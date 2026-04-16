@@ -46,6 +46,9 @@ _CHAR_MAP: dict[str, tuple[str, str | None]] = {
     "T": ("█", "#6600aa"),          # tentacles — deeper purple
     "L": ("╰", "#6600aa"),          # tentacle curl left
     "R": ("╯", "#6600aa"),          # tentacle curl right
+    "C": ("█", "bold #cc5500"),     # collar — burnt orange
+    "X": ("█", "bold #ffcc00"),     # ID tag — gold
+    "S": ("█", "#666666"),          # shackle / chain — dark grey
     " ": (" ", None),
 }
 
@@ -55,16 +58,18 @@ _RAW_MASCOT = [
     "   BBBBBBBBBBBBBB   ",
     "  BBBBBBBBBBBBBBBB  ",
     " BBBBBBBBBBBBBBBBBB ",
-    " BBWWWWWBBBWWWWWBBB ",   # eye whites top  (5 wide, flush to body)
+    " BBWWWWWBBBWWWWWBBB ",   # eye whites top
     " BBWW*WWBBBWW*WWBBB ",   # single centered pupil per eye
     " BBWWWWWBBBWWWWWBBB ",   # eye whites bottom
     " BBBBBBBBBBBBBBBBBB ",   # body
     "   BBBB MMMMM BBBB  ",   # cute pink mouth
+    " CCCCCCCCCCCCCCCCCC ",   # collar band — burnt orange
+    "         XX         ",   # ID tag hanging from collar — gold
     "   BBBBBBBBBBBBBB   ",   # lower body
     "    BBBBBBBBBBBB    ",   # bottom of body
-    "  TT   TT   TT   TT ",   # tentacle stems ×4
-    "  TT   TT   TT   TT ",   #   (two rows for length)
-    " LTTR LTTR LTTR LTTR",   # tentacle curls ╰TT╯
+    "  ST   ST   ST   ST ",   # shackled tentacle roots — grey cuffs
+    "  ST   ST   ST   ST ",   # chain section
+    " LSTR LSTR LSTR LSTR",   # chained tentacle curls ╰S██╯
 ]
 # fmt: on
 

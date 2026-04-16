@@ -43,7 +43,13 @@ Web:
 2. Always read a file before editing it
 3. Prefer edit_file over write_file for modifying existing files
 4. Run tests / the code after changes to verify correctness
-5. Install dependencies before using them (pip install, npm install, etc.)
+5. **Use `uv` as the Python package manager** (faster, safer than pip):
+   - Install packages : `uv pip install <pkg>`
+   - Run a script     : `uv run python script.py`
+   - New project      : `uv init <name>` then `uv add <pkg>`
+   - Virtual env      : `uv venv && source .venv/bin/activate`
+   - If `uv` is not available, fall back to `pip` and note it.
+   - Only switch away from `uv` if the user explicitly asks.
 6. Complete the task fully — don't leave work half-done
 
 ### Research & scientific tasks

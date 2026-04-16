@@ -31,7 +31,7 @@ ROLES: dict[str, dict] = {
         "label": "Researcher",
         "icon": "🔬",
         "color": "bold cyan",
-        "default_model": "qwen3.5",
+        "default_model": "qwen3.5-122b",           # large model — thorough web reading
         "max_iter": 30,
         "tools": ["read_file", "write_file", "web_search", "web_fetch",
                   "list_dir", "glob", "bash"],
@@ -40,16 +40,16 @@ ROLES: dict[str, dict] = {
         "label": "Hypothesis Generator",
         "icon": "💡",
         "color": "bold bright_magenta",
-        "default_model": "gpt-oss-120b",
-        "max_iter": 15,
+        "default_model": "deepseek-v3.2-thinking",  # extended thinking — bold hypotheses
+        "max_iter": 20,
         "tools": ["read_file", "write_file", "list_dir", "glob"],
     },
     "coder": {
         "label": "Coder",
         "icon": "💻",
         "color": "bold green",
-        "default_model": "qwen3-coder",
-        "max_iter": 40,
+        "default_model": "qwen3-coder-30b",         # large code model — fewer mistakes
+        "max_iter": 50,
         "tools": ["read_file", "write_file", "edit_file", "bash",
                   "glob", "grep", "list_dir"],
     },
@@ -57,8 +57,8 @@ ROLES: dict[str, dict] = {
         "label": "Debugger",
         "icon": "🐛",
         "color": "bold red",
-        "default_model": "qwen3-coder",
-        "max_iter": 25,
+        "default_model": "qwen3-coder-30b",         # same large coder — deep inspection
+        "max_iter": 30,
         "tools": ["read_file", "write_file", "edit_file", "bash",
                   "glob", "grep", "list_dir"],
     },
@@ -66,8 +66,8 @@ ROLES: dict[str, dict] = {
         "label": "Evaluator",
         "icon": "⚖️ ",
         "color": "bold yellow",
-        "default_model": "gpt-oss-120b",
-        "max_iter": 15,
+        "default_model": "deepseek-v3.2-thinking",  # extended thinking — rigorous critique
+        "max_iter": 20,
         "tools": ["read_file", "bash", "write_file", "list_dir",
                   "web_search", "glob"],
     },
@@ -75,15 +75,15 @@ ROLES: dict[str, dict] = {
         "label": "Orchestrator",
         "icon": "🧠",
         "color": "bold bright_white",
-        "default_model": "mistral-small-4",
-        "max_iter": 15,
+        "default_model": "deepseek-v3.2",           # strong reasoning — solid synthesis
+        "max_iter": 20,
         "tools": ["read_file", "write_file", "list_dir", "glob"],
     },
     "reporter": {
         "label": "Reporter",
         "icon": "📊",
         "color": "bold bright_cyan",
-        "default_model": "gpt-oss-120b",
+        "default_model": "gpt-oss-120b",            # large general — clean HTML/writing
         "max_iter": 25,
         "tools": ["read_file", "write_file", "bash", "list_dir", "glob"],
     },
@@ -302,6 +302,19 @@ VISUALISATION (REQUIRED)
 - Use tight_layout() and savefig() — do not rely on plt.show().
 - Also save a {round_dir}/03_code/results/summary_figure.png that is a
   multi-panel overview (2–4 subplots) of the most important results.
+
+PYTHON PACKAGE MANAGEMENT — USE UV
+- Always use `uv` as the package manager unless the user specifies otherwise.
+  uv is faster, reproducible, and isolates dependencies correctly.
+  Commands:
+    uv pip install <pkg>          # install into current env
+    uv pip install -r requirements.txt
+    uv run python script.py       # run with uv-managed env
+    uv init <project>             # new project with pyproject.toml
+    uv add <pkg>                  # add dep to pyproject.toml
+    uv sync                       # install all deps from lockfile
+- If uv is not installed: `pip install uv -q` first, then use uv.
+- Fallback to pip ONLY if uv fails and document the reason in IMPLEMENTATION.md.
 
 ABSOLUTE RULES — READ CAREFULLY
 - NEVER generate synthetic or dummy data as a substitute for real data.
