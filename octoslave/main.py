@@ -144,11 +144,64 @@ def config(api_key, model, base_url, ollama_url, show):
 
     if not any([api_key, model, base_url, ollama_url]):
         display.console.print("[bold]OctoSlave — setup[/bold]\n")
-        new_key = click.prompt("API key (e-INFRA CZ)", default=new_key,
-                               hide_input=True, show_default=False)
-        new_url = click.prompt("Base URL (e-INFRA CZ)", default=new_url)
-        new_model = click.prompt("Default model", default=new_model)
-        new_ollama = click.prompt("Ollama URL", default=new_ollama)
+        display.console.print(
+            "  [bold]einfra[/bold]  — e-INFRA CZ cloud API  "
+            "(requires an API key; best model quality; recommended)\n"
+            "  [bold]ollama[/bold]  — local models via Ollama "
+            "(no API key; fully private; GPU strongly recommended)\n"
+        )
+        new_backend = click.prompt(
+            "Backend",
+            default=new_backend,
+            type=click.Choice(["einfra", "ollama"]),
+        )
+
+        if new_backend == "einfra":
+            display.console.print(
+                "\n  Get an API key at [link=https://llm.ai.e-infra.cz]llm.ai.e-infra.cz[/link] "
+                "(free for Czech academic institutions).\n"
+            )
+            new_key = click.prompt(
+                "API key (e-INFRA CZ)",
+                default=new_key,
+                hide_input=True,
+                show_default=False,
+            )
+            new_url = click.prompt("Base URL (leave default unless self-hosting)", default=new_url)
+            display.console.print(
+                "\n  Suggested models:\n"
+                "    [bold]deepseek-v3.2[/bold]          — best all-round default (reasoning + coding)\n"
+                "    [bold]deepseek-v3.2-thinking[/bold] — extended chain-of-thought; slower\n"
+                "    [bold]qwen3-coder-30b[/bold]        — strongest at code generation\n"
+                "    [bold]qwen3.5-122b[/bold]           — fast reader; good for research\n"
+                "    [bold]gpt-oss-120b[/bold]           — large context; clean writing\n"
+                "  Run [bold]ots models[/bold] to see the full list.\n"
+            )
+            new_model = click.prompt("Default model", default=new_model)
+        else:
+            new_ollama = click.prompt("Ollama URL", default=new_ollama)
+            running = ollama_is_running(new_ollama)
+            if not running:
+                display.console.print(
+                    "[yellow]  Ollama is not running — start it with: ollama serve[/yellow]\n"
+                    "  Pull a model later with: ollama pull llama3.1:8b\n"
+                )
+                new_model = click.prompt("Default model (set now or update after pulling)", default=new_model)
+            else:
+                pulled = ollama_list_models(new_ollama)
+                if pulled:
+                    display.console.print(
+                        "\n  Pulled models: " + ", ".join(pulled) + "\n"
+                        "  Tip: pull a strong reasoning model for Tier A (orchestrator/evaluator)\n"
+                        "       and a coder model for Tier B (coder/debugger).\n"
+                    )
+                    new_model = click.prompt("Default model", default=pulled[0], type=click.Choice(pulled))
+                else:
+                    display.console.print(
+                        "\n  No models pulled yet. Recommended first pull:\n"
+                        "    ollama pull llama3.1:8b   (5 GB — good all-round)\n"
+                    )
+                    new_model = click.prompt("Default model (set after pulling)", default="llama3.1:8b")
 
     save_config(new_key, new_url, new_model, backend=new_backend, ollama_url=new_ollama)
     display.console.print("[bold green]Config saved.[/bold green]")

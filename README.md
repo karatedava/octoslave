@@ -413,13 +413,48 @@ Usable for simple interactive tasks. Long-research not recommended on CPU only.
 
 ## Configuration
 
+### Which backend should I use?
+
+```
+Do you have access to e-INFRA CZ? ──yes──▶ use einfra  (best model quality, free for Czech academia)
+         │
+         no
+         │
+         ▼
+Do you have a GPU (≥8 GB VRAM)?  ──yes──▶ use ollama  (fully local, private, no API key needed)
+         │
+         no
+         │
+         ▼
+         use ollama on CPU  (interactive tasks only; long-research not recommended)
+```
+
+Run `ots config` — the interactive wizard will walk you through each choice.
+
+### Which model should I set as default?
+
+| Goal | Recommended default |
+|------|-------------------|
+| Best all-round (reasoning + coding) | `deepseek-v3.2` ← **start here** |
+| Writing-heavy tasks | `gpt-oss-120b` |
+| Code generation focus | `qwen3-coder-30b` |
+| Chain-of-thought / hard problems | `deepseek-v3.2-thinking` |
+| Fast general purpose | `qwen3.5-122b` |
+
+The default model is only the starting point — switch any time with `/model NAME` inside the TUI.
+
+### What about `base_url` and `ollama_url`?
+
+- **`base_url`** — leave at the default (`https://llm.ai.e-infra.cz/v1`) unless you are self-hosting an OpenAI-compatible API.
+- **`ollama_url`** — leave at the default (`http://localhost:11434/v1`) unless Ollama runs on a different machine or port.
+
+### Precedence and environment variables
+
 | Mechanism | Precedence | Notes |
 |-----------|-----------|-------|
 | Environment variable | **Highest** | Overrides everything |
 | `~/.octoslave/config.json` | Medium | Written by `ots config` |
 | Built-in default | Lowest | `deepseek-v3.2`, e-INFRA CZ endpoint |
-
-**Environment variables**
 
 | Variable | Description |
 |----------|-------------|
