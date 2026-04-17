@@ -495,6 +495,7 @@ def _handle_long_research(arg: str, state: dict, cfg: dict, client):
     all_model: str | None = None
     overseer_model: str | None = None
     resume = False
+    num_parallel = 1
 
     i = 0
     while i < len(tokens):
@@ -504,6 +505,15 @@ def _handle_long_research(arg: str, state: dict, cfg: dict, client):
                 max_rounds = int(tokens[i + 1])
             except ValueError:
                 display.print_error(f"--rounds expects an integer, got: {tokens[i+1]}")
+                return
+            i += 2
+        elif t == "--parallel" and i + 1 < len(tokens):
+            try:
+                num_parallel = int(tokens[i + 1])
+                if num_parallel < 1:
+                    raise ValueError
+            except ValueError:
+                display.print_error(f"--parallel expects a positive integer, got: {tokens[i+1]}")
                 return
             i += 2
         elif t == "--all" and i + 1 < len(tokens):
@@ -522,8 +532,8 @@ def _handle_long_research(arg: str, state: dict, cfg: dict, client):
     topic = " ".join(topic_parts).strip()
     if not topic:
         display.print_error(
-            "Usage: /long-research <topic> [--rounds N] [--all MODEL] "
-            "[--overseer MODEL] [--resume]"
+            "Usage: /long-research <topic> [--rounds N] [--parallel N] "
+            "[--all MODEL] [--overseer MODEL] [--resume]"
         )
         return
 
@@ -551,6 +561,7 @@ def _handle_long_research(arg: str, state: dict, cfg: dict, client):
         max_rounds=max_rounds,
         model_overrides=overrides,
         resume=resume,
+        num_parallel=num_parallel,
     )
 
 
