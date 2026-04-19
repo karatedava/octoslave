@@ -148,10 +148,10 @@ async def ws_endpoint(websocket: WebSocket):
     try:
         cfg = load_config()
         await send({"type": "config", "data": {
-            "model": cfg.default_model,
-            "base_url": cfg.base_url,
-            "backend": getattr(cfg, "backend", "einfra"),
-            "has_api_key": bool(cfg.api_key),
+            "model": cfg.get("default_model", ""),
+            "base_url": cfg.get("base_url", ""),
+            "backend": cfg.get("backend", "einfra"),
+            "has_api_key": bool(cfg.get("api_key", "")),
             "working_dir": ".",
         }})
     except Exception as exc:
@@ -175,10 +175,10 @@ async def ws_endpoint(websocket: WebSocket):
                 try:
                     cfg = load_config()
                     await send({"type": "config", "data": {
-                        "model": cfg.default_model,
-                        "base_url": cfg.base_url,
-                        "backend": getattr(cfg, "backend", "einfra"),
-                        "has_api_key": bool(cfg.api_key),
+                        "model": cfg.get("default_model", ""),
+                        "base_url": cfg.get("base_url", ""),
+                        "backend": cfg.get("backend", "einfra"),
+                        "has_api_key": bool(cfg.get("api_key", "")),
                         "working_dir": state["working_dir"],
                     }})
                 except Exception as exc:

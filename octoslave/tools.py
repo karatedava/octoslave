@@ -100,7 +100,7 @@ TOOL_DEFINITIONS = [
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "Shell command to run"},
-                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 60)"},
+                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 3600). For ML model training that may take hours pass a high value, e.g. 28800 (8 h) or 86400 (24 h). There is no hard cap — size it to the expected job duration."},
                 },
                 "required": ["command"],
             },
@@ -345,7 +345,10 @@ def _edit_file(path: str, old_string: str, new_string: str, working_dir: str) ->
     return f"Edited {path}", True
 
 
-def _bash(command: str, working_dir: str, timeout: int = 60) -> tuple[str, bool]:
+def _bash(command: str, working_dir: str, timeout: int = 3600) -> tuple[str, bool]:
+    # Unset VIRTUAL_ENV so uv doesn't emit a mismatch warning when the conda/system
+    # venv doesn't match the project's .venv.
+    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
     try:
         result = subprocess.run(
             command,
@@ -354,6 +357,7 @@ def _bash(command: str, working_dir: str, timeout: int = 60) -> tuple[str, bool]
             text=True,
             cwd=working_dir,
             timeout=timeout,
+            env=env,
         )
         output = ""
         if result.stdout:

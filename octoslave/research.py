@@ -32,9 +32,9 @@ ROLES: dict[str, dict] = {
         "icon": "🔬",
         "color": "bold cyan",
         "default_model": "qwen3.5-122b",           # large — fast reading + search
-        "max_iter": 10,                             # targeted scout, not full survey
+        "max_iter": 15,                             # 15 = budget for ~5 web ops + write
         "tools": ["read_file", "write_file", "web_search", "web_fetch",
-                  "list_dir", "glob", "bash"],
+                  "list_dir", "glob"],              # no bash — researcher surveys, never installs
     },
     "hypothesis": {
         "label": "Experiment Designer",
@@ -67,7 +67,7 @@ ROLES: dict[str, dict] = {
         "icon": "⚖️ ",
         "color": "bold yellow",
         "default_model": "deepseek-v3.2-thinking",  # thinking — rigorous scientific judgement
-        "max_iter": 10,
+        "max_iter": 15,
         "tools": ["read_file", "bash", "write_file", "list_dir",
                   "web_search", "glob"],
     },
@@ -84,7 +84,7 @@ ROLES: dict[str, dict] = {
         "icon": "📊",
         "color": "bold bright_cyan",
         "default_model": "gpt-oss-120b",            # large general — clean HTML/writing
-        "max_iter": 25,
+        "max_iter": 40,
         "tools": ["read_file", "write_file", "bash", "list_dir", "glob"],
     },
 }
@@ -131,11 +131,17 @@ WORK DIR  : {working_dir}
 BRIEF:
 {brief}
 
-EFFICIENCY RULES (critical — small models, limited context):
-- Act immediately. No preamble, no "I will now...", no narration.
-- Read only the specific section you need from each file, not the whole file.
-- Write output files once, concisely. Do not draft, then rewrite.
-- Stop as soon as your required output file is written and verified non-empty.
+EXECUTION RULES — non-negotiable:
+- ACT, don't narrate. Zero preamble. "I will now..." costs a tool call. Skip it.
+- Read ONLY the section you need (use offset/limit on read_file). Never read a whole file.
+- Write each output file ONCE. No drafts, no re-reads, no polish passes.
+- INTERMEDIATE FILES (01_literature.md … 06_synthesis.md) are terse HANDOFFS, not reports.
+  They exist so the next agent can start fast — not to document your reasoning.
+  If it fits in a bullet list, use a bullet list. Prose is waste.
+- STOP the moment your required output file is written. Do not make additional tool calls
+  to "verify", "review", or "summarise". The next agent will read it directly.
+- LONG TASKS (training, data download) are expected to take hours. Do not abort them.
+  Pass an appropriate timeout to bash (see PACKAGES / LONG-RUNNING JOBS below).
 ---
 """
 
@@ -147,26 +153,55 @@ Fast, targeted intelligence-gathering pass. Equip the Experiment Designer with
 exactly what they need to commit to ONE concrete experiment. 3 sharp sources
 beat 10 shallow ones. Total output: under 500 words.
 
-STEPS
-1. Round > 1: read {research_dir}/findings.md (## Key Findings section only) to
-   know what was tried. Round 1: skip.
-2. Run 2–3 targeted web searches on the round brief. Fetch the single most
-   useful page per search. Stop when you can answer: (a) best known result /
-   method, (b) which dataset is accessible right now.
-3. For each dataset candidate: fetch its landing page. Label it:
-   ACCESSIBLE | REQUIRES_SIGNUP | PAYWALLED | UNAVAILABLE. Only list confirmed ones.
+HARD LIMITS — enforced by the system. Violating them means 01_literature.md is NOT written
+and the entire round fails. Every limit below is a MAXIMUM, not a target:
+  list_dir:    1 call   (step 0 only)
+  read_file:   0–2 calls (local data files only — NOT task.md, NOT findings.md twice)
+  web_search:  max 2 calls  ← STRICT. Stop searching after 2.
+  web_fetch:   max 2 calls  ← STRICT. Stop fetching after 2.
+  write_file:  1 call   (your LAST call — always)
+  TOTAL: max 8 calls. After call 8, your next and only action is write_file.
 
-OUTPUT — write ONE file: {round_dir}/01_literature.md
+RESEARCHER CONSTRAINTS — non-negotiable:
+- Do NOT read task.md. The topic is already in your brief above — reading it again wastes a call.
+- Do NOT install packages. You have no bash tool. Survey only.
+- Do NOT run code. Do NOT validate datasets programmatically.
+- Dataset accessibility: fetch the landing page once. If it loads and a download link is visible
+  → ACCESSIBLE. Otherwise → REQUIRES_SIGNUP/PAYWALLED. That's the full check. Move on.
+- After 2 web_search + 2 web_fetch calls, you have gathered enough. WRITE the file.
+
+STEPS
+0. LOCAL DATA FIRST (mandatory, round 1 and every round):
+   Call list_dir on {working_dir}. If any PDFs, CSVs, FASTAs, TSVs, or JSON files
+   exist there, read the most relevant ones NOW using read_file — they are the
+   user's primary input. A local PDF is the paper you are extending; a local CSV
+   is the dataset you must analyse. Do not web-search topics already covered by
+   local files.
+1. Round > 1: read {research_dir}/findings.md — ONLY the ## Key Findings section
+   (use read_file with offset/limit). Round 1: skip this step entirely.
+2. Run 2–3 targeted web searches to fill gaps NOT covered by local files. Fetch ONE
+   page per search (the most useful one). Stop the moment you can answer:
+   (a) best known result / method, (b) which dataset is accessible right now.
+3. For each external dataset candidate: fetch its landing page. Label it:
+   ACCESSIBLE | REQUIRES_SIGNUP | PAYWALLED | UNAVAILABLE. Only confirmed ones.
+4. Write 01_literature.md. Stop. Do not re-read it. Do not add more searches.
+
+OUTPUT — write EXACTLY ONE file: {round_dir}/01_literature.md
+The filename MUST be exactly "01_literature.md". Do NOT write any other file (no HTML reports,
+no final_report, no CSV, no summary). Any other file write is WRONG and wastes your only call.
 Keep every section to bullet points — no prose paragraphs except the last one.
 
   ## SOTA Summary     (2–3 bullets: best result, method, benchmark)
-  ## Available Datasets (name · direct URL · size · licence · ACCESS STATUS)
+  ## Available Datasets (name · path or URL · size · ACCESS STATUS)
+    - LOCAL files from {working_dir} are always ACCESSIBLE — list their full
+      absolute paths here so downstream agents can use them directly.
   ## Baselines        (concrete numbers only, e.g. "ResNet-50: 76.1% top-1")
 
   ## FOR THE EXPERIMENT DESIGNER
-  [1 focused paragraph: which gap to target, which dataset to use (URL),
-   what baseline to beat, key gotcha. Be direct — the next agent reads ONLY
-   this section.]
+  [1 focused paragraph: which gap to target, which dataset to use, what
+   baseline to beat, key gotcha. Be direct — the next agent reads ONLY this
+   section. MUST include the absolute path(s) of any local data files so the
+   Hypothesis Designer can pass them to the Coder verbatim.]
 """,
 
 "hypothesis": """\
@@ -176,12 +211,14 @@ Total output: under 400 words.
 
 STEPS
 1. Read ONLY the ## FOR THE EXPERIMENT DESIGNER section from
-   {round_dir}/01_literature.md — that is your entire input.
-2. Round > 1: also read {research_dir}/findings.md (## What Failed section only)
-   to avoid repeating failures.
-3. Think, commit, write. No drafting.
+   {round_dir}/01_literature.md (use offset/limit — do not read the whole file).
+2. Round > 1: read ONLY the ## What Failed section from {research_dir}/findings.md.
+   Round 1: skip.
+3. Think once, commit, write. No drafting, no iteration.
 
-OUTPUT — write ONE file: {round_dir}/02_experiment.md
+OUTPUT — write EXACTLY ONE file: {round_dir}/02_experiment.md
+The filename MUST be exactly "02_experiment.md". Any other filename (e.g. 02_methodology.md)
+is WRONG and will break the pipeline. No exceptions.
 
   ## Experiment: <short name>
   **Hypothesis**: one falsifiable claim
@@ -193,9 +230,10 @@ OUTPUT — write ONE file: {round_dir}/02_experiment.md
    Include: method, loss, key hyperparameters, eval protocol. Max 10 lines.]
 
   ## Data Plan
-  **Primary**: <name> · <direct download URL> · <format>
-  **Fallback**: <alternative> · <URL>
-  (Only sources confirmed ACCESSIBLE in 01_literature.md.)
+  **Primary**: <name> · <absolute path or download URL> · <format>
+  **Fallback**: <alternative> · <path or URL>
+  (Files in {working_dir} are always ACCESSIBLE — use their absolute paths.
+   For external sources, only list those confirmed ACCESSIBLE in 01_literature.md.)
 
   ## Expected Output Files
   - results/key_results.json  → {{"metric": <name>, "value": <float>, "baseline": <float>}}
@@ -226,7 +264,19 @@ STEPS
    c. Write modular Python. Install packages with uv (see below).
    d. Run the code. Fix runtime errors.
    e. Save ALL output (metrics, plots) to {round_dir}/03_code/results/.
-6. Write {round_dir}/03_code/IMPLEMENTATION.md — keep it SHORT (under 300 words):
+6. Write {round_dir}/03_code/IMPLEMENTATION.md — keep it SHORT (under 300 words).
+   STOP after writing IMPLEMENTATION.md. Your output is EXACTLY:
+     - {round_dir}/03_code/<script>.py     (the implementation)
+     - {round_dir}/03_code/IMPLEMENTATION.md
+     - {round_dir}/03_code/results/*.json and *.png
+   FORBIDDEN files (writing these is an error):
+     - final_report.html  (Master Reporter's job — wrong role, wrong path)
+     - 01_literature.md / 02_experiment.md  (Researcher / Experiment Designer's job)
+     - 04_debug_report.md  (Debugger's job)
+     - 05_evaluation.md   (Evaluator's job)
+     - 06_synthesis.md    (Orchestrator's job — writing this will SKIP the Orchestrator)
+     - 04_findings.md, README.md, or any other round-level summaries
+   If you find yourself writing anything other than the listed files, STOP.
    - Hardware used (device, batch size chosen)
    - Data source + how it was accessed
    - Approach in 3–5 bullet points
@@ -235,23 +285,54 @@ STEPS
 
 GPU RULES (if CUDA available per hw_profile.json — no exceptions)
 - device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-- Move models AND tensors: .to(device). Log "Using device: {device}" at runtime.
+- Move models AND tensors: .to(device). Log "Using device: {{device}}" at runtime.
 - PyTorch: use autocast("cuda") + GradScaler; num_workers≥2; pin_memory=True.
 - Batch size: target 70–80% of vram_gb from hw_profile.
 - HuggingFace: device_map="auto". scikit-learn/XGBoost: device="cuda".
 - Log peak_vram_gb to results/ via torch.cuda.max_memory_allocated()/1e9.
 
+RESULTS ORDER — CRITICAL:
+1. Save key_results.json FIRST (before any visualisation).
+2. Save main_plot.png, summary_figure.png.
+3. Run any optional extras (UMAP, etc.) LAST — if they fail, the core results are already on disk.
+Never put visualisation code before the JSON save — a plot error must not erase your results.
+
 VISUALISATION (save to {round_dir}/03_code/results/)
 - Main results plot + summary_figure.png (2–4 subplot overview). Both required.
 - 150 dpi PNG. Title, axis labels, legend. Use tight_layout() + savefig().
+- Wrap UMAP or other optional visualisations in try/except so a missing package doesn't crash.
 
-PACKAGES — use `uv pip install <pkg>`. Fallback: pip. Note failures in IMPLEMENTATION.md.
+PACKAGES — hw_profile.json contains `uv_available` (bool).
+- If True  → ALWAYS use uv. No exceptions. Preferred patterns:
+    Option A (isolated):  uv venv && uv pip install <pkgs> && .venv/bin/python script.py
+    Option B (inline run): uv run --with <pkg1> --with <pkg2> python script.py
+  CRITICAL: If you used Option A (uv venv + uv pip install), you MUST run with
+  `.venv/bin/python script.py`. Do NOT mix Option A setup with `uv run` execution —
+  `uv run` ignores the local .venv and uses the project-root environment where your
+  packages are not installed. Mixing patterns = ModuleNotFoundError.
+  Never call `uv pip install` without first creating a venv (Option A) or using `uv run` (Option B).
+  `uv pip install --system` is acceptable if the working dir already has system Python in PATH.
+- If False → use pip and add a one-line note in IMPLEMENTATION.md: "uv not found, used pip".
+Never silently fall back to pip when uv is available.
+
+LONG-RUNNING JOBS — training a model can take hours or days. This is expected and correct.
+- Pass an explicit `timeout` to every bash training call: estimate duration × 1.5, in seconds.
+  Example: expected 2 h → `timeout=10800`. Expected overnight → `timeout=86400`.
+- Do NOT use the shell `timeout` command (e.g. `timeout 3600 python ...`) — it does NOT exist
+  on macOS and will immediately fail with "timeout: command not found". Instead, pass the
+  timeout as the tool parameter to the bash call itself (the tool enforces it at the OS level).
+- Do NOT kill a training job because it is slow. Let it run.
+- If a job genuinely fails (non-zero exit, OOM) document it and try alternatives.
 
 ABSOLUTE RULES — READ CAREFULLY
 - NEVER generate synthetic or dummy data as a substitute for real data.
   Synthetic stand-ins are scientifically invalid and mislead future agents.
 - NEVER fabricate results or outputs. Every number in results/ must come from
   real computation on real data.
+- NEVER hardcode paths to files from previous rounds (e.g. round_001/) as data
+  fallbacks. Prior-round files may be artefacts, test files, or placeholders — not
+  validated data sources. If your primary URL fails, download fresh data from a
+  different public URL or report the failure in IMPLEMENTATION.md.
 - If a data source is unavailable (network error, API down, auth required):
     1. Log the failure clearly in IMPLEMENTATION.md under ## Skipped Steps.
     2. Do NOT proceed with that experiment using fake data.
@@ -273,16 +354,26 @@ ABSOLUTE RULES — READ CAREFULLY
 YOUR MISSION
 Verify code correctness and result validity. Be skeptical. Total report: under 350 words.
 
-STEPS
-1. Read IMPLEMENTATION.md and the main script(s) under {round_dir}/03_code/.
-2. Run the main script. Inspect output in 03_code/results/.
+STEPS — focus ONLY on {round_dir}. Do NOT read files from other rounds.
+1. Read {round_dir}/03_code/IMPLEMENTATION.md (the ## Results Summary section only).
+   Use grep to scan the main script in {round_dir}/03_code/ — do NOT read every line.
+2. Check {round_dir}/03_code/results/ with list_dir.
+   - If results/ has key_results.json AND at least one .png → results exist. DO NOT re-run the
+     full script. Proceed to step 3 with the existing files.
+   - If results/ is MISSING or EMPTY → run the main script. To run, first check how the Coder
+     ran it: read IMPLEMENTATION.md for the run command. If uv was used, run with:
+     `cd {round_dir}/03_code && uv run --with <pkgs> python <script>.py`
+     or use the existing .venv: `.venv/bin/python <script>.py`
+     Never run bare `python <script>.py` — it won't have the packages.
 3. Check — each is a potential one-line report entry:
    - SYNTHETIC DATA: any fabricated/placeholder data instead of real → CRITICAL
    - GPU UNDERUSE: if hw_profile.json shows CUDA available but "Using device: cpu"
      appears in output → CRITICAL (fix: add .to(device), rerun)
    - Runtime errors, off-by-one, data leakage, wrong metrics
    - Results implausibly good/bad (may indicate fake data)
-4. Fix each bug (edit_file / bash). Re-run to confirm.
+4. Fix CRITICAL bugs only (edit_file / bash). Re-run once to confirm.
+   Non-critical style issues: document in Outstanding Issues, do NOT fix now.
+5. Write 04_debug_report.md. Stop immediately after writing.
 
 OUTPUT — write ONE file: {round_dir}/04_debug_report.md
 
@@ -299,15 +390,18 @@ If no bugs: "No bugs found. Results verified." — then the score. Done.
 YOUR MISSION
 Independent assessment of this round's work. Critical, concise. Total report: under 400 words.
 
-STEPS
-1. Read: {round_dir}/03_code/IMPLEMENTATION.md and {round_dir}/04_debug_report.md.
-   These are your primary inputs. Read {round_dir}/02_experiment.md only for
-   the success metric. Read {round_dir}/01_literature.md ONLY if you need a
-   SOTA number for comparison.
-2. Check results/ for key_results.json and plots. Verify numbers are plausible.
-3. One web_search max if you need a SOTA reference.
+STEPS — follow in ORDER, do NOT skip ahead:
+1. Read {round_dir}/03_code/IMPLEMENTATION.md (primary input — always exists).
+   If {round_dir}/04_debug_report.md exists, read it too (may be absent — that's OK).
+   Read {round_dir}/02_experiment.md ONLY for the success metric (first 20 lines).
+   Do NOT read 01_literature.md unless you need a specific SOTA number.
+2. Read {round_dir}/03_code/results/key_results.json if it exists. Check numbers.
+3. WRITE {round_dir}/05_evaluation.md NOW — do NOT wait. This is your primary output.
+   Use the format below. Estimate scores from what you've read so far.
+4. ONLY after writing 05_evaluation.md: optionally write + run a chart script.
+   Skip the chart entirely if reading + writing has used more than 8 iterations.
 
-OUTPUT — write ONE file: {round_dir}/05_evaluation.md
+OUTPUT — The filename MUST be exactly "05_evaluation.md". Write it at step 3, not later.
 Format: score on the SAME line as the heading, then ONE sentence commentary.
 
   ## Literature Quality      X/10 — <one sentence>
@@ -318,7 +412,7 @@ Format: score on the SAME line as the heading, then ONE sentence commentary.
   ## Critical Weaknesses     (bullet list, max 3 items)
   ## Recommended Next Steps  (bullet list, max 3 specific actionable items)
 
-SCORES CHART (only if results/key_results.json exists)
+SCORES CHART (OPTIONAL — only after 05_evaluation.md is written)
 - Write + run a minimal Python script → saves {round_dir}/05_scores_chart.png.
 - Simple bar chart, 4 bars, labels, colour-coded (green≥7, amber4–6, red≤3).
 - If no results exist, skip the chart entirely.
@@ -326,6 +420,8 @@ SCORES CHART (only if results/key_results.json exists)
 SCORING RULES
 - Synthetic/fabricated data → Results Validity capped at 1/10.
 - Be harsh. A generous score on mediocre work wastes the next round's effort.
+- Missing 04_debug_report.md is NOT a reason to delay writing 05_evaluation.md —
+  evaluate based on IMPLEMENTATION.md and key_results.json alone.
 """,
 
 "orchestrator": """\
@@ -547,10 +643,13 @@ def _run_specialist(
 
     t0 = time.time()
     iteration = 0
+    _rate_limit_retries = 0
 
-    for iteration in range(1, max_iter + 1):
+    while iteration < max_iter:
+        iteration += 1
         try:
             response = _stream_completion_with_tools(client, model, messages, tools)
+            _rate_limit_retries = 0  # reset on success
         except BadRequestError as e:
             err = str(e)
             if "ContextWindow" in err or "context" in err.lower():
@@ -559,8 +658,26 @@ def _run_specialist(
                     "trimming oldest tool results and retrying."
                 )
                 messages = _trim_messages(messages)
+                iteration -= 1  # context trim doesn't consume a turn
                 continue
             display.print_error(f"[{cfg['label']}] API error: {e}")
+            return False
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "rate" in err_str.lower() or "RateLimit" in type(e).__name__:
+                _rate_limit_retries += 1
+                wait = min(60, 5 * (2 ** (_rate_limit_retries - 1)))  # 5s, 10s, 20s, 40s, 60s cap
+                display.print_info(
+                    f"  [{cfg['label']}] Rate limit hit — waiting {wait}s before retry "
+                    f"({_rate_limit_retries}/5)."
+                )
+                if _rate_limit_retries > 5:
+                    display.print_error(f"[{cfg['label']}] Rate limit persists after 5 retries. Aborting.")
+                    return False
+                time.sleep(wait)
+                iteration -= 1  # don't count this as a used iteration
+                continue
+            display.print_error(f"[{cfg['label']}] Unexpected error: {e}")
             return False
         except KeyboardInterrupt:
             display.stream_end(False)
@@ -576,7 +693,33 @@ def _run_specialist(
             assistant_msg["tool_calls"] = tool_calls
         messages.append(assistant_msg)
 
-        if not tool_calls or finish_reason == "stop":
+        if not tool_calls:
+            # Model returned text with no tool calls — only exit if expected output exists.
+            import pathlib as _pl
+            expected_rel = OUTPUT_FILES.get(role, "")
+            if expected_rel:
+                expected_abs = _pl.Path(round_dir) / expected_rel
+                if expected_rel.endswith("/"):
+                    output_done = (expected_abs / "IMPLEMENTATION.md").exists()
+                else:
+                    output_done = expected_abs.exists()
+            else:
+                output_done = True
+            if output_done:
+                break
+            # Output not yet written — nudge the model to write it
+            exact_path = str(_pl.Path(round_dir) / expected_rel)
+            nudge = (
+                f"REQUIRED ACTION: You have not yet written the output file for THIS round. "
+                f"The EXACT path you must write is: {exact_path}\n"
+                f"Call write_file with file_path=\"{exact_path}\" RIGHT NOW. "
+                "Do not write to any other path. Do not write to a different round's directory."
+            )
+            messages.append({"role": "user", "content": nudge})
+            iteration -= 1  # don't count the nudge against the iteration budget
+            continue
+
+        if finish_reason == "stop":
             break
 
         display.print_separator()
@@ -635,9 +778,17 @@ def _update_findings(
     evaluation  = _read(OUTPUT_FILES["evaluator"])
     experiment  = _read(OUTPUT_FILES["hypothesis"])
 
-    # Extract overall score from evaluation
-    score_match = re.search(r"##\s*Overall Score[^\n]*\n+([^\n]+)", evaluation)
-    score_str   = score_match.group(1).strip() if score_match else "N/A"
+    # Extract overall score from evaluation.
+    # Handles two formats:
+    #   "## Overall Score           X/10"  (score on SAME line as heading)
+    #   "## Overall Score\nX/10"           (score on NEXT line)
+    score_match = re.search(
+        r"##\s*Overall Score\s+(\d+(?:\.\d+)?/\d+|\d+(?:\.\d+)?\s*/\s*\d+)",
+        evaluation,
+    )
+    if not score_match:
+        score_match = re.search(r"##\s*Overall Score[^\n]*\n+([^\n]+)", evaluation)
+    score_str = score_match.group(1).strip() if score_match else "N/A"
 
     # Extract key findings / summary block from synthesis (## Key Findings section)
     kf_match = re.search(
@@ -729,19 +880,37 @@ def _parse_synthesis(synthesis_path: str) -> tuple[str, bool]:
 # Context trimmer (last-resort when context window fills up)
 # ---------------------------------------------------------------------------
 
-def _trim_messages(messages: list[dict]) -> list[dict]:
+def _trim_messages(messages: list[dict], groups: int = 3) -> list[dict]:
     """
-    Remove the oldest tool-result messages (pairs) to free context space.
-    Always preserve system + first user message.
+    Remove the oldest N complete assistant-turn groups (assistant message +
+    all its tool results) to free context space.  Always preserves the system
+    prompt and the first user message (messages[:2]).
+
+    Removes `groups` turns per call so recovery from a deeply-full context is
+    fast rather than requiring many retries.
     """
     system = messages[:2]
-    rest = messages[2:]
+    rest   = list(messages[2:])
 
-    # Drop oldest tool result
-    for i, m in enumerate(rest):
-        if m.get("role") == "tool":
-            rest = rest[:max(0, i - 1)] + rest[i + 1:]
-            break
+    removed = 0
+    while removed < groups and rest:
+        # Find the first assistant message that issued tool calls
+        start = next(
+            (i for i, m in enumerate(rest)
+             if m.get("role") == "assistant" and m.get("tool_calls")),
+            None,
+        )
+        if start is None:
+            break  # no more tool-calling turns to trim
+
+        # Collect the contiguous block of tool results that follow it
+        end = start + 1
+        while end < len(rest) and rest[end].get("role") == "tool":
+            end += 1
+
+        # Drop the assistant turn + its tool results
+        rest = rest[:start] + rest[end:]
+        removed += 1
 
     return system + rest
 
@@ -807,8 +976,14 @@ def _run_master_reporter(
     model: str,
 ) -> None:
     """Generate the final master HTML report covering all rounds."""
+    import pathlib as _pl
     cfg = ROLES["reporter"]
     tools = _tools_for_role("reporter")
+
+    # Remove stale report so the reporter always regenerates fresh
+    stale = _pl.Path(research_dir) / "final_report.html"
+    if stale.exists():
+        stale.unlink()
 
     display.print_agent_banner("reporter", model, rounds_done, rounds_done)
     display.print_info("  Generating master report…")
@@ -827,15 +1002,34 @@ def _run_master_reporter(
 
     t0 = time.time()
     iteration = 0
-    for iteration in range(1, cfg["max_iter"] + 1):
+    _rate_limit_retries = 0
+
+    while iteration < cfg["max_iter"]:
+        iteration += 1
         try:
             response = _stream_completion_with_tools(client, model, messages, tools)
+            _rate_limit_retries = 0
         except BadRequestError as e:
             err = str(e)
             if "ContextWindow" in err or "context" in err.lower():
                 messages = _trim_messages(messages)
+                iteration -= 1
                 continue
             display.print_error(f"[Master Reporter] API error: {e}")
+            return
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "rate" in err_str.lower() or "RateLimit" in type(e).__name__:
+                _rate_limit_retries += 1
+                wait = min(60, 5 * (2 ** (_rate_limit_retries - 1)))
+                display.print_info(f"[Master Reporter] Rate limit — waiting {wait}s ({_rate_limit_retries}/5).")
+                if _rate_limit_retries > 5:
+                    display.print_error("[Master Reporter] Rate limit persists. Aborting.")
+                    return
+                time.sleep(wait)
+                iteration -= 1
+                continue
+            display.print_error(f"[Master Reporter] Unexpected error: {e}")
             return
         except KeyboardInterrupt:
             display.stream_end(False)
@@ -851,7 +1045,21 @@ def _run_master_reporter(
             assistant_msg["tool_calls"] = tool_calls
         messages.append(assistant_msg)
 
-        if not tool_calls or finish_reason == "stop":
+        if not tool_calls:
+            # Only exit early if final_report.html has been produced.
+            import pathlib as _pl2
+            if (_pl2.Path(research_dir) / "final_report.html").exists():
+                break
+            # Not written yet — nudge the model
+            nudge = (
+                f"You have not yet written {research_dir}/final_report.html. "
+                "Write build_master_report.py and run it, OR write final_report.html directly. "
+                "Call write_file or bash now."
+            )
+            messages.append({"role": "user", "content": nudge})
+            continue
+
+        if finish_reason == "stop":
             break
 
         display.print_separator()
@@ -891,9 +1099,22 @@ def _probe_hardware(research_dir: str) -> dict:
     hw_path = Path(research_dir) / "hw_profile.json"
 
     script = (
-        "import json, platform, os, sys\n"
+        "import json, platform, os, sys, shutil, subprocess as _sp\n"
         "info = {'python': sys.version.split()[0], 'platform': platform.platform(), "
         "'cpu_count': os.cpu_count()}\n"
+        # UV availability
+        "uv_path = shutil.which('uv')\n"
+        "if uv_path:\n"
+        "    try:\n"
+        "        v = _sp.run(['uv', '--version'], capture_output=True, text=True, timeout=5)\n"
+        "        info['uv_available'] = True\n"
+        "        info['uv_version'] = v.stdout.strip()\n"
+        "    except Exception:\n"
+        "        info['uv_available'] = True\n"
+        "        info['uv_version'] = 'unknown'\n"
+        "else:\n"
+        "    info['uv_available'] = False\n"
+        "    info['uv_version'] = None\n"
         "try:\n"
         "    import psutil; m = psutil.virtual_memory()\n"
         "    info['ram_total_gb'] = round(m.total/1e9,1)\n"
@@ -912,7 +1133,7 @@ def _probe_hardware(research_dir: str) -> dict:
         "except ImportError:\n"
         "    info['torch_available'] = False\n"
         "try:\n"
-        "    r = __import__('subprocess').run(['nvidia-smi','--query-gpu=name,memory.total,memory.free',"
+        "    r = _sp.run(['nvidia-smi','--query-gpu=name,memory.total,memory.free',"
         "'--format=csv,noheader,nounits'], capture_output=True, text=True, timeout=5)\n"
         "    if r.returncode==0: info['nvidia_smi'] = r.stdout.strip()\n"
         "except Exception: pass\n"
@@ -921,8 +1142,10 @@ def _probe_hardware(research_dir: str) -> dict:
 
     profile: dict = {}
     try:
+        import shutil as _shutil
+        _py = _shutil.which("python3") or _shutil.which("python") or "python3"
         result = _sp.run(
-            ["python3", "-c", script],
+            [_py, "-c", script],
             capture_output=True, text=True, timeout=15,
         )
         if result.returncode == 0 and result.stdout.strip():
@@ -937,14 +1160,22 @@ def _probe_hardware(research_dir: str) -> dict:
     devices = profile.get("cuda_devices", [])
     ram = profile.get("ram_total_gb", "?")
     cpus = profile.get("cpu_count", "?")
+    uv_ok = profile.get("uv_available", False)
+    uv_ver = profile.get("uv_version") or ""
+
+    uv_tag = (
+        f"[bold bright_green]uv ✓[/bold bright_green] ({uv_ver})"
+        if uv_ok
+        else "[bold red]uv ✗ — agents will fall back to pip[/bold red]"
+    )
 
     if cuda and devices:
         gpu_str = ", ".join(f"{d['name']} ({d['vram_gb']} GB)" for d in devices)
         display.print_info(f"  Hardware: {cpus} CPU cores, {ram} GB RAM, "
-                           f"[bold bright_green]CUDA ✓[/bold bright_green] {gpu_str}")
+                           f"[bold bright_green]CUDA ✓[/bold bright_green] {gpu_str}  |  {uv_tag}")
     else:
         display.print_info(f"  Hardware: {cpus} CPU cores, {ram} GB RAM, "
-                           f"[dim]no CUDA GPU detected[/dim]")
+                           f"[dim]no CUDA GPU detected[/dim]  |  {uv_tag}")
 
     return profile
 
@@ -978,11 +1209,36 @@ def run_long_research(
     # and read by the coder/debugger agents in every subsequent round.
     _probe_hardware(str(research_dir))
 
+    # Scan working directory for user-supplied local files (PDFs, CSVs, data, etc.)
+    # Include them in the brief so every agent knows they exist from round 1.
+    _LOCAL_DATA_EXTENSIONS = {
+        ".pdf", ".csv", ".tsv", ".fasta", ".fa", ".fastq",
+        ".json", ".jsonl", ".xlsx", ".xls", ".parquet", ".h5", ".hdf5",
+        ".txt", ".bed", ".vcf", ".gff", ".gtf",
+    }
+    local_files = [
+        p for p in Path(working_dir).iterdir()
+        if p.is_file() and p.suffix.lower() in _LOCAL_DATA_EXTENSIONS
+    ]
+    local_files_block = ""
+    if local_files:
+        file_list = "\n".join(f"  - {p.name}  ({p.stat().st_size // 1024 or 1} KB)" for p in local_files)
+        local_files_block = (
+            f"\n\nLOCAL FILES IN WORKING DIR — provided by the user as primary input:\n"
+            f"{file_list}\n"
+            "Agents MUST read these files before doing any web searches. "
+            "They take precedence over anything found online."
+        )
+        display.print_info(
+            f"  Local data files detected: {', '.join(p.name for p in local_files)}"
+        )
+
     # Initial brief
     brief = (
         f"Initial research round. Conduct a broad literature survey on: {topic}\n"
         "Identify key papers, available datasets, existing methods, and open problems.\n"
         "Generate first hypotheses and implement the most promising experiment."
+        f"{local_files_block}"
     )
 
     completed_early = False
@@ -996,10 +1252,14 @@ def run_long_research(
         for role in PIPELINE:
             model = overrides.get(role) or ROLES[role]["default_model"]
 
-            # Resumability: skip if output already exists
+            # Resumability: skip if output already exists (and is non-empty for coder)
             expected = OUTPUT_FILES[role]
             expected_path = round_dir / expected
-            if resume and expected_path.exists():
+            output_complete = expected_path.exists()
+            if output_complete and role == "coder":
+                # For the coder, the directory must contain IMPLEMENTATION.md to be valid
+                output_complete = (expected_path / "IMPLEMENTATION.md").exists()
+            if resume and output_complete:
                 display.print_info(
                     f"  ↩  {ROLES[role]['label']} output found — skipping."
                 )
@@ -1031,6 +1291,16 @@ def run_long_research(
                     f"{ROLES[role]['label']} failed in round {round_num}. "
                     "Continuing with next agent."
                 )
+
+            # Structural integrity check: warn if expected output file is missing
+            expected_out = round_dir / OUTPUT_FILES[role]
+            if role != "coder":  # coder output is a directory, not a single file
+                if not expected_out.exists():
+                    display.print_info(
+                        f"  [yellow]⚠ {ROLES[role]['label']}: expected output "
+                        f"{OUTPUT_FILES[role]} not found after {ROLES[role]['max_iter']} "
+                        f"iterations. Next role will proceed without it.[/yellow]"
+                    )
 
         # Update findings.md from round outputs — pipeline-owned, not LLM-owned
         _update_findings(
