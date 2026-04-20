@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>OctoSlave</title>
-  <link rel="icon" type="image/png" href="/static/logo.png">
+  <link rel="icon" type="image/png" href="/static/logo.png?v=2">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
@@ -49,7 +49,7 @@
     #navbar {
       position: fixed;
       top: 0; left: 0; right: 0;
-      height: 80px;
+      height: 100px;
       background: var(--surface);
       border-bottom: 1px solid var(--border);
       display: flex;
@@ -67,8 +67,8 @@
     }
 
     #nav-brand img {
-      width: 68px;
-      height: 68px;
+      height: 90px;
+      width: auto;
       object-fit: contain;
     }
 
@@ -154,8 +154,8 @@
 
     /* ── MAIN AREA ───────────────────────────────────────────── */
     #main {
-      margin-top: 80px;
-      height: calc(100vh - 80px);
+      margin-top: 100px;
+      height: calc(100vh - 100px);
       overflow: hidden;
     }
 
@@ -485,6 +485,58 @@
 
     #chat-send-btn:hover:not(:disabled) { background: var(--teal-light); }
     #chat-send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    #chat-attach-btn {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      padding: 0 14px;
+      height: 72px;
+      border-radius: var(--radius);
+      font-size: 22px;
+      flex-shrink: 0;
+      cursor: pointer;
+      transition: color 0.15s, border-color 0.15s;
+    }
+    #chat-attach-btn:hover { color: var(--teal-light); border-color: var(--teal); }
+
+    #chat-attachments {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+    #chat-attachments:empty { display: none; }
+
+    .attach-chip {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 4px 10px 4px 10px;
+      font-size: 13px;
+      color: var(--text);
+      max-width: 280px;
+    }
+    .attach-chip.loading { opacity: 0.5; }
+    .attach-chip .chip-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .attach-chip .chip-remove {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 14px;
+      padding: 0 0 0 4px;
+      line-height: 1;
+      flex-shrink: 0;
+    }
+    .attach-chip .chip-remove:hover { color: var(--error); }
 
     #chat-hint {
       margin-top: 5px;
@@ -873,10 +925,10 @@
     /* ── HISTORY SIDEBAR ────────────────────────────────────── */
     #history-sidebar {
       position: fixed;
-      top: 80px;
+      top: 100px;
       left: -320px;
       width: 320px;
-      height: calc(100vh - 80px);
+      height: calc(100vh - 100px);
       background: var(--surface);
       border-right: 1px solid var(--border);
       z-index: 95;
@@ -890,7 +942,7 @@
     #history-overlay {
       display: none;
       position: fixed;
-      inset: 80px 0 0 0;
+      inset: 100px 0 0 0;
       z-index: 94;
       background: rgba(0,0,0,0.35);
     }
@@ -1008,7 +1060,7 @@
 ══════════════════════════════════════════════════════════ -->
 <nav id="navbar">
   <div id="nav-brand">
-    <img src="/static/logo.png" alt="OctoSlave logo">
+    <img src="/static/logo.png?v=2" alt="OctoSlave logo">
     <span class="brand-name">OctoSlave</span>
   </div>
 
@@ -1060,11 +1112,14 @@
     <div id="chat-messages"></div>
 
     <div id="chat-input-area">
+      <div id="chat-attachments"></div>
       <div id="chat-input-row">
+        <button id="chat-attach-btn" title="Attach files" type="button">📎</button>
+        <input type="file" id="chat-file-input" multiple style="display:none">
         <textarea id="chat-textarea" rows="3" placeholder="Ask OctoSlave anything…"></textarea>
         <button id="chat-send-btn">Send</button>
       </div>
-      <div id="chat-hint">Enter to send · Shift+Enter for newline</div>
+      <div id="chat-hint">Enter to send · Shift+Enter for newline · 📎 to attach files</div>
     </div>
   </div>
 
@@ -1263,8 +1318,9 @@ const state = {
   chatIsFirst: true,
   pendingToolCall: null,   // { name, summary }
   streamBuffer: '',        // raw text accumulation before markdown render
-  messages: [],            // mirror of server-side messages (for new-chat save)
-  currentChatId: null,     // id of currently loaded chat (null = new unsaved chat)
+  messages: [],            // lightweight mirror — only user messages, for "has conversation started" check
+  currentChatId: null,     // id of last saved/loaded chat; null = unsaved new chat
+  attachedFiles: [],       // [{name, path, chipId}] pending attachments
 
   // research
   researchDir: '',
@@ -1401,10 +1457,13 @@ function handleServerMessage(msg) {
     case 'done':        onDone(msg.iterations); break;
     case 'info':        appendChatInfo(msg.text); break;
     case 'error':       onServerError(msg.text); break;
-    case 'cleared':     clearChatMessages(); break;
+    case 'cleared':     break; // client already cleared on button press; ignore to avoid double-reset
 
     // Chat history
-    case 'chat_saved':  refreshHistoryIfOpen(); break;
+    case 'chat_saved':
+      if (msg.id) state.currentChatId = msg.id;
+      refreshHistoryIfOpen();
+      break;
     case 'chat_loaded': onChatLoaded(msg); break;
 
     // Research events
@@ -1479,11 +1538,22 @@ function populateModelSelects(models) {
 function sendChat() {
   const textarea = document.getElementById('chat-textarea');
   const text = textarea.value.trim();
-  if (!text || state.running) return;
+  const hasFiles = state.attachedFiles.length > 0;
+  if ((!text && !hasFiles) || state.running) return;
 
-  appendUserMessage(text);
+  // Build the message text, appending file paths for the agent
+  let fullText = text;
+  if (hasFiles) {
+    const paths = state.attachedFiles.map(f => `- ${f.path}`).join('\n');
+    fullText += (text ? '\n\n' : '') + `Attached files:\n${paths}`;
+  }
+
+  appendUserMessage(fullText);
   textarea.value = '';
   autoResizeTextarea(textarea);
+  // Clear attachment chips
+  document.getElementById('chat-attachments').innerHTML = '';
+  state.attachedFiles = [];
   setChatRunning(true);
 
   const model = document.getElementById('chat-model-input').value.trim();
@@ -1492,24 +1562,23 @@ function sendChat() {
   const type = state.chatIsFirst ? 'chat' : 'chat_continue';
   state.chatIsFirst = false;
 
-  sendMsg({ type, message: text, model, working_dir: dir });
+  sendMsg({ type, message: fullText, model, working_dir: dir });
 }
 
 // ── New chat ──────────────────────────────────────────────────
 document.getElementById('chat-new-btn').addEventListener('click', () => {
-  // Save current chat before clearing (if it has content)
-  if (state.messages && state.messages.length > 2) {
-    sendMsg({ type: 'save_chat' });
+  // Save if the conversation was never auto-saved (e.g. ended with an error)
+  if (state.messages.length > 0 && !state.currentChatId) {
+    sendMsg({ type: 'save_chat', chat_id: '' });
   }
   sendMsg({ type: 'chat_clear' });
-  state.chatIsFirst = true;
-  state.currentChatId = null;
   clearChatMessages();
   refreshHistoryIfOpen();
 });
 
 function clearChatMessages() {
   document.getElementById('chat-messages').innerHTML = '';
+  document.getElementById('chat-attachments').innerHTML = '';
   state.currentAssistantBubble = null;
   state.currentToolCallsDiv    = null;
   state.pendingToolCall        = null;
@@ -1517,6 +1586,7 @@ function clearChatMessages() {
   state.chatIsFirst            = true;
   state.messages               = [];
   state.currentChatId          = null;
+  state.attachedFiles          = [];
   setChatRunning(false);
 }
 
@@ -1635,6 +1705,10 @@ function onDone(iterations) {
   if (iterations !== undefined) {
     appendChatInfo(`✓ Done (${iterations} iterations)`);
   }
+  // Auto-save after every completed exchange; passes currentChatId so server updates the same file
+  if (state.messages.length > 0) {
+    sendMsg({ type: 'save_chat', chat_id: state.currentChatId || '' });
+  }
 }
 
 function onServerError(text) {
@@ -1643,6 +1717,10 @@ function onServerError(text) {
   state.currentAssistantBubble = null;
   state.currentToolCallsDiv    = null;
   state.streamBuffer           = '';
+  // Save whatever the server has so the conversation appears in history
+  if (state.messages.length > 0) {
+    sendMsg({ type: 'save_chat', chat_id: state.currentChatId || '' });
+  }
 }
 
 // ── Running state ─────────────────────────────────────────────
@@ -2150,14 +2228,15 @@ function loadChat(chatId) {
 }
 
 function onChatLoaded(msg) {
-  state.currentChatId = msg.id;
-  state.chatIsFirst = false;
   // Update model dropdown if provided
   if (msg.model) {
     const sel = document.getElementById('chat-model-input');
     if (sel.querySelector(`option[value="${CSS.escape(msg.model)}"]`)) sel.value = msg.model;
   }
   restoreChatDisplay(msg.messages || []);
+  // Restore after restoreChatDisplay→clearChatMessages nulls these out
+  state.currentChatId = msg.id;
+  state.chatIsFirst = false;
 }
 
 function restoreChatDisplay(messages) {
@@ -2270,6 +2349,61 @@ async function browseDir(inputId) {
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = '📂'; }
   }
+}
+
+// ════════════════════════════════════════════════════════════
+//  FILE ATTACHMENTS
+// ════════════════════════════════════════════════════════════
+
+document.getElementById('chat-attach-btn').addEventListener('click', () => {
+  document.getElementById('chat-file-input').click();
+});
+
+document.getElementById('chat-file-input').addEventListener('change', async (e) => {
+  const files = [...e.target.files];
+  e.target.value = ''; // reset so same file can be re-selected
+  const dir = document.getElementById('chat-dir-input').value.trim() || '.';
+
+  for (const file of files) {
+    const chipId = `chip-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    _addAttachChip(chipId, file.name, null); // loading state
+
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('working_dir', dir);
+    try {
+      const resp = await fetch('/api/upload', { method: 'POST', body: fd });
+      const data = await resp.json();
+      if (data.path) {
+        state.attachedFiles.push({ name: file.name, path: data.path, chipId });
+        const chip = document.getElementById(chipId);
+        if (chip) chip.classList.remove('loading');
+      } else {
+        document.getElementById(chipId)?.remove();
+        appendChatError(`Upload failed: ${esc(file.name)}`);
+      }
+    } catch (err) {
+      document.getElementById(chipId)?.remove();
+      appendChatError(`Upload failed: ${esc(file.name)}`);
+    }
+  }
+});
+
+function _addAttachChip(id, name, path) {
+  const area = document.getElementById('chat-attachments');
+  const chip = document.createElement('div');
+  chip.className = 'attach-chip' + (path === null ? ' loading' : '');
+  chip.id = id;
+  chip.innerHTML =
+    `<span>📄</span>` +
+    `<span class="chip-name" title="${esc(name)}">${esc(name)}</span>` +
+    `<button class="chip-remove" onclick="_removeAttachment('${id}')" title="Remove">✕</button>`;
+  area.appendChild(chip);
+}
+
+function _removeAttachment(chipId) {
+  document.getElementById(chipId)?.remove();
+  state.attachedFiles = state.attachedFiles.filter(f => f.chipId !== chipId);
 }
 
 connect();

@@ -19,7 +19,7 @@ from pathlib import Path
 from queue import Empty, Queue
 from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -58,15 +58,24 @@ def _chat_title(messages: list) -> str:
             return m["content"][:80]
     return "Untitled"
 
-def _save_chat(messages: list, model: str = "") -> str:
+def _save_chat(messages: list, model: str = "", chat_id: str = "") -> str:
     CHATS_DIR.mkdir(parents=True, exist_ok=True)
-    chat_id = f"chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
     now = datetime.now().isoformat(timespec="seconds")
+    if chat_id and _safe_chat_id(chat_id):
+        existing = CHATS_DIR / f"{chat_id}.json"
+        try:
+            existing_data = json.loads(existing.read_text())
+            created_at = existing_data.get("created_at", now)
+        except Exception:
+            created_at = now
+    else:
+        chat_id = f"chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        created_at = now
     data = {
         "id": chat_id,
         "title": _chat_title(messages),
         "model": model,
-        "created_at": now,
+        "created_at": created_at,
         "updated_at": now,
         "messages": messages,
     }
@@ -114,6 +123,30 @@ async def delete_chat(chat_id: str):
 @app.get("/")
 async def serve_index():
     return FileResponse(str(STATIC_DIR / "index.html"))
+
+
+@app.post("/api/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    working_dir: str = Form("."),
+):
+    """Save an uploaded file into <working_dir>/.uploads/ and return its path."""
+    upload_dir = Path(working_dir) / ".uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    filename = Path(file.filename).name  # strip any client-side path components
+    dest = upload_dir / filename
+    # avoid clobbering existing files
+    if dest.exists():
+        stem, suffix, i = dest.stem, dest.suffix, 1
+        while dest.exists():
+            dest = upload_dir / f"{stem}_{i}{suffix}"
+            i += 1
+
+    content = await file.read()
+    dest.write_bytes(content)
+    return {"path": str(dest.resolve()), "name": filename, "size": len(content)}
+
 
 
 @app.get("/api/pick-dir")
@@ -355,7 +388,8 @@ async def ws_endpoint(websocket: WebSocket):
 
             elif mtype == "save_chat":
                 if state["messages"]:
-                    chat_id = _save_chat(state["messages"], state.get("model", ""))
+                    existing_id = msg.get("chat_id", "")
+                    chat_id = _save_chat(state["messages"], state.get("model", ""), existing_id)
                     await send({"type": "chat_saved", "id": chat_id})
                 else:
                     await send({"type": "chat_saved", "id": None})

@@ -255,6 +255,25 @@ def _agent_loop(messages: list[dict], model: str, working_dir: str, client: Open
                     "Context window exceeded and cannot be trimmed further.\n"
                     "Use /compact to summarise history, or /clear to start fresh."
                 )
+            elif "Unterminated string" in err_str or "Extra data" in err_str:
+                # The model's tool-call arguments were cut off mid-stream, leaving
+                # invalid JSON in the message history.  Roll back the last assistant
+                # turn (and any partial tool results) and ask the model to retry.
+                while messages and messages[-1].get("role") in ("tool", "assistant"):
+                    messages.pop()
+                display.print_info(
+                    "Tool call arguments were truncated — rolling back and retrying."
+                )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your previous response was cut off before the tool arguments "
+                        "were complete. Please redo the last action from scratch, making "
+                        "sure to produce a complete, valid response."
+                    ),
+                })
+                iteration -= 1
+                continue
             else:
                 display.print_error(f"API error: {e}")
             break
@@ -300,7 +319,16 @@ def _agent_loop(messages: list[dict], model: str, working_dir: str, client: Open
             try:
                 args = json.loads(raw_args) if raw_args else {}
             except json.JSONDecodeError:
-                args = {}
+                # Arguments were truncated mid-stream — sanitize before they enter
+                # message history (prevents "Unterminated string" on next API call).
+                tc["function"]["arguments"] = "{}"
+                err_msg = (
+                    f"Tool call '{name}' had malformed JSON arguments "
+                    f"(the model's response was truncated). Please retry with complete arguments."
+                )
+                display.print_tool_result(name, err_msg, False)
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": err_msg})
+                continue
 
             display.print_tool_call(name, args)
             result, success = execute_tool(name, args, working_dir)
