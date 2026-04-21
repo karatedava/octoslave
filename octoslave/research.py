@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -87,7 +88,18 @@ ROLES: dict[str, dict] = {
         "max_iter": 40,
         "tools": ["read_file", "write_file", "bash", "list_dir", "glob"],
     },
+    "merger": {
+        "label": "Merger",
+        "icon": "🔀",
+        "color": "bold bright_cyan",
+        "default_model": "deepseek-v3.2",
+        "max_iter": 12,
+        "tools": ["read_file", "write_file"],
+    },
 }
+
+# Roles that can run as N independent parallel copies (no intra-round dependencies)
+PARALLEL_ROLES: frozenset[str] = frozenset({"researcher", "hypothesis", "evaluator"})
 
 # Per-round pipeline — reporter runs ONCE at the very end, not each round
 PIPELINE: list[str] = [
@@ -748,6 +760,159 @@ def _run_specialist(
 
 
 # ---------------------------------------------------------------------------
+# Parallel specialist runner + merger
+# ---------------------------------------------------------------------------
+
+def _run_parallel_specialists(
+    role: str,
+    n: int,
+    models: list[str],
+    topic: str,
+    round_num: int,
+    max_rounds: int,
+    round_dir: Path,
+    research_dir: str,
+    working_dir: str,
+    brief: str,
+    client: OpenAI,
+) -> list[Path]:
+    """
+    Run n independent copies of role in parallel, each writing to
+    round_dir/{role}_{i}/. Returns paths to outputs that were written.
+    """
+    def _run_one(i: int) -> Path | None:
+        sub_dir = round_dir / f"{role}_{i}"
+        sub_dir.mkdir(exist_ok=True)
+        model = models[(i - 1) % len(models)]
+        _run_specialist(
+            role=role,
+            model=model,
+            topic=topic,
+            round_num=round_num,
+            max_rounds=max_rounds,
+            round_dir=str(sub_dir),
+            research_dir=research_dir,
+            working_dir=working_dir,
+            brief=brief,
+            client=client,
+        )
+        out = sub_dir / OUTPUT_FILES[role]
+        return out if out.exists() else None
+
+    results: list[Path] = []
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        futures = {pool.submit(_run_one, i): i for i in range(1, n + 1)}
+        for f in as_completed(futures):
+            path = f.result()
+            if path:
+                results.append(path)
+    return results
+
+
+def _run_merger(
+    role: str,
+    parallel_outputs: list[Path],
+    canonical_path: Path,
+    round_num: int,
+    max_rounds: int,
+    round_dir: str,
+    research_dir: str,
+    working_dir: str,
+    client: OpenAI,
+) -> bool:
+    """
+    Reconcile parallel agent outputs into one canonical file.
+    Returns True if canonical_path was written successfully.
+    """
+    cfg = ROLES["merger"]
+    tools = _tools_for_role("merger")
+    paths_block = "\n".join(f"  {i + 1}. {p}" for i, p in enumerate(parallel_outputs))
+    role_label = ROLES[role]["label"]
+
+    system_prompt = (
+        f"You are the Merger in OctoSlave's autonomous research pipeline.\n\n"
+        f"ROUND          : {round_num} / {max_rounds}\n"
+        f"ROUND DIR      : {round_dir}\n"
+        f"RESEARCH DIR   : {research_dir}\n"
+        f"WORKING DIR    : {working_dir}\n\n"
+        f"YOUR MISSION\n"
+        f"Reconcile {len(parallel_outputs)} independent {role_label} outputs into one\n"
+        f"authoritative canonical file. Read every parallel output, identify where\n"
+        f"agents agree and diverge, and write the best synthesis.\n\n"
+        f"PARALLEL OUTPUTS\n{paths_block}\n\n"
+        f"CANONICAL OUTPUT: {canonical_path}\n\n"
+        f"RECONCILIATION RULES\n"
+        f"- Preserve all unique insights that appear in any single output.\n"
+        f"- Where agents agree, state the consensus confidently.\n"
+        f"- Where agents disagree, present the strongest position or note both.\n"
+        f"- For EVALUATOR outputs: average numeric scores; flag any dimension where\n"
+        f"  scores differ by more than 2 points as (DISPUTED).\n"
+        f"- For RESEARCHER outputs: merge datasets and references without duplication;\n"
+        f"  prefer sources that multiple agents identified independently.\n"
+        f"- For HYPOTHESIS outputs: adopt the stronger design fully, or hybridise if\n"
+        f"  both have complementary strengths. Produce one clear experiment spec.\n"
+        f"- Use the same section structure as the individual outputs.\n"
+        f"- Write ONLY the canonical output file — no other files.\n"
+    )
+
+    messages: list[dict] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": (
+            f"Read all parallel outputs listed above, then write the merged result "
+            f"to {canonical_path}. When done, stop calling tools."
+        )},
+    ]
+
+    display.print_agent_banner("merger", cfg["default_model"], round_num, max_rounds)
+
+    t0 = time.time()
+    iteration = 0
+    for iteration in range(1, cfg["max_iter"] + 1):
+        try:
+            response = _stream_completion_with_tools(client, cfg["default_model"], messages, tools)
+        except BadRequestError as e:
+            err = str(e)
+            if "ContextWindow" in err or "context" in err.lower():
+                messages = _trim_messages(messages)
+                continue
+            display.print_error(f"[Merger] API error: {e}")
+            return False
+        except KeyboardInterrupt:
+            display.stream_end(False)
+            raise
+
+        content = response["content"]
+        tool_calls = response["tool_calls"]
+        finish_reason = response["finish_reason"]
+
+        assistant_msg: dict = {"role": "assistant", "content": content or None}
+        if tool_calls:
+            assistant_msg["tool_calls"] = tool_calls
+        messages.append(assistant_msg)
+
+        if not tool_calls or finish_reason == "stop":
+            break
+
+        display.print_separator()
+        for tc in tool_calls:
+            name = tc["function"]["name"]
+            try:
+                args = json.loads(tc["function"]["arguments"] or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            display.print_tool_call(name, args)
+            result, success = execute_tool(name, args, working_dir)
+            result = _cap_result(result, name)
+            display.print_tool_result(name, result, success)
+            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+        display.print_separator()
+
+    elapsed = time.time() - t0
+    display.print_agent_done("merger", elapsed, iteration)
+    return canonical_path.exists()
+
+
+# ---------------------------------------------------------------------------
 # findings.md updater — called by the pipeline, not the LLM
 # ---------------------------------------------------------------------------
 
@@ -1187,17 +1352,20 @@ def run_long_research(
     max_rounds: int = 5,
     model_overrides: dict[str, str] | None = None,
     resume: bool = False,
+    num_parallel: int = 1,
 ) -> None:
     """
     Run the full autonomous multi-agent research pipeline.
 
     Args:
-        topic:          The research topic / goal.
-        working_dir:    The project working directory.
-        client:         Authenticated OpenAI client.
-        max_rounds:     Maximum number of research rounds.
+        topic:           The research topic / goal.
+        working_dir:     The project working directory.
+        client:          Authenticated OpenAI client.
+        max_rounds:      Maximum number of research rounds.
         model_overrides: Per-role model overrides, e.g. {"coder": "qwen3-coder-30b"}.
-        resume:         If True, skip rounds whose output files already exist.
+        resume:          If True, skip rounds whose output files already exist.
+        num_parallel:    Number of independent agent copies to run for parallelisable
+                         roles (researcher, hypothesis, evaluator). Default 1 = sequential.
     """
     overrides = model_overrides or {}
     research_dir = Path(working_dir) / "research"
@@ -1252,6 +1420,9 @@ def run_long_research(
         for role in PIPELINE:
             model = overrides.get(role) or ROLES[role]["default_model"]
 
+            # Resumability: skip if canonical output already exists
+            expected_path = round_dir / OUTPUT_FILES[role]
+            if resume and expected_path.exists():
             # Resumability: skip if output already exists (and is non-empty for coder)
             expected = OUTPUT_FILES[role]
             expected_path = round_dir / expected
@@ -1266,18 +1437,59 @@ def run_long_research(
                 continue
 
             try:
-                ok = _run_specialist(
-                    role=role,
-                    model=model,
-                    topic=topic,
-                    round_num=round_num,
-                    max_rounds=max_rounds,
-                    round_dir=str(round_dir),
-                    research_dir=str(research_dir),
-                    working_dir=working_dir,
-                    brief=brief,
-                    client=client,
-                )
+                if num_parallel > 1 and role in PARALLEL_ROLES:
+                    display.print_info(
+                        f"  ⚡ Spawning {num_parallel} parallel "
+                        f"{ROLES[role]['label']} agents…"
+                    )
+                    parallel_outputs = _run_parallel_specialists(
+                        role=role,
+                        n=num_parallel,
+                        models=[model] * num_parallel,
+                        topic=topic,
+                        round_num=round_num,
+                        max_rounds=max_rounds,
+                        round_dir=round_dir,
+                        research_dir=str(research_dir),
+                        working_dir=working_dir,
+                        brief=brief,
+                        client=client,
+                    )
+                    if parallel_outputs:
+                        _run_merger(
+                            role=role,
+                            parallel_outputs=parallel_outputs,
+                            canonical_path=expected_path,
+                            round_num=round_num,
+                            max_rounds=max_rounds,
+                            round_dir=str(round_dir),
+                            research_dir=str(research_dir),
+                            working_dir=working_dir,
+                            client=client,
+                        )
+                    else:
+                        display.print_error(
+                            f"All parallel {ROLES[role]['label']} agents failed "
+                            f"in round {round_num}. Continuing."
+                        )
+                else:
+                    ok = _run_specialist(
+                        role=role,
+                        model=model,
+                        topic=topic,
+                        round_num=round_num,
+                        max_rounds=max_rounds,
+                        round_dir=str(round_dir),
+                        research_dir=str(research_dir),
+                        working_dir=working_dir,
+                        brief=brief,
+                        client=client,
+                    )
+                    if not ok:
+                        display.print_error(
+                            f"{ROLES[role]['label']} failed in round {round_num}. "
+                            "Continuing with next agent."
+                        )
             except KeyboardInterrupt:
                 display.console.print(
                     "\n[bold yellow]Research paused.[/bold yellow] "
