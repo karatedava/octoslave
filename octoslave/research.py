@@ -1423,10 +1423,10 @@ def run_long_research(
             # Resumability: skip if canonical output already exists
             expected_path = round_dir / OUTPUT_FILES[role]
             if resume and expected_path.exists():
-            # Resumability: skip if output already exists (and is non-empty for coder)
-            expected = OUTPUT_FILES[role]
-            expected_path = round_dir / expected
-            output_complete = expected_path.exists()
+                # Resumability: skip if output already exists (and is non-empty for coder)
+                expected = OUTPUT_FILES[role]
+                expected_path = round_dir / expected
+                output_complete = expected_path.exists()
             if output_complete and role == "coder":
                 # For the coder, the directory must contain IMPLEMENTATION.md to be valid
                 output_complete = (expected_path / "IMPLEMENTATION.md").exists()
