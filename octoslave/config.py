@@ -10,7 +10,7 @@ CONFIG_DIR = Path.home() / ".octoslave"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 BASE_URL = "https://llm.ai.e-infra.cz/v1"
-DEFAULT_MODEL = "deepseek-v3.2-thinking"
+DEFAULT_MODEL = "deepseek-v3.2"
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
 
 KNOWN_MODELS = [
