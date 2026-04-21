@@ -95,6 +95,7 @@ TOOL_DEFINITIONS = [
             "description": (
                 "Execute a shell command and return stdout + stderr. "
                 "Use for running tests, installing packages, building, git operations, etc."
+                "Always use timeout on every bash command to avoid getting stuck"
             ),
             "parameters": {
                 "type": "object",
