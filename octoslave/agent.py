@@ -2,16 +2,63 @@
 
 import json
 from datetime import date
+from pathlib import Path
 from openai import OpenAI, BadRequestError
 
 from . import display
 from .tools import TOOL_DEFINITIONS, execute_tool
+from .config import load_config
 
 MAX_ITERATIONS = 100
 
 # Hard cap on characters in a single tool result that goes into the message history.
 # Prevents a single large file/page from blowing up the context window.
 MAX_TOOL_RESULT_CHARS = 50_000
+
+# Path to prompt profiles directory
+PROMPT_PROFILES_DIR = Path(__file__).parent / "prompt_profiles"
+
+
+def load_system_prompt(profile: str = "base", working_dir: str = None) -> str:
+    """
+    Load a system prompt from a profile file in the prompt_profiles directory.
+    
+    Args:
+        profile: Profile name without extension (e.g., "base" or "simple")
+        working_dir: Current working directory to substitute in the prompt
+    
+    Returns:
+        The system prompt string with working_dir and date substituted
+    
+    Raises:
+        FileNotFoundError: If the profile file doesn't exist
+    """
+    profile_file = PROMPT_PROFILES_DIR / f"{profile}.md"
+    
+    if not profile_file.exists():
+        available = [f.stem for f in PROMPT_PROFILES_DIR.glob("*.md")]
+        raise FileNotFoundError(
+            f"Prompt profile '{profile}' not found. Available profiles: {available}"
+        )
+    
+    content = profile_file.read_text()
+    
+    # Strip the outer triple quotes and line continuation if present
+    # Format is: """\ followed by newline at start, and """ at end
+    content = content.strip()
+    if content.startswith('"""'):
+        content = content[3:]  # Remove opening """
+        if content.startswith('\\\n'):
+            content = content[2:]  # Remove \ and newline
+        elif content.startswith('\\'):
+            content = content[1:]  # Remove just \
+    if content.endswith('"""'):
+        content = content[:-3]  # Remove closing """
+    content = content.strip()
+    
+    # Substitute placeholders
+    wd = working_dir or Path.cwd().resolve()
+    return content.format(working_dir=wd, date=date.today().isoformat())
 
 
 def _trim_messages(messages: list[dict], groups: int = 3) -> list[dict]:
@@ -201,18 +248,22 @@ def run_agent(
     model: str,
     working_dir: str,
     client: OpenAI,
+    prompt_profile: str = "base",
+    permission_mode: str = None,
 ) -> list[dict]:
+    if permission_mode is None:
+        cfg = load_config()
+        permission_mode = cfg.get("permission_mode", "autonomous")
+    
+    system_prompt = load_system_prompt(prompt_profile, working_dir)
     messages: list[dict] = [
         {
             "role": "system",
-            "content": SYSTEM_PROMPT.format(
-                working_dir=working_dir,
-                date=date.today().isoformat(),
-            ),
+            "content": system_prompt,
         },
         {"role": "user", "content": task},
     ]
-    return _agent_loop(messages, model, working_dir, client)
+    return _agent_loop(messages, model, working_dir, client, permission_mode)
 
 
 def continue_agent(
@@ -221,12 +272,23 @@ def continue_agent(
     model: str,
     working_dir: str,
     client: OpenAI,
+    permission_mode: str = None,
 ) -> list[dict]:
+    if permission_mode is None:
+        cfg = load_config()
+        permission_mode = cfg.get("permission_mode", "autonomous")
+    
     messages.append({"role": "user", "content": follow_up})
-    return _agent_loop(messages, model, working_dir, client)
+    return _agent_loop(messages, model, working_dir, client, permission_mode)
 
 
-def _agent_loop(messages: list[dict], model: str, working_dir: str, client: OpenAI) -> list[dict]:
+def _agent_loop(
+    messages: list[dict], 
+    model: str, 
+    working_dir: str, 
+    client: OpenAI,
+    permission_mode: str = "autonomous",
+) -> list[dict]:
     import time as _time
     from collections import Counter
     iteration = 0
@@ -330,7 +392,7 @@ def _agent_loop(messages: list[dict], model: str, working_dir: str, client: Open
                 continue
 
             display.print_tool_call(name, args)
-            result, success = execute_tool(name, args, working_dir)
+            result, success = execute_tool(name, args, working_dir, permission_mode)
 
             # Cap result size BEFORE it enters the message history
             result = _cap_result(result, name)

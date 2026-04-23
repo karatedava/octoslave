@@ -52,8 +52,12 @@ _HISTORY_FILE = Path.home() / ".octoslave" / "history"
 @click.option("--api-key", default=None, envvar="OCTOSLAVE_API_KEY")
 @click.option("--base-url", default=None, envvar="OCTOSLAVE_BASE_URL")
 @click.option("--local", is_flag=True, default=False, help="Use local Ollama models")
+@click.option("-p", "--prompt-profile", default="base", help="Prompt profile to use (default: base, options: base, simple, strict)")
+@click.option("--permission-mode", default=None, 
+              type=click.Choice(["autonomous", "controlled", "supervised"]),
+              help="Permission mode: autonomous (default), controlled (ask before all edits), or supervised (ask before file edits only)")
 @click.pass_context
-def cli(ctx, model, working_dir, api_key, base_url, local):
+def cli(ctx, model, working_dir, api_key, base_url, local, prompt_profile, permission_mode):
     """OctoSlave — autonomous AI research & coding assistant.
 
     Run without arguments to enter interactive mode.
@@ -64,6 +68,8 @@ def cli(ctx, model, working_dir, api_key, base_url, local):
     ctx.obj["api_key"] = api_key
     ctx.obj["base_url"] = base_url
     ctx.obj["local"] = local
+    ctx.obj["prompt_profile"] = prompt_profile
+    ctx.obj["permission_mode"] = permission_mode
 
     if ctx.invoked_subcommand is None:
         _interactive(ctx.obj)
@@ -80,8 +86,12 @@ def cli(ctx, model, working_dir, api_key, base_url, local):
 @click.option("--api-key", default=None, envvar="OCTOSLAVE_API_KEY")
 @click.option("--base-url", default=None, envvar="OCTOSLAVE_BASE_URL")
 @click.option("--local", is_flag=True, default=False, help="Use local Ollama models")
+@click.option("-p", "--prompt-profile", default="base", help="Prompt profile to use (default: base, options: base, simple, strict)")
 @click.option("-i", "--interactive", is_flag=True, help="Stay interactive after task")
-def run(task, model, working_dir, api_key, base_url, local, interactive):
+@click.option("--permission-mode", default=None, 
+              type=click.Choice(["autonomous", "controlled", "supervised"]),
+              help="Permission mode: autonomous (default), controlled (ask before all edits), or supervised (ask before file edits only)")
+def run(task, model, working_dir, api_key, base_url, local, prompt_profile, interactive, permission_mode):
     """Run a single TASK and exit (or continue interactively with -i).
 
     \b
@@ -90,13 +100,39 @@ def run(task, model, working_dir, api_key, base_url, local, interactive):
       ots run "research recent papers on RAG" --model qwen3-coder
       ots run "add unit tests" -i
       ots run "explain this codebase" --local
+      ots run "do whatever" -p simple  # use simple profile for more flexibility
+      ots run "fix the bug" -p strict  # use strict profile to confirm before editing
+      ots run "edit files" --permission-mode controlled  # ask before each edit
     """
     cfg = _resolve_config(model, working_dir, api_key, base_url, local=local)
+    cfg["prompt_profile"] = prompt_profile
+    
+    # Override permission mode if specified
+    if permission_mode:
+        cfg["permission_mode"] = permission_mode
+    else:
+        saved_cfg = load_config()
+        cfg["permission_mode"] = saved_cfg.get("permission_mode", "autonomous")
+    
     display.print_header(cfg["model"], cfg["working_dir"], local=cfg["backend"] == "ollama")
+    
+    # Show permission mode in header
+    if cfg["permission_mode"] == "autonomous":
+        mode_tag = "[bold green]autonomous[/bold green]"
+    elif cfg["permission_mode"] == "controlled":
+        mode_tag = "[bold yellow]controlled[/bold yellow]"
+    else:
+        mode_tag = "[bold cyan]supervised[/bold cyan]"
+    display.console.print(f"[dim]permission mode: {mode_tag}[/dim]")
+    display.console.print()
+    
     display.print_task(task)
 
     client = make_client(cfg["api_key"], cfg["base_url"])
-    messages = run_agent(task, cfg["model"], cfg["working_dir"], client)
+    messages = run_agent(
+        task, cfg["model"], cfg["working_dir"], client, 
+        prompt_profile, cfg["permission_mode"]
+    )
 
     if interactive:
         _repl_loop(client, cfg, messages)
@@ -111,20 +147,25 @@ def run(task, model, working_dir, api_key, base_url, local, interactive):
 @click.option("--model", default=None)
 @click.option("--base-url", default=None)
 @click.option("--ollama-url", default=None, help="Ollama base URL (default: http://localhost:11434/v1)")
+@click.option("--permission-mode", default=None, 
+              type=click.Choice(["autonomous", "controlled", "supervised"]),
+              help="Permission mode: autonomous (default), controlled (ask before all edits), or supervised (ask before file edits only)")
 @click.option("--show", is_flag=True, help="Show current config")
-def config(api_key, model, base_url, ollama_url, show):
-    """Configure API key, default model, base URL, and Ollama settings."""
+def config(api_key, model, base_url, ollama_url, permission_mode, show):
+    """Configure API key, default model, base URL, Ollama settings, and permission mode."""
     current = load_config()
 
     if show:
         key = current.get("api_key", "")
         masked = (key[:8] + "…" + key[-4:]) if len(key) > 12 else ("set" if key else "not set")
         backend = current.get("backend", "einfra")
+        perm_mode = current.get("permission_mode", "autonomous")
         display.console.print(f"[bold]backend[/bold]      : {backend}")
         display.console.print(f"[bold]api_key[/bold]      : {masked}")
         display.console.print(f"[bold]base_url[/bold]     : {current.get('base_url')}")
         display.console.print(f"[bold]default_model[/bold]: {current.get('default_model')}")
         display.console.print(f"[bold]ollama_url[/bold]   : {current.get('ollama_url', OLLAMA_BASE_URL)}")
+        display.console.print(f"[bold]permission_mode[/bold]: {perm_mode}")
         if backend == "ollama":
             running = ollama_is_running(current.get("ollama_url", OLLAMA_BASE_URL))
             pulled = ollama_list_models(current.get("ollama_url", OLLAMA_BASE_URL))
@@ -141,8 +182,9 @@ def config(api_key, model, base_url, ollama_url, show):
     new_model = model or current.get("default_model", DEFAULT_MODEL)
     new_ollama = ollama_url or current.get("ollama_url", OLLAMA_BASE_URL)
     new_backend = current.get("backend", "einfra")
+    new_perm_mode = permission_mode or current.get("permission_mode", "autonomous")
 
-    if not any([api_key, model, base_url, ollama_url]):
+    if not any([api_key, model, base_url, ollama_url, permission_mode]):
         display.console.print("[bold]OctoSlave — setup[/bold]\n")
         display.console.print(
             "  [bold]einfra[/bold]  — e-INFRA CZ cloud API  "
@@ -203,7 +245,25 @@ def config(api_key, model, base_url, ollama_url, show):
                     )
                     new_model = click.prompt("Default model (set after pulling)", default="llama3.1:8b")
 
-    save_config(new_key, new_url, new_model, backend=new_backend, ollama_url=new_ollama)
+        # Ask about permission mode if not explicitly set
+        display.console.print(
+            "\n  [bold]Permission mode:[/bold]\n"
+            "  [bold]autonomous[/bold]  — work without asking (default)\n"
+            "  [bold]controlled[/bold]  — ask before file edits or commands\n"
+            "  [bold]supervised[/bold]  — ask before file edits, auto-allow commands\n"
+        )
+        new_perm_mode = click.prompt(
+            "Permission mode",
+            default=new_perm_mode,
+            type=click.Choice(["autonomous", "controlled", "supervised"]),
+        )
+
+    save_config(
+        new_key, new_url, new_model, 
+        backend=new_backend, 
+        ollama_url=new_ollama,
+        permission_mode=new_perm_mode,
+    )
     display.console.print("[bold green]Config saved.[/bold green]")
 
 
@@ -262,6 +322,14 @@ def _interactive(ctx_obj: dict):
         ctx_obj.get("base_url"),
         local=ctx_obj.get("local", False),
     )
+    cfg["prompt_profile"] = ctx_obj.get("prompt_profile", "base")
+    
+    # Handle permission mode from CLI or config
+    if ctx_obj.get("permission_mode"):
+        cfg["permission_mode"] = ctx_obj["permission_mode"]
+    else:
+        saved_cfg = load_config()
+        cfg["permission_mode"] = saved_cfg.get("permission_mode", "autonomous")
 
     is_local = cfg["backend"] == "ollama"
 
@@ -273,6 +341,17 @@ def _interactive(ctx_obj: dict):
         sys.exit(1)
 
     display.print_welcome(cfg["model"], cfg["working_dir"], local=is_local)
+    
+    # Show permission mode
+    if cfg["permission_mode"] == "autonomous":
+        mode_tag = "[bold green]autonomous[/bold green]"
+    elif cfg["permission_mode"] == "controlled":
+        mode_tag = "[bold yellow]controlled[/bold yellow]"
+    else:
+        mode_tag = "[bold cyan]supervised[/bold cyan]"
+    display.console.print(f"[dim]permission mode: {mode_tag}[/dim]")
+    display.console.print()
+    
     client = make_client(cfg["api_key"], cfg["base_url"])
     messages: list[dict] = []
 
@@ -295,6 +374,8 @@ def _repl_loop(client, cfg: dict, messages: list[dict]):
         "ollama_url":  cfg.get("ollama_url", OLLAMA_BASE_URL),
         "api_key":     cfg.get("api_key", ""),
         "base_url":    cfg.get("base_url", BASE_URL),
+        "prompt_profile": cfg.get("prompt_profile", "base"),
+        "permission_mode": cfg.get("permission_mode", "autonomous"),
     }
 
     while True:
@@ -329,11 +410,18 @@ def _repl_loop(client, cfg: dict, messages: list[dict]):
         display.print_task(user_input)
         try:
             if messages:
-                messages = continue_agent(messages, user_input, state["model"],
-                                          state["working_dir"], client)
+                messages = continue_agent(
+                    messages, user_input, state["model"],
+                    state["working_dir"], client,
+                    state["permission_mode"]
+                )
             else:
-                messages = run_agent(user_input, state["model"],
-                                     state["working_dir"], client)
+                messages = run_agent(
+                    user_input, state["model"],
+                    state["working_dir"], client,
+                    state["prompt_profile"],
+                    state["permission_mode"]
+                )
         except KeyboardInterrupt:
             display.console.print("\n[dim]Interrupted.[/dim]")
             messages = []
@@ -399,6 +487,64 @@ def _handle_slash(cmd: str, state: dict, cfg: dict, messages: list, client) -> s
                 state["working_dir"] = new_dir
                 display.console.print(f"[dim]Dir set to[/dim] {new_dir}")
                 messages.clear()
+        return "ok"
+
+    if name == "/profile":
+        from .agent import load_system_prompt
+        if not arg:
+            current = state.get("prompt_profile", "base")
+            available = ["base", "simple", "strict"]
+            display.console.print(f"[dim]Current profile:[/dim] [bold]{current}[/bold]")
+            display.console.print(f"[dim]Available profiles:[/dim] {', '.join(available)}")
+            display.console.print("[dim]Usage: /profile <name>  e.g. /profile simple[/dim]")
+        else:
+            # Validate profile exists
+            try:
+                test_prompt = load_system_prompt(arg, state["working_dir"])
+                state["prompt_profile"] = arg
+                display.console.print(
+                    f"[dim]Prompt profile set to[/dim] [bold magenta]{arg}[/bold magenta]"
+                )
+                display.console.print(
+                    "[dim]Note: Profile will be used for the next task (new conversation).[/dim]"
+                )
+                messages.clear()
+            except FileNotFoundError as e:
+                display.print_error(str(e))
+        return "ok"
+
+    if name == "/permission":
+        if not arg:
+            current = state.get("permission_mode", "autonomous")
+            available = ["autonomous", "controlled", "supervised"]
+            display.console.print(f"[dim]Current permission mode:[/dim] [bold]{current}[/bold]")
+            display.console.print(f"[dim]Available modes:[/dim] {', '.join(available)}")
+            display.console.print(
+                "[dim]Usage: /permission <mode>  e.g. /permission controlled[/dim]\n"
+                "[dim]  autonomous — work without asking (default)[/dim]\n"
+                "[dim]  controlled — ask before file edits or commands[/dim]\n"
+                "[dim]  supervised — ask before file edits, auto-allow commands[/dim]"
+            )
+        else:
+            arg = arg.lower()
+            if arg not in ("autonomous", "controlled", "supervised"):
+                display.print_error(
+                    f"Invalid mode '{arg}'. Use 'autonomous', 'controlled', or 'supervised'."
+                )
+                return "ok"
+            state["permission_mode"] = arg
+            if arg == "autonomous":
+                mode_tag = "[bold green]autonomous[/bold green]"
+            elif arg == "controlled":
+                mode_tag = "[bold yellow]controlled[/bold yellow]"
+            else:
+                mode_tag = "[bold cyan]supervised[/bold cyan]"
+            display.console.print(
+                f"[dim]Permission mode set to[/dim] {mode_tag}"
+            )
+            display.console.print(
+                "[dim]Note: Mode will apply to the next tool execution.[/dim]"
+            )
         return "ok"
 
     if name == "/compact":
@@ -636,9 +782,17 @@ def _make_toolbar(state: dict):
         wd = "…" + wd[-43:]
     is_local = state.get("backend") == "ollama"
     backend_tag = " [local]" if is_local else ""
+    profile = state.get("prompt_profile", "base")
+    perm_mode = state.get("permission_mode", "autonomous")
+    if perm_mode == "autonomous":
+        perm_short = "auto"
+    elif perm_mode == "controlled":
+        perm_short = "ctrl"
+    else:
+        perm_short = "supv"
     return HTML(
-        f'<bottom-toolbar>  dir: {wd}{backend_tag}'
-        f'   /help · /model · /local · /einfra · /clear · /exit</bottom-toolbar>'
+        f'<bottom-toolbar>  dir: {wd}{backend_tag}  profile:{profile}  perm:{perm_short}'
+        f'   /help · /model · /profile · /permission · /local · /einfra · /clear · /exit</bottom-toolbar>'
     )
 
 

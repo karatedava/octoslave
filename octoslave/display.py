@@ -327,6 +327,8 @@ def print_help():
         "[bold white]Slash commands[/bold white]\n\n"
         "  [cyan]/model [NAME][/cyan]         Switch model (or list if no name given)\n"
         "  [cyan]/dir [PATH][/cyan]           Change working directory\n"
+        "  [cyan]/profile [NAME][/cyan]       Switch prompt profile (base/simple/strict)\n"
+        "  [cyan]/permission [MODE][/cyan]    Switch permission mode (autonomous/controlled)\n"
         "  [cyan]/clear[/cyan]                Clear screen and conversation history\n"
         "  [cyan]/compact[/cyan]              Summarise history to save context\n"
         "  [cyan]/long-research TOPIC[/cyan]  Launch multi-agent research pipeline\n"
@@ -336,6 +338,10 @@ def print_help():
         "  [cyan]/local [MODEL][/cyan]        Switch to local Ollama models\n"
         "  [cyan]/einfra[/cyan]               Switch back to e-INFRA CZ\n"
         "  [cyan]/pull MODEL[/cyan]           Pull a new Ollama model\n\n"
+        "[bold white]Permission modes:[/bold white]\n"
+        "  [cyan]autonomous[/cyan]  — work without asking (default)\n"
+        "  [cyan]controlled[/cyan]  — ask before file edits or commands\n"
+        "  [cyan]supervised[/cyan]  — ask before file edits, auto-allow commands\n\n"
         "[bold white]/long-research flags:[/bold white]\n"
         "  [cyan]--rounds N[/cyan]            Number of research rounds (default 5)\n"
         "  [cyan]--overseer MODEL[/cyan]      Model for orchestrator (default mistral-small-4)\n"
@@ -443,6 +449,70 @@ def print_research_complete(rounds_done: int, research_dir: str):
         padding=(0, 2),
     ))
     console.print()
+
+
+def request_permission(tool_name: str, args: dict, working_dir: str, permission_mode: str = "controlled") -> bool:
+    """
+    Request user permission for a tool that modifies state.
+    Returns True if allowed, False if denied.
+    
+    In controlled mode, this displays a prompt and waits for user input.
+    In supervised mode, the title reflects that bash commands are auto-approved.
+    """
+    # Build a descriptive message about what the tool will do
+    icon = _TOOL_ICONS.get(tool_name, "⚙")
+    
+    if tool_name == "write_file":
+        path = args.get("path", "")
+        desc = f"create/overwrite file: {path}"
+    elif tool_name == "edit_file":
+        path = args.get("path", "")
+        desc = f"edit file: {path}"
+    elif tool_name == "bash":
+        cmd = args.get("command", "")
+        cmd_preview = (cmd[:60] + "...") if len(cmd) > 60 else cmd
+        desc = f"run command: {cmd_preview}"
+    else:
+        desc = f"execute: {tool_name}"
+    
+    # Determine mode title and border color
+    if permission_mode == "supervised":
+        title = "[bold cyan]Supervised Mode[/bold cyan]"
+        border_style = "cyan"
+    else:
+        title = "[bold cyan]Controlled Mode[/bold cyan]"
+        border_style = "yellow"
+    
+    console.print()
+    console.print(
+        Panel(
+            f"[bold yellow]⚠ Permission Required[/bold yellow]\n\n"
+            f"[dim]{icon} {tool_name}[/dim]\n\n"
+            f"OctoSlave wants to: [bold]{desc}[/bold]\n\n"
+            f"Working directory: [dim]{working_dir}[/dim]",
+            title=title,
+            border_style=border_style,
+            padding=(1, 2),
+        )
+    )
+    console.print()
+    
+    # Get user input
+    while True:
+        try:
+            response = console.input(
+                "[bold green]Allow?[/bold green] [cyan](y)[/cyan]/[red](n)[/red] "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            return False
+        
+        if response in ("y", "yes", "ok", "allow"):
+            return True
+        elif response in ("n", "no", "deny"):
+            return False
+        else:
+            console.print("[dim]Please enter 'y' for yes or 'n' for no.[/dim]")
 
 
 def _get_role_cfg(role: str) -> dict:
