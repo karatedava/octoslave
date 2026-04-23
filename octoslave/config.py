@@ -168,6 +168,7 @@ def load_config() -> dict:
         "default_model": DEFAULT_MODEL,
         "backend": "einfra",        # "einfra" | "ollama"
         "ollama_url": OLLAMA_BASE_URL,
+        "permission_mode": "autonomous",  # "autonomous" | "controlled" | "supervised"
     }
     # Env vars override config file
     if os.environ.get("OCTOSLAVE_API_KEY"):
@@ -180,6 +181,8 @@ def load_config() -> dict:
         config["backend"] = os.environ["OCTOSLAVE_BACKEND"]
     if os.environ.get("OCTOSLAVE_OLLAMA_URL"):
         config["ollama_url"] = os.environ["OCTOSLAVE_OLLAMA_URL"]
+    if os.environ.get("OCTOSLAVE_PERMISSION_MODE"):
+        config["permission_mode"] = os.environ["OCTOSLAVE_PERMISSION_MODE"]
 
     if CONFIG_FILE.exists():
         try:
@@ -190,11 +193,12 @@ def load_config() -> dict:
             #   default_model→OCTOSLAVE_MODEL, backend→OCTOSLAVE_BACKEND,
             #   ollama_url→OCTOSLAVE_OLLAMA_URL
             _env_keys = {
-                "api_key":       "OCTOSLAVE_API_KEY",
-                "base_url":      "OCTOSLAVE_BASE_URL",
-                "default_model": "OCTOSLAVE_MODEL",
-                "backend":       "OCTOSLAVE_BACKEND",
-                "ollama_url":    "OCTOSLAVE_OLLAMA_URL",
+                "api_key":          "OCTOSLAVE_API_KEY",
+                "base_url":         "OCTOSLAVE_BASE_URL",
+                "default_model":    "OCTOSLAVE_MODEL",
+                "backend":          "OCTOSLAVE_BACKEND",
+                "ollama_url":       "OCTOSLAVE_OLLAMA_URL",
+                "permission_mode":  "OCTOSLAVE_PERMISSION_MODE",
             }
             for key, env_var in _env_keys.items():
                 if not os.environ.get(env_var) and saved.get(key):
@@ -211,6 +215,7 @@ def save_config(
     default_model: str = DEFAULT_MODEL,
     backend: str = "einfra",
     ollama_url: str = OLLAMA_BASE_URL,
+    permission_mode: str = "autonomous",
 ):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     data = {
@@ -219,6 +224,7 @@ def save_config(
         "default_model": default_model,
         "backend": backend,
         "ollama_url": ollama_url,
+        "permission_mode": permission_mode,
     }
     with open(CONFIG_FILE, "w") as f:
         json.dump(data, f, indent=2)

@@ -27,6 +27,12 @@ try:
 except ImportError:
     _HAS_BS4 = False
 
+# Tools that require permission in controlled mode
+MODIFYING_TOOLS = {"write_file", "edit_file", "bash"}
+
+# Tools that require permission only in controlled mode (not supervised)
+FILE_MODIFYING_TOOLS = {"write_file", "edit_file"}
+
 # ---------------------------------------------------------------------------
 # Tool schemas (sent to the model)
 # ---------------------------------------------------------------------------
@@ -198,8 +204,28 @@ TOOL_DEFINITIONS = [
 # Tool execution
 # ---------------------------------------------------------------------------
 
-def execute_tool(name: str, args: dict, working_dir: str) -> tuple[str, bool]:
+def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str = "autonomous") -> tuple[str, bool]:
     """Execute a tool. Returns (result_text, success)."""
+    # Check permission for modifying tools
+    # - controlled: ask for all modifying tools (file ops + bash)
+    # - supervised: ask only for file operations (allow bash without asking)
+    if permission_mode == "controlled" and name in MODIFYING_TOOLS:
+        try:
+            from . import display
+            if not display.request_permission(name, args, working_dir, permission_mode):
+                return f"Permission denied by user for {name}", False
+        except Exception:
+            # Fallback if display module has issues
+            pass
+    elif permission_mode == "supervised" and name in FILE_MODIFYING_TOOLS:
+        try:
+            from . import display
+            if not display.request_permission(name, args, working_dir, permission_mode):
+                return f"Permission denied by user for {name}", False
+        except Exception:
+            # Fallback if display module has issues
+            pass
+    
     try:
         if name == "read_file":
             return _read_file(working_dir=working_dir, **args)

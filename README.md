@@ -39,6 +39,7 @@ It ships two modes:
 - [Local models (Ollama)](#local-models-ollama)
 - [Tools reference](#tools-reference)
 - [Configuration](#configuration)
+- [Permission modes](#permission-modes)
 - [Project structure](#project-structure)
 - [License](#license)
 
@@ -57,6 +58,7 @@ It ships two modes:
 <tr><td>⚡ <strong>GPU-aware</strong></td><td>Hardware probe at startup; CUDA utilisation enforced in all generated code</td></tr>
 <tr><td>🏠 <strong>Local mode</strong></td><td>Full functionality via Ollama — no API key needed, complete privacy</td></tr>
 <tr><td>💾 <strong>Resumable</strong></td><td>Research runs persist to disk and resume exactly where they left off</td></tr>
+<tr><td>🔒 <strong>Permission modes</strong></td><td>Choose between <code>autonomous</code> (default), <code>controlled</code> (ask before all edits), or <code>supervised</code> (ask before file edits only)</td></tr>
 </table>
 
 ---
@@ -505,11 +507,54 @@ The default model is only the starting point — switch any time with `/model NA
 | `OCTOSLAVE_MODEL` | Default model override |
 | `OCTOSLAVE_BACKEND` | `einfra` (default) or `ollama` |
 | `OCTOSLAVE_OLLAMA_URL` | Ollama base URL (default: `http://localhost:11434/v1`) |
+| `OCTOSLAVE_PERMISSION_MODE` | `autonomous` (default), `controlled`, or `supervised` |
 
 ```bash
 ots config          # guided interactive setup
 ots config --show   # print current config (key masked)
 ```
+
+### Permission Modes
+
+OctoSlave supports three permission modes that control how the agent interacts with your system:
+
+- **`autonomous`** (default) — The agent works without asking for permission. Best for trusted workflows and automated tasks.
+- **`controlled`** — The agent asks for permission before making any changes (file edits, writes, or command execution). Best for production code or when you want full oversight.
+- **`supervised`** — The agent asks for permission before file operations (read/write/edit) but runs shell commands automatically. Ideal when you want oversight on file changes but don't want to approve every test/run command.
+
+Set the mode:
+
+```bash
+# Via CLI flag
+ots --permission-mode supervised
+ots run "edit files" --permission-mode supervised
+
+# Via environment variable
+export OCTOSLAVE_PERMISSION_MODE=supervised
+
+# In interactive mode
+/permission supervised    # switch to supervised mode
+/permission controlled    # switch to controlled mode
+/permission autonomous    # switch to autonomous mode
+/permission               # show current mode
+```
+
+When in controlled or supervised mode, you'll see a prompt before modifying actions:
+
+```
+┌────── Controlled Mode ──────┐     ┌────── Supervised Mode ───────┐
+│  ⚠ Permission Required      │     │  ⚠ Permission Required       │
+│  ✏️  write_file             │     │  🔧 edit_file                │
+│  OctoSlave wants to:        │     │  OctoSlave wants to:         │
+│  create/overwrite file:     │     │  edit file: src/main.py      │
+│  src/main.py                │     │                              │
+└─────────────────────────────┘     └──────────────────────────────┘
+Allow? (y)/n                            Allow? (y)/n
+```
+
+In **supervised** mode, shell commands (`bash`) are executed automatically without prompting, while file operations still require approval.
+
+See [PERMISSION_MODE.md](PERMISSION_MODE.md) for full documentation.
 
 ---
 
