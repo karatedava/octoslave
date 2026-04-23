@@ -433,7 +433,9 @@ def print_round_done(round_num: int, round_dir: str):
 
 
 def print_research_complete(rounds_done: int, research_dir: str):
-    _emit({"type": "research_complete", "rounds": rounds_done, "dir": research_dir})
+    from pathlib import Path as _Path
+    report_path = str(_Path(research_dir) / "final_report.html")
+    _emit({"type": "research_complete", "rounds": rounds_done, "dir": research_dir, "report_path": report_path})
     console.print()
     console.print(Panel(
         f"[bold bright_white]🎉 Research complete[/bold bright_white]\n\n"
