@@ -192,6 +192,8 @@ Running `ots` opens the full TUI:
 |---------|-------------|
 | `/model [name]` | Switch model; lists available if no name given |
 | `/dir [path]` | Change the active working directory |
+| `/profile [name]` | Switch prompt profile (`base` / `simple` / `strict`) |
+| `/permission [mode]` | Show or change permission mode (`autonomous` / `controlled` / `supervised`) |
 | `/clear` | Clear screen and reset conversation history |
 | `/compact` | Summarise history into a compact context block (saves tokens) |
 | `/local [model]` | Switch to local Ollama backend |
@@ -554,7 +556,7 @@ Allow? (y)/n                            Allow? (y)/n
 
 In **supervised** mode, shell commands (`bash`) are executed automatically without prompting, while file operations still require approval.
 
-See [PERMISSION_MODE.md](PERMISSION_MODE.md) for full documentation.
+See [PERMISSION_MODE.md](docs/PERMISSION_MODE.md) for full documentation.
 
 ---
 
@@ -564,17 +566,29 @@ See [PERMISSION_MODE.md](PERMISSION_MODE.md) for full documentation.
 octoslave/
 ├── assets/
 │   └── logo.png              ← project logo (pixel-art octopus)
+├── docs/
+│   ├── PERMISSION_MODE.md    ← permission mode documentation
+│   └── PROMPT_PROFILES.md    ← prompt profile documentation
 ├── octoslave/
 │   ├── agent.py              ← core agent loop, system prompt, context management
 │   ├── config.py             ← config load/save, Ollama helpers, model list
 │   ├── display.py            ← Rich TUI + web event bridge (thread-safe emit system)
 │   ├── main.py               ← Click CLI, interactive REPL, slash-command handler
+│   ├── prompt_profiles/      ← system prompt profiles (base, simple, strict)
 │   ├── research.py           ← multi-agent long-research pipeline
 │   ├── tools.py              ← all tool definitions and implementations
 │   └── web/
 │       ├── app.py            ← FastAPI backend: WebSocket handler, file serving
 │       └── static/
-│           └── index.html    ← single-page web UI (Chat / Research / Files / Settings)
+│           ├── index.html    ← single-page web UI (Chat / Research / Files / Settings)
+│           ├── css/
+│           │   └── styles.css
+│           └── js/
+│               ├── app.js        ← main application logic
+│               ├── components.js ← UI components (history, file tree, chat helpers)
+│               ├── slash-commands.js ← web slash command handler
+│               ├── utils.js      ← shared utilities (markdown, escaping)
+│               └── websocket.js  ← WebSocket management and reconnection
 ├── run_research.py           ← CLI helper: run long-research without the TUI
 └── pyproject.toml
 ```

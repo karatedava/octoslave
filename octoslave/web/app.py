@@ -344,6 +344,81 @@ async def ws_endpoint(websocket: WebSocket):
                 state["working_dir"] = wd
                 await send({"type": "ok", "working_dir": wd})
 
+            elif mtype == "switch_backend":
+                """Handle backend switching (ollama <-> einfra)."""
+                try:
+                    from ..config import save_config, ollama_is_running, ollama_list_models
+                    backend = msg.get("backend", "einfra")
+                    requested_model = msg.get("model")
+                    
+                    cfg = load_config()
+                    
+                    if backend == "ollama":
+                        # Switch to Ollama
+                        ollama_url = cfg.get("ollama_url", "http://localhost:11434/v1")
+                        if not ollama_is_running(ollama_url):
+                            await send({"type": "error", "text": "Ollama is not running. Start it with: ollama serve"})
+                        else:
+                            pulled = ollama_list_models(ollama_url)
+                            if not pulled:
+                                await send({"type": "error", "text": "No models pulled yet. Use /pull <model> first."})
+                            else:
+                                chosen = requested_model if requested_model and requested_model in pulled else pulled[0]
+                                # Update config
+                                save_config(
+                                    cfg.get("api_key", ""),
+                                    cfg.get("base_url", cfg.get("base_url", "")),
+                                    chosen,
+                                    backend="ollama",
+                                    ollama_url=ollama_url,
+                                )
+                                state["backend"] = "ollama"
+                                state["model"] = chosen
+                                await send({"type": "config_updated", "backend": "ollama", "model": chosen})
+                                await send({"type": "info", "text": f"Switched to local mode with {chosen}"})
+                    else:
+                        # Switch to e-INFRA CZ
+                        api_key = cfg.get("api_key", "")
+                        if not api_key:
+                            await send({"type": "error", "text": "No e-INFRA CZ API key configured. Run 'ots config' first."})
+                        else:
+                            default_model = cfg.get("default_model", "")
+                            save_config(
+                                api_key,
+                                cfg.get("base_url", cfg.get("base_url", "")),
+                                default_model,
+                                backend="einfra",
+                                ollama_url=cfg.get("ollama_url", ""),
+                            )
+                            state["backend"] = "einfra"
+                            state["model"] = default_model
+                            await send({"type": "config_updated", "backend": "einfra", "model": default_model})
+                            await send({"type": "info", "text": f"Switched to e-INFRA CZ mode with {default_model}"})
+                except Exception as exc:
+                    await send({"type": "error", "text": f"Backend switch failed: {exc}"})
+
+            elif mtype == "pull_model":
+                """Handle pulling a model from Ollama."""
+                try:
+                    from ..config import ollama_is_running, ollama_pull_model
+                    model_name = msg.get("model", "")
+                    if not model_name:
+                        await send({"type": "error", "text": "Model name required."})
+                        return
+                    
+                    ollama_url = load_config().get("ollama_url", "http://localhost:11434/v1")
+                    if not ollama_is_running(ollama_url):
+                        await send({"type": "error", "text": "Ollama is not running. Start it with: ollama serve"})
+                    else:
+                        await send({"type": "info", "text": f"Pulling {model_name}..."})
+                        ok = ollama_pull_model(model_name, ollama_url)
+                        if ok:
+                            await send({"type": "info", "text": f"✓ {model_name} pulled successfully. Use /local {model_name} to switch to it."})
+                        else:
+                            await send({"type": "error", "text": f"Failed to pull {model_name}."})
+                except Exception as exc:
+                    await send({"type": "error", "text": f"Pull failed: {exc}"})
+
             # ---- chat ----
             elif mtype in ("chat", "chat_new", "chat_continue"):
                 if state["running"]:
@@ -354,6 +429,9 @@ async def ws_endpoint(websocket: WebSocket):
                 model = msg.get("model") or state["model"] or cfg.get("default_model", "")
                 working_dir = msg.get("working_dir") or state["working_dir"]
                 message_text = msg.get("message", "").strip()
+                prompt_profile = msg.get("prompt_profile") or cfg.get("prompt_profile", "base")
+                permission_mode = msg.get("permission_mode") or cfg.get("permission_mode", "autonomous")
+                
                 if not message_text:
                     continue
 
@@ -363,13 +441,14 @@ async def ws_endpoint(websocket: WebSocket):
                 state["running"] = True
                 client = make_client(cfg.get("api_key", ""), cfg.get("base_url", ""))
 
-                def chat_fn(txt=message_text, mdl=model, wd=working_dir, new=new_conv):
+                def chat_fn(txt=message_text, mdl=model, wd=working_dir, new=new_conv, 
+                           pp=prompt_profile, pm=permission_mode):
                     display.set_event_callback(make_emit())
                     try:
                         if new:
-                            result = run_agent(txt, mdl, wd, client)
+                            result = run_agent(txt, mdl, wd, client, pp, pm)
                         else:
-                            result = continue_agent(state["messages"], txt, mdl, wd, client)
+                            result = continue_agent(state["messages"], txt, mdl, wd, client, pm)
                         state["messages"] = result
                     except Exception as exc:
                         loop.call_soon_threadsafe(
