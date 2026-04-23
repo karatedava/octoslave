@@ -7,7 +7,7 @@ from openai import OpenAI, BadRequestError
 from . import display
 from .tools import TOOL_DEFINITIONS, execute_tool
 
-MAX_ITERATIONS = 80
+MAX_ITERATIONS = 100
 
 # Hard cap on characters in a single tool result that goes into the message history.
 # Prevents a single large file/page from blowing up the context window.
