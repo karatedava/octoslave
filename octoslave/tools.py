@@ -392,9 +392,9 @@ def _bash(command: str, working_dir: str, timeout: int = 3600) -> tuple[str, boo
             output += result.stderr
         if not output:
             output = f"(exit code {result.returncode})"
-        # Truncate very long outputs
+        # Truncate very long outputs — keep tail-heavy since errors appear at the end
         if len(output) > 8000:
-            output = output[:4000] + "\n\n... [output truncated] ...\n\n" + output[-2000:]
+            output = output[:2000] + "\n\n... [output truncated] ...\n\n" + output[-5000:]
         return output, result.returncode == 0
     except subprocess.TimeoutExpired:
         return f"Command timed out after {timeout}s", False
