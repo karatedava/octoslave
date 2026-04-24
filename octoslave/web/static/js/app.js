@@ -198,6 +198,7 @@ function onDone(iterations) {
 
 function onServerError(text) {
   appendChatError(text);
+  window.appState.researchRunning = false;
   setChatRunning(false);
 }
 
@@ -251,9 +252,16 @@ function onChatLoaded(msg) {
 
 function onResearchStart(msg) {
   window.appState.researchRunning = true;
+  setChatRunning(true);
   document.getElementById('pipeline-section').classList.add('show');
   document.getElementById('research-console').innerHTML = '';
   document.getElementById('completion-card').classList.remove('show');
+  // Reset all pipeline boxes to pending state for the new run
+  document.querySelectorAll('.pipeline-box').forEach(box => {
+    box.className = 'pipeline-box pending';
+    const m = box.querySelector('.p-model'); if (m) m.textContent = '';
+    const e = box.querySelector('.p-elapsed'); if (e) e.textContent = '';
+  });
 }
 
 function onRoundStart(msg) {
@@ -294,6 +302,7 @@ function onAgentDone(msg) {
 
 function onResearchComplete(msg) {
   window.appState.researchRunning = false;
+  setChatRunning(false);
   document.getElementById('pipeline-section').classList.remove('show');
   document.getElementById('completion-card').classList.add('show');
   
@@ -388,6 +397,7 @@ function initApp() {
 
   // Research start button
   document.getElementById('research-start-btn')?.addEventListener('click', () => {
+    if (window.appState.running) return;
     const topic = document.getElementById('research-topic').value.trim();
     if (!topic) {
       appendChatError('⚠ Research topic is required.');

@@ -417,7 +417,7 @@ def print_agent_banner(role: str, model: str, round_num: int, max_rounds: int):
 
 def print_agent_done(role: str, elapsed: float, iterations: int):
     _emit({"type": "agent_done", "role": role,
-           "elapsed": round(elapsed, 1), "iterations": iterations})
+           "elapsed": f"{elapsed:.0f}s", "iterations": iterations})
     cfg = _get_role_cfg(role)
     console.print(
         f"\n  [{cfg['color']}]✓ {cfg['label']}[/{cfg['color']}] "
