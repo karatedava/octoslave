@@ -193,31 +193,32 @@ def print_task(task: str):
 # Streaming text
 # ---------------------------------------------------------------------------
 
-_streaming_started = False
+_stream_state = _threading.local()
+
+
+def _streaming_started() -> bool:
+    return getattr(_stream_state, "started", False)
 
 
 def stream_start():
-    global _streaming_started
-    _streaming_started = False
+    _stream_state.started = False
 
 
 def stream_chunk(text: str):
     _emit({"type": "token", "text": text})
-    global _streaming_started
-    if not _streaming_started:
+    if not _streaming_started():
         console.print("[bold green]●[/bold green] ", end="")
-        _streaming_started = True
+        _stream_state.started = True
     sys.stdout.write(text)
     sys.stdout.flush()
 
 
 def stream_end(had_content: bool):
     _emit({"type": "stream_end"})
-    global _streaming_started
     if had_content:
         sys.stdout.write("\n")
         sys.stdout.flush()
-    _streaming_started = False
+    _stream_state.started = False
 
 
 # ---------------------------------------------------------------------------

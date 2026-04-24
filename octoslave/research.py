@@ -20,7 +20,7 @@ from pathlib import Path
 from openai import OpenAI, BadRequestError
 
 from . import display
-from .agent import _cap_result
+from .agent import _cap_result, _trim_messages
 from .tools import TOOL_DEFINITIONS, execute_tool
 
 # ---------------------------------------------------------------------------
@@ -672,6 +672,23 @@ def _run_specialist(
                 messages = _trim_messages(messages)
                 iteration -= 1  # context trim doesn't consume a turn
                 continue
+            if "Unterminated string" in err or "Extra data" in err:
+                # Truncated tool-call arguments — roll back the partial turn and retry
+                while messages and messages[-1].get("role") in ("tool", "assistant"):
+                    messages.pop()
+                display.print_info(
+                    f"[{cfg['label']}] Tool call arguments truncated — rolling back and retrying."
+                )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your previous response was cut off before the tool arguments "
+                        "were complete. Please redo the last action from scratch, making "
+                        "sure to produce a complete, valid response."
+                    ),
+                })
+                iteration -= 1
+                continue
             display.print_error(f"[{cfg['label']}] API error: {e}")
             return False
         except Exception as e:
@@ -700,7 +717,7 @@ def _run_specialist(
         tool_calls = response["tool_calls"]
         finish_reason = response["finish_reason"]
 
-        assistant_msg: dict = {"role": "assistant", "content": content or None}
+        assistant_msg: dict = {"role": "assistant", "content": content if content else ""}
         if tool_calls:
             assistant_msg["tool_calls"] = tool_calls
         messages.append(assistant_msg)
@@ -724,7 +741,7 @@ def _run_specialist(
             nudge = (
                 f"REQUIRED ACTION: You have not yet written the output file for THIS round. "
                 f"The EXACT path you must write is: {exact_path}\n"
-                f"Call write_file with file_path=\"{exact_path}\" RIGHT NOW. "
+                f"Call write_file with path=\"{exact_path}\" RIGHT NOW. "
                 "Do not write to any other path. Do not write to a different round's directory."
             )
             messages.append({"role": "user", "content": nudge})
@@ -740,7 +757,15 @@ def _run_specialist(
             try:
                 args = json.loads(tc["function"]["arguments"] or "{}")
             except json.JSONDecodeError:
+                tc["function"]["arguments"] = "{}"
                 args = {}
+                err_msg = (
+                    f"Tool call '{name}' had malformed JSON arguments "
+                    "(the model's response was truncated). Please retry with complete arguments."
+                )
+                display.print_tool_result(name, err_msg, False)
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": err_msg})
+                continue
 
             display.print_tool_call(name, args)
             result, success = execute_tool(name, args, working_dir)
@@ -875,6 +900,18 @@ def _run_merger(
             if "ContextWindow" in err or "context" in err.lower():
                 messages = _trim_messages(messages)
                 continue
+            if "Unterminated string" in err or "Extra data" in err:
+                while messages and messages[-1].get("role") in ("tool", "assistant"):
+                    messages.pop()
+                display.print_info("[Merger] Tool call arguments truncated — rolling back and retrying.")
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your previous response was cut off before the tool arguments "
+                        "were complete. Please redo the last action with complete, valid arguments."
+                    ),
+                })
+                continue
             display.print_error(f"[Merger] API error: {e}")
             return False
         except KeyboardInterrupt:
@@ -885,7 +922,7 @@ def _run_merger(
         tool_calls = response["tool_calls"]
         finish_reason = response["finish_reason"]
 
-        assistant_msg: dict = {"role": "assistant", "content": content or None}
+        assistant_msg: dict = {"role": "assistant", "content": content if content else ""}
         if tool_calls:
             assistant_msg["tool_calls"] = tool_calls
         messages.append(assistant_msg)
@@ -899,7 +936,15 @@ def _run_merger(
             try:
                 args = json.loads(tc["function"]["arguments"] or "{}")
             except json.JSONDecodeError:
+                tc["function"]["arguments"] = "{}"
                 args = {}
+                err_msg = (
+                    f"Tool call '{name}' had malformed JSON arguments "
+                    "(the model's response was truncated). Please retry with complete arguments."
+                )
+                display.print_tool_result(name, err_msg, False)
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": err_msg})
+                continue
             display.print_tool_call(name, args)
             result, success = execute_tool(name, args, working_dir)
             result = _cap_result(result, name)
@@ -1045,41 +1090,6 @@ def _parse_synthesis(synthesis_path: str) -> tuple[str, bool]:
 # Context trimmer (last-resort when context window fills up)
 # ---------------------------------------------------------------------------
 
-def _trim_messages(messages: list[dict], groups: int = 3) -> list[dict]:
-    """
-    Remove the oldest N complete assistant-turn groups (assistant message +
-    all its tool results) to free context space.  Always preserves the system
-    prompt and the first user message (messages[:2]).
-
-    Removes `groups` turns per call so recovery from a deeply-full context is
-    fast rather than requiring many retries.
-    """
-    system = messages[:2]
-    rest   = list(messages[2:])
-
-    removed = 0
-    while removed < groups and rest:
-        # Find the first assistant message that issued tool calls
-        start = next(
-            (i for i, m in enumerate(rest)
-             if m.get("role") == "assistant" and m.get("tool_calls")),
-            None,
-        )
-        if start is None:
-            break  # no more tool-calling turns to trim
-
-        # Collect the contiguous block of tool results that follow it
-        end = start + 1
-        while end < len(rest) and rest[end].get("role") == "tool":
-            end += 1
-
-        # Drop the assistant turn + its tool results
-        rest = rest[:start] + rest[end:]
-        removed += 1
-
-    return system + rest
-
-
 # ---------------------------------------------------------------------------
 # Master HTML report (runs once after all rounds complete)
 # ---------------------------------------------------------------------------
@@ -1180,6 +1190,19 @@ def _run_master_reporter(
                 messages = _trim_messages(messages)
                 iteration -= 1
                 continue
+            if "Unterminated string" in err or "Extra data" in err:
+                while messages and messages[-1].get("role") in ("tool", "assistant"):
+                    messages.pop()
+                display.print_info("[Master Reporter] Tool call arguments truncated — rolling back and retrying.")
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your previous response was cut off before the tool arguments "
+                        "were complete. Please redo the last action with complete, valid arguments."
+                    ),
+                })
+                iteration -= 1
+                continue
             display.print_error(f"[Master Reporter] API error: {e}")
             return
         except Exception as e:
@@ -1205,7 +1228,7 @@ def _run_master_reporter(
         tool_calls = response["tool_calls"]
         finish_reason = response["finish_reason"]
 
-        assistant_msg: dict = {"role": "assistant", "content": content or None}
+        assistant_msg: dict = {"role": "assistant", "content": content if content else ""}
         if tool_calls:
             assistant_msg["tool_calls"] = tool_calls
         messages.append(assistant_msg)
@@ -1233,7 +1256,15 @@ def _run_master_reporter(
             try:
                 args = json.loads(tc["function"]["arguments"] or "{}")
             except json.JSONDecodeError:
+                tc["function"]["arguments"] = "{}"
                 args = {}
+                err_msg = (
+                    f"Tool call '{name}' had malformed JSON arguments "
+                    "(the model's response was truncated). Please retry with complete arguments."
+                )
+                display.print_tool_result(name, err_msg, False)
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": err_msg})
+                continue
             display.print_tool_call(name, args)
             result, success = execute_tool(name, args, working_dir)
             result = _cap_result(result, name)
