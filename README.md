@@ -67,19 +67,83 @@ It ships two modes:
 
 **Requirements:** Python 3.10+, an [e-INFRA CZ LLM](https://llm.ai.e-infra.cz) API key *(or Ollama for local mode)*
 
+### Step 1 — Install Python (skip if you already have Python 3.10+)
+
+<details>
+<summary><strong>Windows</strong></summary>
+
+1. Go to [https://www.python.org/downloads/](https://www.python.org/downloads/) and click **Download Python 3.x.x**.
+2. Run the installer. **Important:** tick the box **"Add Python to PATH"** before clicking Install.
+3. Open **Command Prompt** (`Win + R` → type `cmd` → Enter) and verify:
+   ```
+   python --version
+   ```
+   You should see something like `Python 3.12.3`.
+
+</details>
+
+<details>
+<summary><strong>macOS</strong></summary>
+
+Option A — official installer (easiest):
+1. Go to [https://www.python.org/downloads/](https://www.python.org/downloads/) and download the macOS package.
+2. Run the `.pkg` installer and follow the prompts.
+
+Option B — Homebrew (if you already use it):
+```bash
+brew install python
+```
+
+Verify in **Terminal**:
+```bash
+python3 --version
+```
+
+</details>
+
+<details>
+<summary><strong>Linux (Ubuntu / Debian)</strong></summary>
+
+```bash
+sudo apt update
+sudo apt install python3 python3-pip
+python3 --version
+```
+
+</details>
+
+> `pip` (the Python package installer) is bundled with Python 3.10+ — you do not need to install it separately. If `pip` is missing for any reason, run `python -m ensurepip --upgrade`.
+
+---
+
+### Step 2 — Get the code
+
+If you have [Git](https://git-scm.com/downloads) installed:
+
 ```bash
 git clone https://github.com/karatedava/octoslave.git
 cd octoslave
+```
 
+No Git? Download the ZIP directly from the GitHub page → **Code → Download ZIP**, then unzip and open a terminal inside the folder.
+
+---
+
+### Step 3 — Install OctoSlave
+
+```bash
 # CLI only
 pip install -e .
 
-# CLI + web UI
+# CLI + web UI (recommended)
 pip install -e ".[web]"
 ```
 
+> On macOS/Linux you may need to use `pip3` instead of `pip` if your system has both Python 2 and Python 3. If you see a "permission denied" error, add `--user` to the command: `pip install --user -e ".[web]"`.
+
 > **Recommended:** use [uv](https://github.com/astral-sh/uv) for faster, reproducible installs:
 > ```bash
+> pip install uv          # install uv once
 > uv pip install -e ".[web]"
 > ```
 

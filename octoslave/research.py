@@ -1453,11 +1453,7 @@ def run_long_research(
 
             # Resumability: skip if canonical output already exists
             expected_path = round_dir / OUTPUT_FILES[role]
-            if resume and expected_path.exists():
-                # Resumability: skip if output already exists (and is non-empty for coder)
-                expected = OUTPUT_FILES[role]
-                expected_path = round_dir / expected
-                output_complete = expected_path.exists()
+            output_complete = expected_path.exists()
             if output_complete and role == "coder":
                 # For the coder, the directory must contain IMPLEMENTATION.md to be valid
                 output_complete = (expected_path / "IMPLEMENTATION.md").exists()
@@ -1467,6 +1463,7 @@ def run_long_research(
                 )
                 continue
 
+            ok = True
             try:
                 if num_parallel > 1 and role in PARALLEL_ROLES:
                     display.print_info(
@@ -1499,6 +1496,7 @@ def run_long_research(
                             client=client,
                         )
                     else:
+                        ok = False
                         display.print_error(
                             f"All parallel {ROLES[role]['label']} agents failed "
                             f"in round {round_num}. Continuing."
@@ -1516,11 +1514,6 @@ def run_long_research(
                         brief=brief,
                         client=client,
                     )
-                    if not ok:
-                        display.print_error(
-                            f"{ROLES[role]['label']} failed in round {round_num}. "
-                            "Continuing with next agent."
-                        )
             except KeyboardInterrupt:
                 display.console.print(
                     "\n[bold yellow]Research paused.[/bold yellow] "
