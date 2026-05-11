@@ -626,7 +626,9 @@ function setChatRunning(running) {
 function onChatLoaded(msg) {
   window.appState.messages = msg.messages || [];
   window.appState.model = msg.model || '';
-  
+  window.appState.currentChatId = msg.id || null;
+  window.appState.chatIsFirst = false;
+
   // Clear and rebuild chat UI
   const container = document.getElementById('chat-messages');
   container.innerHTML = '';
@@ -890,8 +892,8 @@ function initApp() {
   });
 
   document.getElementById('chat-new-btn')?.addEventListener('click', () => {
-    if (window.appState.messages.length > 0 && !window.appState.currentChatId) {
-      sendMsg({ type: 'save_chat', chat_id: '' });
+    if (window.appState.messages.length > 0) {
+      sendMsg({ type: 'save_chat', chat_id: window.appState.currentChatId || '' });
     }
     sendMsg({ type: 'chat_clear' });
     clearChatMessages();

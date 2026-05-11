@@ -348,6 +348,17 @@ Keep every section to bullet points — no prose paragraphs except the last one.
       absolute paths here so downstream agents can use them directly.
   ## Baselines        (concrete numbers only, e.g. "ResNet-50: 76.1% top-1")
 
+  ## Research Seeds
+  [Bullet list of any externally retrieved items that the Coder can directly use.
+   Include only things you ACTUALLY fetched this round (web search, API, PDB, etc.).
+   Each seed must be one of:
+     - A concrete SMILES / sequence / structure with its source URL or DOI
+     - A quantitative benchmark (e.g. "BLU-945 IC50=5 nM vs T790M, Nat Cancer 2022 doi:10.xxx")
+     - A downloadable dataset URL with format and expected row count
+     - A PDB / UniProt / ChEMBL ID with the query that retrieved it
+   Omit this section entirely if nothing externally retrieved is directly actionable.
+   DO NOT copy content from pre-provided local files — Seeds are NEW external discoveries only.]
+
   ## FOR THE EXPERIMENT DESIGNER
   [1 focused paragraph: which gap to target, which dataset to use, what
    baseline to beat, key gotcha. Be direct — the next agent reads ONLY this
@@ -367,6 +378,10 @@ STEPS
    are concise.
 1. Read ONLY the ## FOR THE EXPERIMENT DESIGNER section from
    {round_dir}/01_literature.md (use offset/limit — do not read the whole file).
+   Also read the ## Research Seeds section if present (it immediately precedes
+   ## FOR THE EXPERIMENT DESIGNER). Seeds are externally retrieved structures,
+   benchmarks, or dataset URLs you MUST incorporate into the experiment where
+   relevant — they are new data the Coder cannot find on its own.
 2. Round > 1: read ONLY the ## What Failed section from {research_dir}/findings.md.
    Round 1: skip.
 2b. Round > 1: if {research_dir}/case_memory.md exists, read the last 800 chars
@@ -518,14 +533,28 @@ do not pile on. Be specific (cite line / section).
   D. FORBIDDEN-APPROACH OVERLAP (round > 1)
      Does the plan resemble any entry in forbidden_approaches.md (same data +
      same method class, OR same failure mode)? If yes, is `## Why This Differs`
-     present and substantive (concrete differences, not "we'll be more careful
-     this time")? Without it, OBJECT.
+     present and substantive?
+     Grace clause: if `## Why This Differs` lists ≥2 of the following concrete
+     improvements over the prior case — (a) different/larger dataset, (b) different
+     method class, (c) external validation added, (d) sample size increased ≥3×,
+     (e) specific failure mode from that case explicitly addressed — then PASS even
+     if the approach name is similar. "We'll be more careful" without specifics → OBJECT.
 
   E. SUCCESS-METRIC REALISM
      Is the success threshold structurally achievable given the data size /
      held-out set / known noise floor? An impossible-by-construction target
      (e.g. ≤0.15 RMSE on 4 held-out blocks with σ=0.5 interaction noise) is a
      planned failure → OBJECT.
+
+  F. HARDCODED QUANTITATIVE PREDICTIONS
+     Does the plan pre-assign numeric values to categories/classes/mechanisms rather
+     than computing them from the actual data?
+     (e.g. "set kinome_liability = 0.5 for scaffold X", "assign selectivity_risk = 0.3
+     for allosteric candidates", "use penalty factor 1.5× for non-covalent")
+     Pre-assigned values masquerade as computed results and corrupt Q4/selectivity
+     assessments → OBJECT. All reported numeric metrics must be derived by running
+     code on real input data. Exception: explicit MODEL hyperparameters (learning
+     rate, regularisation λ) are allowed as design choices, not predictions.
 
 OUTPUT — write EXACTLY ONE file: {round_dir}/02b_skeptic_review.md
 Format (literal — Coder parses `## Verdict:`):
@@ -597,13 +626,22 @@ STEPS
    (R001, R002, …); inventory.md gives you the absolute path, columns, and first
    rows already. DO NOT re-discover the schema with extra read_file / list_dir calls
    — the inventory entry already shows column names and sample rows.
-2. Read ONLY ## Available Datasets AND ## Baselines from {round_dir}/01_literature.md.
-   This is where the Researcher recorded all primary entities and experimental values.
-   Use those values EXACTLY as written — do NOT modify, guess, or replace them.
+2. Read ONLY ## Available Datasets, ## Baselines, AND ## Research Seeds from
+   {round_dir}/01_literature.md. This is where the Researcher recorded all primary
+   entities, experimental values, and externally retrieved seeds (SMILES, URLs,
+   benchmark numbers). Use those values EXACTLY as written — do NOT modify, guess,
+   or replace them.
    CRITICAL: NEVER hardcode a value (identifier, sequence, compound name, dataset ID,
    numeric baseline) that does not appear verbatim in 01_literature.md or 02_experiment.md.
    If no primary entities are present in those files, write a script that reads the
    primary data file directly rather than inventing values from memory.
+   EXTERNAL VALIDATION (mandatory when ground-truth exists): if inventory.md or
+   01_literature.md contains known reference values (e.g. a known IC50 for an approved
+   drug, a published accuracy benchmark, a validated measurement from literature),
+   you MUST compute predicted_vs_known discrepancy for at least one reference and
+   include it in key_results.json as "external_validation": {{"reference": <name>,
+   "known_value": <float>, "predicted_value": <float>, "abs_error": <float>}}.
+   Skipping this when reference data is available is an implementation gap.
 3. Read {research_dir}/hw_profile.json — hardware probed at pipeline start.
    Check `available_packages` for what is already installed. You installed missing
    critical packages in Step 0 (INSTALL PHASE). Do NOT install any more packages now.
@@ -1023,20 +1061,24 @@ YOUR MISSION
 Independent assessment of this round's work. Critical, concise. Total report: under 400 words.
 
 STEPS — follow in ORDER, do NOT skip ahead:
-1. Read {round_dir}/03_code/IMPLEMENTATION.md (primary input — always exists).
+1. Read {round_dir}/01_literature.md (first 80 lines only — needed for Literature Quality score).
+2. Read {round_dir}/03_code/IMPLEMENTATION.md (primary input — always exists).
    If {round_dir}/04_debug_report.md exists, read it too (may be absent — that's OK).
    Read {round_dir}/02_experiment.md ONLY for the success metric (first 20 lines).
-   Do NOT read 01_literature.md unless you need a specific SOTA number.
-2. Read {round_dir}/03_code/results/key_results.json if it exists. Check numbers.
-3. WRITE {round_dir}/05_evaluation.md NOW — do NOT wait. This is your primary output.
+3. Read {round_dir}/03_code/results/key_results.json if it exists. Check numbers.
+4. WRITE {round_dir}/05_evaluation.md NOW — do NOT wait. This is your primary output.
    Use the format below. Estimate scores from what you've read so far.
-4. ONLY after writing 05_evaluation.md: optionally write + run a chart script.
+5. ONLY after writing 05_evaluation.md: optionally write + run a chart script.
    Skip the chart entirely if reading + writing has used more than 8 iterations.
 
-OUTPUT — The filename MUST be exactly "05_evaluation.md". Write it at step 3, not later.
+OUTPUT — The filename MUST be exactly "05_evaluation.md". Write it at step 4, not later.
 Format: score on the SAME line as the heading, then ONE sentence commentary.
 
-  ## Literature Quality      X/10 — <one sentence>
+  ## Literature Quality      X/10 — <one sentence: judge 01_literature.md — did the
+     Researcher fetch external papers/databases/structures beyond what was pre-provided?
+     Score 8–10: ≥2 external sources fetched (web search, PDB, ChEMBL API, etc.) with
+     specific SOTA numbers cited. Score 5–7: literature read but mostly relying on
+     pre-provided files. Score 1–4: no external search, only local files used.>
   ## Hypothesis Quality      X/10 — <one sentence>
   ## Implementation Quality  X/10 — <one sentence>
   ## Results Validity        X/10 — <one sentence>
@@ -1047,7 +1089,7 @@ Format: score on the SAME line as the heading, then ONE sentence commentary.
   ## Critical Weaknesses     (bullet list, max 3 items)
   ## Recommended Next Steps  (bullet list, max 3 specific actionable items)
 
-SCORES CHART (OPTIONAL — only after 05_evaluation.md is written)
+SCORES CHART (OPTIONAL — only after 05_evaluation.md is written, step 5)
 - Write + run a minimal Python script → saves {round_dir}/05_scores_chart.png.
 - Simple bar chart, 4 bars, labels, colour-coded (green≥7, amber4–6, red≤3).
 - If no results exist, skip the chart entirely.
@@ -1153,13 +1195,32 @@ If THIS round is ZERO_RESULTS AND the same error appears in findings.md from las
   5. Reduce scope: fewer variants, simpler metrics, shorter simulations.
 A pivot brief beats a third "please fix the unit errors" brief every time.
 
+Q-COVERAGE CHECK (mandatory — do this before writing the brief):
+Read the first 40 lines of {research_dir}/findings.md to extract the research
+questions from the task (look for numbered questions, Q1/Q2/Q3/… markers, or
+explicit "research questions" sections). Then check which questions have been
+substantially addressed across ALL completed rounds (not just this one).
+A question is "addressed" only if a prior round produced concrete numbers or
+artefacts for it — not merely mentioned it. Build a mental coverage table:
+
+  Q1: [addressed / partial / NOT YET]  — one-line evidence summary
+  Q2: [addressed / partial / NOT YET]  — one-line evidence summary
+  ...
+
+The NEXT_ROUND_BRIEF MUST prioritise the highest-value NOT YET or partial
+question, even if that means pivoting away from the current thread. A pipeline
+that keeps polishing Q1 while Q2–Q4 remain untouched will never score above 6.
+
 STRUCTURE — short bullets, not paragraphs:
 
   ## Round Summary        (2–3 bullets)
   ## Key Findings         (2–3 bullets with numbers where possible)
   ## What Worked          (1–3 bullets)
   ## What Failed / Gaps   (1–3 bullets)
-  ## Updated Research Direction  (1–2 sentences)
+  ## Research Question Coverage  (mandatory — the Q-coverage table you built above,
+     one line per question: Q1: addressed ✓ / partial ~ / not yet ✗ + evidence)
+  ## Updated Research Direction  (1–2 sentences — driven by the coverage table,
+     not just the most recent failure)
   ## Transferable Lessons (2–3 bullets — knowledge that applies BEYOND this round.
      Frame as reusable principles, not round-specific facts. Examples:
      "numpy-only descriptor pipelines reliably produce numbers when MD fails";
@@ -1200,9 +1261,14 @@ artifacts more carefully before writing.
   Then ONE of:
 
   {next_brief_marker}
-  [HARD LIMIT: 150 words. Specific tasks only — no summaries of what happened.
+  [HARD LIMIT: 200 words. Lead with the highest-priority uncovered research
+   question (from your coverage table above) — not the most recent failure.
    Format: numbered list of concrete actions for the next round's agents.
-   Include: which dataset, which method, which metric to beat, what to fix.]
+   Include: which dataset, which method, which metric to beat, what to fix.
+   If all questions have been addressed at least partially, the brief should
+   push depth (e.g. external validation, larger candidate pool, rigorous stats)
+   rather than breadth. Never write "continue improving X" without specifying
+   the exact number to beat and the exact method to use.]
 
   OR (only if score ≥ 8/10 AND findings are solid OR all directions exhausted):
 
@@ -1218,17 +1284,24 @@ quickly judge what was done, what was found, and what comes next.
 STEPS
 1. Read: 05_evaluation.md, 06_synthesis.md, 03_code/IMPLEMENTATION.md.
    Skim 01_literature.md and 02_experiment.md for titles/metrics only.
+   Also read 03_code/results/key_results.json if it exists — extract concrete outputs
+   (candidates, predicted values, ranked items) to populate the Key Results section.
 2. List *.png in {round_dir}/ and {round_dir}/03_code/results/.
 3. Write {round_dir}/build_report.py (stdlib + matplotlib only). Run it.
    Confirm {round_dir}/07_report.html is non-empty.
 
 HTML SECTIONS (in order):
   1. Sticky nav · 2. Header (round, topic, date, score badge)
-  3. Executive Summary (4–5 bullets from synthesis)
-  4. Interpretation (1 short paragraph — connect the KEY numbers to the research
-     question in plain language. What do the results actually mean for the topic?
-     Why do they matter? Do NOT just list metrics — explain what they imply.
-     If results are only errors, explain what that tells us about the approach.)
+  3. Key Results — THE FIRST content section. Lead with the answer, not the method:
+       a. One-sentence "bottom line": what did this round produce/conclude?
+          (e.g. "Best candidate: SMILES X, pred IC50 = Y nM, Ro5-compliant.")
+       b. Outputs table: if any candidates/predictions/ranked items were produced,
+          show them in a compact table (Name | Value/SMILES | Key metric | Status).
+          Pull from key_results.json if available; otherwise extract from synthesis.
+       c. Research question check: for each numbered question in the task brief,
+          one line: "Q1: [answered ✓ | partial | skipped]" with the evidence.
+  4. Interpretation (1 short paragraph — connect KEY numbers to the research question.
+     Do NOT just list metrics — explain what they imply about the original question.)
   5. Experiment (hypothesis, success metric, data used)
   6. Implementation (approach bullets, data source, any skipped steps)
   7. Results & Plots (ALL PNGs base64-embedded, 2-col grid, 1-line captions)
@@ -2057,9 +2130,11 @@ def _update_findings(
     entry = "".join(entry_lines)
 
     # Create file with header if missing, otherwise append
+    # Use only the first line of topic (topic may be a full task.md content)
+    topic_title = topic.splitlines()[0].strip()[:120] if topic else "Research"
     if not findings_path.exists():
         header = (
-            f"# Research Findings: {topic}\n\n"
+            f"# Research Findings: {topic_title}\n\n"
             f"_Automatically updated after each round by OctoSlave._\n"
         )
         findings_path.write_text(header + entry, encoding="utf-8")
@@ -2140,8 +2215,9 @@ def _update_case_memory(
     case_entry = "".join(case_entry_lines)
 
     if not case_memory_path.exists():
+        topic_title = topic.splitlines()[0].strip()[:120] if topic else "Research"
         header = (
-            f"# Case Memory: {topic}\n\n"
+            f"# Case Memory: {topic_title}\n\n"
             "_Cross-round knowledge base. Each case records what was tried, what worked, "
             "and transferable lessons for future rounds. "
             "Read by Researcher and Experiment Designer at the start of each round._\n"
@@ -2911,6 +2987,8 @@ STEPS
 2. For each round read ONLY: round_NNN/05_evaluation.md, round_NNN/06_synthesis.md,
    round_NNN/03_code/IMPLEMENTATION.md (if exists).
    Read round_NNN/02_experiment.md only for the hypothesis name and success metric.
+   Also read round_NNN/03_code/results/key_results.json (if exists) — extract concrete
+   output objects: candidates, SMILES, predicted values, ranked items, best scores.
 3. Read {research_dir}/findings.md.
 4. Collect all summary_figure.png and 05_scores_chart.png from each round.
    Also list any other PNGs in round_NNN/03_code/results/.
@@ -2920,21 +2998,42 @@ STEPS
 HTML SECTIONS:
   1. Sticky nav
   2. Title block (topic, date, rounds, quality badge)
-  3. Abstract (1 paragraph — entire research arc)
-  4. Research Interpretation (1 paragraph — what did the pipeline collectively learn?
+
+  *** SECTION 3 — KEY RESULTS (most important — put it first, before everything else) ***
+  3. Key Results — directly answer the research question with the best outputs
+     produced across ALL rounds. This section must be the first thing a reader sees
+     after the title. Structure it as:
+       a. "Bottom Line" callout: 1–3 sentences answering the central question in plain
+          language (e.g. "The best candidate is X with predicted IC50 = Y nM").
+       b. Best Outputs Table: a ranked table of the top concrete outputs. What to show
+          depends on the task type:
+            - Candidate/molecule design → ranked candidate table:
+                Rank | Name | SMILES (code block) | Pred. IC50/score | MW | logP | Ro5 | Warhead/Mechanism | Key rationale
+            - Prediction/regression task → prediction table: item | predicted value | CI | basis
+            - Classification task → confusion matrix / accuracy breakdown
+            - Literature review → claim | evidence strength | source
+          Pull data from key_results.json files (prefer the BEST-scoring round's output).
+          Include at minimum 3 rows if any candidates/outputs were produced.
+       c. Direct Q&A: for each numbered research question in the task, one bold question
+          + one sentence answer citing a specific number or compound. If a question was
+          NOT addressed, write "Not addressed — [reason]" in red.
+     Do NOT defer key results to the conclusions section. They belong here.
+
+  4. Abstract (1 paragraph — entire research arc)
+  5. Research Interpretation (1 paragraph — what did the pipeline collectively learn?
      Connect accumulated findings to the original research question. What do the
      numbers, methods, and failures mean together? This is the "so what" section.)
-  5. Research Timeline table: Round | Hypothesis | Score | Status
-  6. Cumulative Findings (from findings.md, as cards)
-  7. Accumulated Knowledge (from case_memory.md — transferable lessons across rounds,
+  6. Research Timeline table: Round | Hypothesis | Score | Status
+  7. Cumulative Findings (from findings.md, as cards)
+  8. Accumulated Knowledge (from case_memory.md — transferable lessons across rounds,
      presented as a "what we learned" card deck; skip if file absent)
-  8. Round Deep Dives — one <details> per round (NOT <div class="details">):
+  9. Round Deep Dives — one <details> per round (NOT <div class="details">):
        hypothesis · implementation summary · ALL result plots
        · scores chart · what worked / failed · transferable lessons
-  9. Score Progression chart (generate with matplotlib: round on x, score on y).
+  10. Score Progression chart (generate with matplotlib: round on x, score on y).
      Save as score_progression.png in {research_dir} and embed it.
-  10. Key Visualisations Gallery (summary_figure.png from each round, full-width)
-  11. Conclusions & Next Steps (from final synthesis)
+  11. Key Visualisations Gallery (summary_figure.png from each round, full-width)
+  12. Conclusions & Next Steps (from final synthesis)
   Footer: topic · timestamp · "Generated by OctoSlave"
 
 IMAGES — STRICT RULES:
