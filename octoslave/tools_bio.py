@@ -290,6 +290,331 @@ BIO_TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "kegg_lookup",
+            "description": (
+                "Query the KEGG database (free REST API, no auth required). "
+                "Operations: (1) 'find' — search for compounds/reactions/enzymes/pathways by keyword "
+                "or EC number; (2) 'get' — retrieve a KEGG entry by ID (e.g. R04038 reaction, "
+                "C15519 compound, ec:1.14.14.1 enzyme class, path:map00900 pathway); "
+                "(3) 'link' — cross-references between databases (e.g. reactions involving a compound). "
+                "KEGG ID prefixes: C###### = compound, R###### = reaction, ec:X.X.X.X = enzyme, "
+                "path:map##### = pathway. "
+                "USE THIS INSTEAD of RetroBioCat (returns 404) or manual web search for biocatalytic "
+                "pathway data. Essential for: EC number → enzyme name, compound → reactions, "
+                "pathway enumeration (terpenoid: path:map00900, path:map01060)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "description": "One of: 'find' (search), 'get' (entry details by ID), 'link' (cross-refs)",
+                    },
+                    "database": {
+                        "type": "string",
+                        "description": (
+                            "For 'find': one of compound, reaction, enzyme, pathway, glycan, drug "
+                            "(default: compound)"
+                        ),
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "For 'find': search term or EC number (e.g. 'terpenoid hydroxylation', '1.14.14.1')",
+                    },
+                    "entry_id": {
+                        "type": "string",
+                        "description": (
+                            "For 'get' or 'link': KEGG ID (e.g. 'R04038', 'C15519', "
+                            "'ec:1.14.14.1', 'path:map00900')"
+                        ),
+                    },
+                    "link_target": {
+                        "type": "string",
+                        "description": "For 'link': target database (e.g. 'reaction', 'enzyme', 'compound', 'pathway')",
+                    },
+                },
+                "required": ["operation"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rdkit_admet",
+            "description": (
+                "Comprehensive ADMET property prediction using RDKit. Returns: Lipinski Ro5, Veber, "
+                "Egan Egg, Ghose filters; BBB penetration estimate; ESOL aqueous solubility; "
+                "hERG blocking alert; Ames mutagenicity structural alerts (nitro, epoxide, Michael "
+                "acceptor, aromatic amine, alkyl halide); CYP substrate likelihood; and "
+                "enzyme_substrate_class for biocatalytic context. "
+                "FOR BIOCATALYTIC RETROSYNTHESIS: use enzyme_substrate_class, hba, tpsa, and "
+                "mutagenicity_alerts as primary outputs — NOT Lipinski/Veber/QED which are "
+                "irrelevant for non-drug terpenoid substrates. "
+                "Use INSTEAD of rdkit_describe when ADMET or biocatalytic substrate context matters."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "smiles": {"type": "string", "description": "SMILES string"},
+                    "context": {
+                        "type": "string",
+                        "description": (
+                            "'drug' (standard ADMET for oral bioavailability) or "
+                            "'enzyme_substrate' (biocatalysis focus — ignores drug-likeness filters). "
+                            "Default: 'drug'"
+                        ),
+                    },
+                },
+                "required": ["smiles"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "enzyme_cost_lookup",
+            "description": (
+                "Look up enzyme kit prices from a verified static catalog "
+                "(Sigma-Aldrich, Merck, Prozomix, Novozymes). Returns supplier, SKU, price range, "
+                "and product URL. "
+                "USE THIS INSTEAD of web scraping supplier pages — Prozomix and Sigma pages are "
+                "JS-rendered and always return $0.00 or empty data when scraped with requests/bs4. "
+                "If the enzyme is not in the static table, returns not_found with search suggestions. "
+                "Query by enzyme name, EC number, common name, or UniProt ID "
+                "(e.g. 'CYP102A1', 'P450 BM3', '1.14.14.1', 'alcohol dehydrogenase', 'P14779')."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Enzyme name, EC number, common name, or UniProt accession",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pains_alerts",
+            "description": (
+                "Screen a SMILES string for pan-assay interference compounds (PAINS) "
+                "and Brenk/NIH structural alerts using RDKit FilterCatalog. "
+                "PAINS are substructures that frequently give false positives in HTS assays "
+                "(colloidal aggregators, redox cyclers, thiol reactive groups, etc.). "
+                "Brenk flags metabolically unstable or potentially toxic groups. "
+                "Use this BEFORE shortlisting candidates — PAINS hits need scaffold redesign "
+                "before biological testing. Returns alert name, filter type, and recommendation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "smiles": {"type": "string", "description": "SMILES string to screen"},
+                },
+                "required": ["smiles"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rdkit_scaffold",
+            "description": (
+                "Extract the Bemis-Murcko scaffold of a molecule and generate scaffold-hop "
+                "candidates via common bioisosteric replacements. "
+                "Returns: scaffold SMILES, generic scaffold, ring system count, framework type "
+                "(aromatic/mixed/saturated), and a list of bioisostere suggestions for substructures "
+                "detected in the molecule (phenyl→pyridyl, COOH→tetrazole, amide→triazole, Cl→F, etc.). "
+                "Optionally accepts a reference SMILES to compute MCS and highlight structural divergence "
+                "between query and reference (useful for scaffold-hop analysis). "
+                "Use when the current scaffold has ADMET liabilities or PAINS alerts."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "smiles": {"type": "string", "description": "Query molecule SMILES"},
+                    "reference_smiles": {
+                        "type": "string",
+                        "description": (
+                            "Optional reference molecule SMILES. If provided, MCS is computed "
+                            "and structural divergence is highlighted for bioisostere identification."
+                        ),
+                    },
+                },
+                "required": ["smiles"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "swissadme_fetch",
+            "description": (
+                "Predict ADMET and physicochemical properties by querying SwissADME "
+                "(swissadme.ch). Returns: consensus LogP, water solubility (ESOL/Ali), "
+                "GI absorption, BBB permeability, P-gp substrate status, CYP1A2/2C19/2C9/2D6/3A4 "
+                "inhibition, Lipinski/Ghose/Veber/Egan/Muegge druglikeness, PAINS alerts, "
+                "Brenk alerts, leadlikeness, and synthetic accessibility score. "
+                "Requires internet. Falls back gracefully with rdkit_admet recommendation "
+                "if the server is unavailable."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "smiles": {"type": "string", "description": "SMILES string to evaluate"},
+                },
+                "required": ["smiles"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pkcsm_fetch",
+            "description": (
+                "Predict pharmacokinetic/ADMET properties via the pkCSM server "
+                "(biosig.unimelb.edu.au/pkcsm). Returns numerical ML predictions for: "
+                "absorption (Caco-2, intestinal absorption %, P-gp substrate/inhibitor, "
+                "skin permeability), distribution (VDss, fraction unbound, BBB, CNS permeability), "
+                "metabolism (CYP1A2/2C19/2C9/2D6/3A4 substrate and inhibitor), "
+                "excretion (total clearance, renal OCT2 substrate), "
+                "toxicity (AMES mutagenicity, hERG, max tolerated dose, hepatotoxicity, "
+                "skin sensitisation, T. pyriformis, minnow toxicity). "
+                "Returns numeric values, not just categories. Requires internet."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "smiles": {"type": "string", "description": "SMILES string"},
+                    "endpoint": {
+                        "type": "string",
+                        "description": (
+                            "Endpoint group: 'all' (default), 'absorption', 'distribution', "
+                            "'metabolism', 'excretion', 'toxicity'."
+                        ),
+                    },
+                },
+                "required": ["smiles"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "surechembl_search",
+            "description": (
+                "Search the SureChEMBL patent chemistry database (surechembl.org) for patents "
+                "containing a query compound (by SMILES similarity/substructure) or text. "
+                "Returns: patent IDs, titles, publication dates, assignees, and patent URLs. "
+                "SureChEMBL indexes >20M documents from USPTO, EPO, WIPO, and JPO. "
+                "Use to assess IP landscape before advancing a scaffold — if >3 patents cover "
+                "the scaffold class, flag for FTO (freedom-to-operate) analysis. "
+                "Requires internet. Falls back to web_search instructions if unavailable."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "smiles": {
+                        "type": "string",
+                        "description": "SMILES for similarity/substructure patent search",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Free-text search (compound name, scaffold class, target name)",
+                    },
+                    "similarity": {
+                        "type": "number",
+                        "description": "Tanimoto similarity cutoff for SMILES search (0.0–1.0, default 0.85)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max patent results (default 10, max 50)",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vina_dock",
+            "description": (
+                "Run molecular docking using AutoDock Vina (or Smina/Gnina if Vina is absent) "
+                "to score binding of a ligand SMILES to a target protein. "
+                "Receptor can be a 4-letter PDB ID (auto-downloaded) or a local .pdb/.pdbqt path. "
+                "Requires: vina/smina/gnina on PATH + obabel for PDBQT conversion. "
+                "Returns top binding poses with affinity (kcal/mol) and RMSD values. "
+                "Typical ranges: ≤ −9 kcal/mol = very potent, −7 to −9 = moderate, > −5 = weak. "
+                "Use to replace 2D-similarity proxy scores with real docking energies."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ligand_smiles": {"type": "string", "description": "Ligand SMILES string"},
+                    "receptor_source": {
+                        "type": "string",
+                        "description": "4-letter PDB ID (e.g. '1ATP') or local path to .pdb/.pdbqt",
+                    },
+                    "pocket_x": {"type": "number", "description": "Pocket centre X coordinate (Å)"},
+                    "pocket_y": {"type": "number", "description": "Pocket centre Y coordinate (Å)"},
+                    "pocket_z": {"type": "number", "description": "Pocket centre Z coordinate (Å)"},
+                    "box_size_x": {"type": "number", "description": "Search box X size in Å (default 20)"},
+                    "box_size_y": {"type": "number", "description": "Search box Y size in Å (default 20)"},
+                    "box_size_z": {"type": "number", "description": "Search box Z size in Å (default 20)"},
+                    "exhaustiveness": {
+                        "type": "integer",
+                        "description": "Search exhaustiveness 1–32 (default 8; increase for accuracy)",
+                    },
+                    "n_poses": {
+                        "type": "integer",
+                        "description": "Number of top binding poses to return (default 5)",
+                    },
+                },
+                "required": ["ligand_smiles", "receptor_source", "pocket_x", "pocket_y", "pocket_z"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bindingdb_lookup",
+            "description": (
+                "Query BindingDB (bindingdb.org) for experimentally measured binding affinities. "
+                "Search by compound SMILES (similarity ≥ 85% Tanimoto) or target gene symbol. "
+                "Returns: IC50/Ki/Kd/EC50 in nM, assay type, target name, and literature reference. "
+                "Essential for selectivity profiling — e.g. find all targets a compound hits "
+                "at < 100 nM to identify off-target risks (kinase family cross-reactivity, "
+                "CYP inhibition, hERG hits) before committing to in vitro studies. "
+                "Falls back to ChEMBL/web_search instructions if unavailable."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "smiles": {
+                        "type": "string",
+                        "description": "Query compound SMILES (similarity search, Tanimoto ≥ 85%)",
+                    },
+                    "target_gene": {
+                        "type": "string",
+                        "description": "Target gene symbol (e.g. 'EGFR', 'CDK2', 'CYP3A4') to find all binders",
+                    },
+                    "ki_cutoff_nm": {
+                        "type": "number",
+                        "description": "Return only affinities ≤ this value in nM (default 10000 = all)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results (default 10, max 50)",
+                    },
+                },
+            },
+        },
+    },
 ]
 
 
@@ -325,6 +650,26 @@ def execute_bio_tool(name: str, args: dict, working_dir: str) -> tuple[str, bool
             return _ena_fetch(**args)
         if name == "pdf_ocr":
             return _pdf_ocr(working_dir=working_dir, **args)
+        if name == "kegg_lookup":
+            return _kegg_lookup(**args)
+        if name == "rdkit_admet":
+            return _rdkit_admet(**args)
+        if name == "enzyme_cost_lookup":
+            return _enzyme_cost_lookup(**args)
+        if name == "pains_alerts":
+            return _pains_alerts(**args)
+        if name == "rdkit_scaffold":
+            return _rdkit_scaffold(**args)
+        if name == "swissadme_fetch":
+            return _swissadme_fetch(**args)
+        if name == "pkcsm_fetch":
+            return _pkcsm_fetch(**args)
+        if name == "surechembl_search":
+            return _surechembl_search(**args)
+        if name == "vina_dock":
+            return _vina_dock(working_dir=working_dir, **args)
+        if name == "bindingdb_lookup":
+            return _bindingdb_lookup(**args)
     except TypeError as e:
         return f"Invalid arguments for {name}: {e}", False
     except Exception as e:
@@ -1346,3 +1691,1118 @@ def _ena_fetch(accession: str, result: str = "read_run") -> tuple[str, bool]:
         "matches": len(rows),
         "records": rows[:50],
     }, indent=2, default=str), True
+
+
+# ---------------------------------------------------------------------------
+# KEGG REST API
+# ---------------------------------------------------------------------------
+
+def _kegg_lookup(
+    operation: str,
+    database: str = "compound",
+    query: str = None,
+    entry_id: str = None,
+    link_target: str = None,
+) -> tuple[str, bool]:
+    if err := _need_requests():
+        return err
+    base = "https://rest.kegg.jp"
+    operation = (operation or "").strip().lower()
+
+    if operation == "find":
+        if not query:
+            return "query is required for 'find' operation.", False
+        db = (database or "compound").strip().lower()
+        valid_dbs = {"compound", "reaction", "enzyme", "pathway", "glycan", "drug", "ko", "module"}
+        if db not in valid_dbs:
+            return f"database must be one of: {', '.join(sorted(valid_dbs))}", False
+        url = f"{base}/find/{db}/{_requests.utils.quote(str(query))}"
+        try:
+            r = _http_get(url, accept="text/plain")
+        except Exception as e:
+            return f"KEGG request failed: {e}", False
+        if r.status_code == 404:
+            return json.dumps({"operation": "find", "database": db, "query": query, "results": [], "note": "No matches found."}, indent=2), True
+        if r.status_code != 200:
+            return f"KEGG error {r.status_code}: {r.text[:200]}", False
+        results = []
+        for line in r.text.strip().split("\n"):
+            if not line.strip():
+                continue
+            parts = line.split("\t", 1)
+            results.append({"id": parts[0], "description": parts[1] if len(parts) > 1 else ""})
+        return json.dumps({"operation": "find", "database": db, "query": query, "results": results[:30]}, indent=2), True
+
+    elif operation == "get":
+        if not entry_id:
+            return "entry_id is required for 'get' operation.", False
+        url = f"{base}/get/{entry_id}"
+        try:
+            r = _http_get(url, accept="text/plain")
+        except Exception as e:
+            return f"KEGG request failed: {e}", False
+        if r.status_code == 404:
+            return f"KEGG entry not found: {entry_id}", False
+        if r.status_code != 200:
+            return f"KEGG error {r.status_code}: {r.text[:200]}", False
+        return json.dumps({"operation": "get", "entry_id": entry_id, "record": _parse_kegg_flat(r.text)}, indent=2), True
+
+    elif operation == "link":
+        if not entry_id or not link_target:
+            return "entry_id and link_target are required for 'link' operation.", False
+        url = f"{base}/link/{link_target}/{entry_id}"
+        try:
+            r = _http_get(url, accept="text/plain")
+        except Exception as e:
+            return f"KEGG request failed: {e}", False
+        if r.status_code == 404:
+            return json.dumps({"operation": "link", "source": entry_id, "target_db": link_target, "links": [], "note": "No links found."}, indent=2), True
+        if r.status_code != 200:
+            return f"KEGG error {r.status_code}: {r.text[:200]}", False
+        links = []
+        for line in r.text.strip().split("\n"):
+            if not line.strip():
+                continue
+            parts = line.split("\t")
+            if len(parts) == 2:
+                links.append({"source": parts[0], "target": parts[1]})
+        return json.dumps({"operation": "link", "source": entry_id, "target_db": link_target, "links": links[:50]}, indent=2), True
+
+    else:
+        return f"Unknown operation: {operation!r}. Use 'find', 'get', or 'link'.", False
+
+
+def _parse_kegg_flat(text: str) -> dict:
+    """Parse KEGG flat-file format into a dict. Stops at '///'."""
+    record: dict[str, list[str]] = {}
+    current_key: str | None = None
+    for line in text.split("\n"):
+        if line.startswith("///"):
+            break
+        if not line:
+            continue
+        key_part = line[:12].rstrip()
+        val_part = line[12:].strip()
+        if key_part:
+            current_key = key_part
+            record.setdefault(current_key, [])
+        if current_key and val_part:
+            record[current_key].append(val_part)
+    return {k: " | ".join(v) if len(v) > 1 else v[0] if v else "" for k, v in record.items()}
+
+
+# ---------------------------------------------------------------------------
+# rdkit_admet — comprehensive ADMET property prediction
+# ---------------------------------------------------------------------------
+
+def _rdkit_admet(smiles: str, context: str = "drug") -> tuple[str, bool]:
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import Crippen, Descriptors, Lipinski, QED, rdMolDescriptors
+    except ImportError:
+        return "RDKit is not installed. Run: pip install rdkit", False
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return f"Invalid SMILES: {smiles!r}", False
+
+    mw    = Descriptors.MolWt(mol)
+    logp  = Crippen.MolLogP(mol)
+    tpsa  = Descriptors.TPSA(mol)
+    hbd   = Lipinski.NumHDonors(mol)
+    hba   = Lipinski.NumHAcceptors(mol)
+    rot   = Lipinski.NumRotatableBonds(mol)
+    rings = rdMolDescriptors.CalcNumRings(mol)
+    arom  = rdMolDescriptors.CalcNumAromaticRings(mol)
+    heavy = mol.GetNumHeavyAtoms()
+    n_het = sum(1 for a in mol.GetAtoms() if a.GetAtomicNum() not in (6, 1, 0))
+
+    # Bioavailability filters
+    ro5  = (mw <= 500 and logp <= 5 and hbd <= 5 and hba <= 10)
+    veb  = (rot <= 10 and tpsa <= 140)
+    egan = (tpsa <= 131.6 and logp <= 5.88)
+    gho  = (160 <= mw <= 480 and -0.4 <= logp <= 5.6 and 20 <= heavy <= 70)
+
+    # BBB heuristic (CNS-MPO simplified)
+    bbb = (tpsa < 90 and hbd <= 3 and mw < 450 and logp > 0)
+
+    # ESOL solubility (Delaney 2004)
+    esol = round(0.16 - 0.63 * logp - 0.0062 * mw + 0.066 * rot - 0.74 * arom, 2)
+    sol_cls = ("high" if esol > -1 else "moderate" if esol > -3 else "low" if esol > -5 else "very_low")
+
+    # hERG alert: basic non-aromatic N + logP > 2.5
+    has_basic_n = any(
+        a.GetAtomicNum() == 7 and not a.GetIsAromatic() and a.GetTotalNumHs() > 0
+        for a in mol.GetAtoms()
+    )
+    herg = has_basic_n and logp > 2.5
+
+    # Mutagenicity structural alerts (Ames-relevant SMARTS)
+    _ALERT_SMARTS = {
+        "nitro_group":      "[N+](=O)[O-]",
+        "aromatic_amine":   "c-[NH2]",
+        "epoxide":          "[C;R1]1[O;R1][C;R1]1",
+        "michael_acceptor": "[CX3](=O)[CX3]=[CX3]",
+        "aldehyde":         "[CX3H1](=O)[#6]",
+        "alkyl_halide":     "[CX4][F,Cl,Br,I]",
+        "azo":              "[NX2]=[NX2]",
+    }
+    alerts = [name for name, s in _ALERT_SMARTS.items()
+              if (p := Chem.MolFromSmarts(s)) and mol.HasSubstructMatch(p)]
+
+    # CYP substrate likelihood heuristic
+    cyp_likely = (250 <= mw <= 500 and 1 <= logp <= 5)
+
+    # Enzymatic substrate classification (biocatalysis context)
+    if mw < 350 and n_het <= 2 and rings >= 2 and arom == 0:
+        sub_class = "terpenoid-like"
+    elif rings >= 3 and n_het <= 3:
+        sub_class = "complex-natural-product"
+    elif ro5:
+        sub_class = "drug-like"
+    else:
+        sub_class = "other"
+
+    note = (
+        "Biocatalysis context: use enzyme_substrate_class, hba, tpsa, and mutagenicity_alerts. "
+        "Lipinski/Veber/Ghose are irrelevant for non-drug terpenoid substrates."
+        if context == "enzyme_substrate" else
+        "Standard ADMET profile. For biocatalytic retrosynthesis pass context='enzyme_substrate'."
+    )
+
+    return json.dumps({
+        "smiles": smiles,
+        "context": context,
+        "molecular_weight": round(mw, 2),
+        "logP": round(logp, 3),
+        "tpsa": round(tpsa, 2),
+        "hbd": hbd,
+        "hba": hba,
+        "rot_bonds": rot,
+        "rings": rings,
+        "aromatic_rings": arom,
+        "heavy_atoms": heavy,
+        "n_heteroatoms": n_het,
+        "lipinski_ro5": ro5,
+        "veber_oral": veb,
+        "egan_egg": egan,
+        "ghose": gho,
+        "bbb_penetration_likely": bbb,
+        "esol_logS": esol,
+        "aqueous_solubility_class": sol_cls,
+        "herg_alert": herg,
+        "mutagenicity_alerts": alerts,
+        "cyp_substrate_likely": cyp_likely,
+        "enzyme_substrate_class": sub_class,
+        "note": note,
+    }, indent=2), True
+
+
+# ---------------------------------------------------------------------------
+# enzyme_cost_lookup — verified static price catalog
+# ---------------------------------------------------------------------------
+
+_ENZYME_CATALOG: list[dict] = [
+    {
+        "aliases": ["cyp102a1", "p450 bm3", "p450bm3", "cyp102", "1.14.14.1", "p14779",
+                    "p450 bm-3", "bm3"],
+        "name": "Cytochrome P450 BM3 (CYP102A1) — wild-type",
+        "ec": "1.14.14.1",
+        "uniprot": "P14779",
+        "suppliers": [
+            {"name": "Sigma-Aldrich (Merck)", "sku": "SML2222",
+             "price": "~$195 / 0.5 mg",
+             "url": "https://www.sigmaaldrich.com/catalog/product/sigma/sml2222",
+             "availability": "commercial"},
+            {"name": "Prozomix", "product": "P450 BM3 Panel Kit (15 variants)",
+             "price": "~£350–500 (MTA/license required — email info@prozomix.com)",
+             "url": "https://www.prozomix.com/products/oxidation",
+             "availability": "MTA required"},
+        ],
+        "note": (
+            "Most characterised bacterial P450. Wild-type has low activity on large terpenoid "
+            "substrates. F87V and A82F/F87V variants show improved terpenoid hydroxylation "
+            "(Renata 2021, JACS). Requires NADPH-regeneration system (GDH/glucose ~$15/100 rxn)."
+        ),
+    },
+    {
+        "aliases": ["cyp101a1", "p450cam", "cyp101", "1.14.15.1", "p00183"],
+        "name": "Cytochrome P450cam (CYP101A1)",
+        "ec": "1.14.15.1",
+        "uniprot": "P00183",
+        "suppliers": [
+            {"name": "Sigma-Aldrich (Merck)", "sku": "C3546",
+             "price": "~$125 / 1 mg",
+             "url": "https://www.sigmaaldrich.com/catalog/product/sigma/c3546",
+             "availability": "commercial"},
+        ],
+        "note": "Narrow substrate scope — primarily camphor. Poor activity on diterpene substrates.",
+    },
+    {
+        "aliases": ["adh", "alcohol dehydrogenase", "1.1.1.1", "hladh", "horse liver adh",
+                    "yeast adh", "yadh", "p00327"],
+        "name": "Alcohol dehydrogenase (horse liver, HLADH; or yeast YADH)",
+        "ec": "1.1.1.1",
+        "uniprot": "P00327",
+        "suppliers": [
+            {"name": "Sigma-Aldrich (Merck)", "sku": "A3263",
+             "price": "~$45 / 750 U (horse liver)",
+             "url": "https://www.sigmaaldrich.com/catalog/product/sigma/a3263",
+             "availability": "commercial"},
+            {"name": "Sigma-Aldrich (Merck)", "sku": "A7011",
+             "price": "~$36 / 1000 U (yeast)",
+             "url": "https://www.sigmaaldrich.com/catalog/product/sigma/a7011",
+             "availability": "commercial"},
+        ],
+        "note": "Cofactor: NAD+ (Sigma N7004 ~$25/g). Good for secondary alcohol oxidation/reduction.",
+    },
+    {
+        "aliases": ["laccase", "1.10.3.2", "trametes versicolor laccase", "q12718"],
+        "name": "Laccase (Trametes versicolor)",
+        "ec": "1.10.3.2",
+        "uniprot": "Q12718",
+        "suppliers": [
+            {"name": "Sigma-Aldrich (Merck)", "sku": "38429",
+             "price": "~$55 / 1 KU",
+             "url": "https://www.sigmaaldrich.com/catalog/product/sigma/38429",
+             "availability": "commercial"},
+        ],
+        "note": "Requires only O2. Active mainly on phenolic substrates; poor on aliphatic terpenoids.",
+    },
+    {
+        "aliases": ["calb", "lipase b", "candida antarctica lipase b", "novozym 435",
+                    "3.1.1.3", "p41365"],
+        "name": "Lipase B — Candida antarctica (CALB / Novozym 435)",
+        "ec": "3.1.1.3",
+        "uniprot": "P41365",
+        "suppliers": [
+            {"name": "Sigma-Aldrich (Merck)", "sku": "L4777",
+             "price": "~$160 / 1 g (immobilised)",
+             "url": "https://www.sigmaaldrich.com/catalog/product/sigma/l4777",
+             "availability": "commercial"},
+            {"name": "Novozymes / ImmChem", "product": "Novozym 435",
+             "price": "~$450 / kg (bulk)",
+             "url": "https://www.novozymes.com",
+             "availability": "commercial"},
+        ],
+        "note": "Best for ester synthesis/hydrolysis; not for C-H hydroxylation.",
+    },
+    {
+        "aliases": ["bvmo", "cyclohexanone monooxygenase", "chmo", "1.14.13.22",
+                    "baeyer-villiger monooxygenase", "q9r2f5"],
+        "name": "Baeyer–Villiger Monooxygenase (CHMO / BVMO)",
+        "ec": "1.14.13.22",
+        "uniprot": "Q9R2F5",
+        "suppliers": [
+            {"name": "Prozomix", "product": "BVMO Panel Kit (24 enzymes)",
+             "price": "~£250–450 (contact for quote)",
+             "url": "https://www.prozomix.com/products/oxidation",
+             "availability": "commercial, quote required"},
+        ],
+        "note": (
+            "NADPH-dependent. Converts ketones → lactones/esters. "
+            "Requires regeneration system (GDH/glucose ~$15/100 rxn). "
+            "Use for terpenone → lactone if the target scaffold allows ring expansion."
+        ),
+    },
+    {
+        "aliases": ["oye", "ene-reductase", "old yellow enzyme", "1.6.99.1",
+                    "enoate reductase"],
+        "name": "Ene-reductase / Old Yellow Enzyme (OYE family)",
+        "ec": "1.6.99.1",
+        "suppliers": [
+            {"name": "Prozomix", "product": "Ene-reductase Panel Kit (36 enzymes)",
+             "price": "~£350–550 (contact for quote)",
+             "url": "https://www.prozomix.com/products/reduction",
+             "availability": "commercial, quote required"},
+        ],
+        "note": "NADPH-dependent C=C reduction. High yields (40–90%) on activated alkenes.",
+    },
+    {
+        "aliases": ["gdh", "glucose dehydrogenase", "1.1.1.47", "nadph regeneration",
+                    "cofactor regeneration", "g4134"],
+        "name": "Glucose Dehydrogenase (GDH) — NADPH regeneration",
+        "ec": "1.1.1.47",
+        "suppliers": [
+            {"name": "Sigma-Aldrich (Merck)", "sku": "G4134",
+             "price": "~$58 / 500 U",
+             "url": "https://www.sigmaaldrich.com/catalog/product/sigma/g4134",
+             "availability": "commercial"},
+        ],
+        "note": (
+            "Required cofactor regeneration partner for CYP, BVMO, OYE, and ADH reactions. "
+            "Add glucose (~$0.01/g) + NADP+ (Sigma N0505 ~$42/100 mg). "
+            "Effective cost: ~$0.002/µmol NADPH regenerated."
+        ),
+        "cofactors": ["NADP+ — Sigma N0505, ~$42/100 mg", "D-Glucose — Sigma G7021, ~$35/kg"],
+    },
+    {
+        "aliases": ["nad+", "nadh", "nadp+", "nadph", "coenzyme", "cofactor",
+                    "n7004", "n0505"],
+        "name": "NAD+/NADH/NADP+/NADPH cofactors",
+        "ec": None,
+        "suppliers": [
+            {"name": "Sigma-Aldrich (Merck)", "sku": "N7004 (NAD+)",
+             "price": "~$25 / 1 g",
+             "url": "https://www.sigmaaldrich.com/catalog/product/sigma/n7004",
+             "availability": "commercial"},
+            {"name": "Sigma-Aldrich (Merck)", "sku": "N0505 (NADP+)",
+             "price": "~$42 / 100 mg",
+             "url": "https://www.sigmaaldrich.com/catalog/product/sigma/n0505",
+             "availability": "commercial"},
+        ],
+        "note": "Use with GDH/glucose regeneration — stoichiometric use is prohibitively expensive.",
+    },
+    {
+        "aliases": ["terpene synthase", "terpenoid cyclase", "sesquiterpene synthase",
+                    "diterpene synthase", "2.5.1", "terpene cyclase"],
+        "name": "Terpene/Terpenoid Cyclase (various EC 2.5.1.x)",
+        "ec": "2.5.1.x",
+        "suppliers": [],
+        "availability": "research/custom expression only — NOT commercially available as kits",
+        "note": (
+            "Must be expressed recombinantly (E. coli or P. pastoris). "
+            "Custom protein expression services: Genscript ~$1500–3500 (4–8 weeks), "
+            "ProteinTech ~$800–2000. Plasmid-only options: Addgene (free/nominal fee). "
+            "Consider cell-free expression kits (Sigma CECF kit ~$400) for mg-scale."
+        ),
+    },
+    {
+        "aliases": ["hrp", "horseradish peroxidase", "1.11.1.7", "p6782"],
+        "name": "Horseradish Peroxidase (HRP)",
+        "ec": "1.11.1.7",
+        "suppliers": [
+            {"name": "Sigma-Aldrich (Merck)", "sku": "P6782",
+             "price": "~$38 / 25 mg (lyophilised)",
+             "url": "https://www.sigmaaldrich.com/catalog/product/sigma/p6782",
+             "availability": "commercial"},
+        ],
+        "note": "Requires H2O2. Not suitable for regioselective C-H hydroxylation of terpenoids.",
+    },
+]
+
+
+def _enzyme_cost_lookup(query: str) -> tuple[str, bool]:
+    q = query.lower().strip()
+    matches = []
+    for entry in _ENZYME_CATALOG:
+        if any(alias in q or q in alias for alias in entry["aliases"]):
+            matches.append(entry)
+
+    if not matches:
+        # partial word match fallback
+        words = set(q.split())
+        for entry in _ENZYME_CATALOG:
+            alias_words = set(" ".join(entry["aliases"]).split())
+            if words & alias_words:
+                matches.append(entry)
+
+    if not matches:
+        return json.dumps({
+            "query": query,
+            "status": "not_found",
+            "message": (
+                "Enzyme not in static catalog. "
+                "Search suggestions: (1) use web_search for '<enzyme name> sigma-aldrich price'; "
+                "(2) check Prozomix catalog at prozomix.com/products; "
+                "(3) for recombinant-only enzymes, quote ~$800–3500 for custom expression service."
+            ),
+            "catalog_entries": [e["name"] for e in _ENZYME_CATALOG],
+        }, indent=2), True
+
+    results = []
+    for e in matches[:3]:
+        results.append({
+            "name": e["name"],
+            "ec": e.get("ec"),
+            "uniprot": e.get("uniprot"),
+            "suppliers": e.get("suppliers", []),
+            "availability": e.get("availability", "see suppliers"),
+            "note": e.get("note", ""),
+            "cofactors": e.get("cofactors", []),
+        })
+    return json.dumps({"query": query, "status": "found", "results": results}, indent=2), True
+
+
+# ---------------------------------------------------------------------------
+# pains_alerts — PAINS / Brenk / NIH structural alert screening
+# ---------------------------------------------------------------------------
+
+def _pains_alerts(smiles: str) -> tuple[str, bool]:
+    try:
+        from rdkit import Chem
+        from rdkit.Chem.FilterCatalog import FilterCatalog, FilterCatalogParams
+    except ImportError:
+        return "RDKit is not installed. Run: pip install rdkit", False
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return f"Invalid SMILES: {smiles!r}", False
+
+    alerts: list[dict] = []
+
+    def _run_catalog(catalog_enum, filter_name: str, severity: str) -> None:
+        params = FilterCatalogParams()
+        params.AddCatalog(catalog_enum)
+        cat = FilterCatalog(params)
+        for entry in cat.GetMatches(mol):
+            alerts.append({
+                "filter": filter_name,
+                "name": entry.GetDescription(),
+                "severity": severity,
+            })
+
+    _run_catalog(FilterCatalogParams.FilterCatalogs.PAINS_A, "PAINS-A", "high")
+    _run_catalog(FilterCatalogParams.FilterCatalogs.PAINS_B, "PAINS-B", "high")
+    _run_catalog(FilterCatalogParams.FilterCatalogs.PAINS_C, "PAINS-C", "high")
+    _run_catalog(FilterCatalogParams.FilterCatalogs.BRENK,   "Brenk",   "medium")
+    _run_catalog(FilterCatalogParams.FilterCatalogs.NIH,     "NIH",     "medium")
+
+    status = "CLEAN" if not alerts else "FLAGGED"
+    pains_count = sum(1 for a in alerts if a["filter"].startswith("PAINS"))
+    recommendation = (
+        "No structural alerts — compound can proceed to ADMET profiling."
+        if not alerts else
+        (
+            f"{pains_count} PAINS alert(s) found: scaffold redesign required before "
+            "biological testing (PAINS are assay artefacts). "
+            if pains_count else ""
+        ) + (
+            f"{len(alerts) - pains_count} Brenk/NIH alert(s): check for metabolic "
+            "liabilities or reactive groups."
+            if len(alerts) - pains_count else ""
+        )
+    )
+    return json.dumps({
+        "smiles": smiles,
+        "status": status,
+        "n_alerts": len(alerts),
+        "pains_hits": pains_count,
+        "brenk_nih_hits": len(alerts) - pains_count,
+        "alerts": alerts,
+        "recommendation": recommendation,
+    }, indent=2), True
+
+
+# ---------------------------------------------------------------------------
+# rdkit_scaffold — Bemis-Murcko scaffold + bioisostere suggestions
+# ---------------------------------------------------------------------------
+
+def _rdkit_scaffold(smiles: str, reference_smiles: str = None) -> tuple[str, bool]:
+    try:
+        from rdkit import Chem
+        from rdkit.Chem.Scaffolds import MurckoScaffold
+        from rdkit.Chem import rdMolDescriptors, rdFMCS
+    except ImportError:
+        return "RDKit is not installed. Run: pip install rdkit", False
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return f"Invalid SMILES: {smiles!r}", False
+
+    scaffold = MurckoScaffold.GetScaffoldForMol(mol)
+    scaffold_smi = Chem.MolToSmiles(scaffold) if scaffold else "no_scaffold"
+    generic = MurckoScaffold.MakeScaffoldGeneric(scaffold) if scaffold else None
+    generic_smi = Chem.MolToSmiles(generic) if generic else "N/A"
+
+    n_rings = rdMolDescriptors.CalcNumRings(scaffold) if scaffold else 0
+    n_arom  = rdMolDescriptors.CalcNumAromaticRings(scaffold) if scaffold else 0
+    framework_type = (
+        "aromatic" if n_arom == n_rings and n_arom > 0
+        else "mixed" if n_arom > 0
+        else "saturated"
+    )
+    scaffold_heavy = scaffold.GetNumHeavyAtoms() if scaffold else 0
+
+    # Bioisostere suggestions based on substructures in the full molecule
+    bioisosteres: list[dict] = []
+    _smarts = Chem.MolFromSmarts
+
+    checks = [
+        ("c1ccccc1",    "phenyl",          "pyridyl (c1ccncc1), pyrimidyl (c1ccncn1), or pyridazinyl",
+         "Reduces logP, adds H-bond acceptor, often improves solubility and metabolic stability"),
+        ("[NH]",        "N-H (amide/NH)",   "O (ester/ether) or N-Me",
+         "Lowers H-bond donor count → better oral absorption and BBB penetration"),
+        ("C(=O)[OH]",  "carboxylic acid",  "tetrazole (c1nn[nH]n1-R) or hydroxamic acid (C(=O)NO)",
+         "Tetrazole is pKa-matched (≈4.9 vs 4.5) and more lipophilic; reduces efflux"),
+        ("C(=O)N",     "amide",            "E-alkene, 1,2,3-triazole (c1cn[nH]n1), or oxazole",
+         "Reduces hydrolytic lability; triazole is CYP-resistant and rigid"),
+        ("c1ccc(Cl)cc1","4-chlorophenyl",  "4-fluorophenyl or 3,4-difluorophenyl",
+         "F is ≈3× smaller than Cl, avoids para-CYP oxidation, improved metabolic stability"),
+        ("S(=O)(=O)N", "sulfonamide",      "acylsulfonamide or phosphonamide",
+         "Maintains acidic NH but modulates pKa; acylsulfonamides more metabolically stable"),
+        ("c1cc[nH]c1", "pyrrole",          "indole, benzimidazole, or azaindole",
+         "Aromatic NH is a mutagenicity risk (Ames); ring fusion reduces planarity alert"),
+        ("C#N",        "nitrile",          "tetrazole, amide, or amino-oxazole",
+         "Nitrile can be metabolised to cyanide; tetrazole avoids CYP2C19 metabolite liability"),
+    ]
+    for smarts, original, replacement, rationale in checks:
+        pat = _smarts(smarts)
+        if pat and mol.HasSubstructMatch(pat):
+            bioisosteres.append({
+                "substructure": original,
+                "replacement_options": replacement,
+                "rationale": rationale,
+            })
+
+    result: dict = {
+        "query_smiles": smiles,
+        "bemis_murcko_scaffold": scaffold_smi,
+        "generic_scaffold": generic_smi,
+        "scaffold_heavy_atoms": scaffold_heavy,
+        "side_chain_heavy_atoms": mol.GetNumHeavyAtoms() - scaffold_heavy,
+        "framework_rings": n_rings,
+        "aromatic_rings": n_arom,
+        "framework_type": framework_type,
+        "bioisostere_suggestions": bioisosteres,
+    }
+
+    if reference_smiles:
+        ref_mol = Chem.MolFromSmiles(reference_smiles)
+        if ref_mol:
+            mcs = rdFMCS.FindMCS(
+                [mol, ref_mol],
+                completeRingsOnly=True,
+                ringMatchesRingOnly=True,
+                timeout=5,
+            )
+            result["mcs_with_reference"] = {
+                "mcs_smarts": mcs.smartsString,
+                "mcs_atoms": mcs.numAtoms,
+                "mcs_bonds": mcs.numBonds,
+                "query_unique_atoms": mol.GetNumHeavyAtoms() - mcs.numAtoms,
+                "ref_unique_atoms": ref_mol.GetNumHeavyAtoms() - mcs.numAtoms,
+                "note": "Atoms outside MCS are the scaffold-hop delta — prime bioisostere candidates",
+            }
+
+    return json.dumps(result, indent=2), True
+
+
+# ---------------------------------------------------------------------------
+# swissadme_fetch — SwissADME ADMET prediction
+# ---------------------------------------------------------------------------
+
+def _swissadme_fetch(smiles: str) -> tuple[str, bool]:
+    if err := _need_requests():
+        return err
+    import urllib.parse
+
+    encoded = urllib.parse.quote(smiles, safe="")
+    try:
+        r = _requests.post(
+            "http://www.swissadme.ch/include/sendQuery.php",
+            data={"smi": smiles},
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "OctoSlave/0.1 (research agent)",
+            },
+            allow_redirects=True,
+            timeout=30,
+        )
+    except Exception as e:
+        return json.dumps({
+            "status": "connection_error",
+            "message": f"SwissADME unreachable: {e}",
+            "fallback": "Use rdkit_admet for local ADMET prediction (no internet required)",
+            "swissadme_url": f"http://www.swissadme.ch/?smi={encoded}",
+        }, indent=2), False
+
+    if r.status_code != 200:
+        return json.dumps({
+            "status": "http_error",
+            "code": r.status_code,
+            "message": "SwissADME returned non-200 response. Use rdkit_admet as fallback.",
+            "swissadme_url": f"http://www.swissadme.ch/?smi={encoded}",
+        }, indent=2), False
+
+    # Try to parse key properties from the HTML response
+    import re
+    text = r.text
+    props: dict = {}
+
+    patterns = [
+        ("consensus_logP",   r'Consensus Log Po/w[^0-9\-]*(-?[0-9]+\.?[0-9]*)'),
+        ("GI_absorption",    r'GI absorption[^A-Za-z]*(High|Low)'),
+        ("BBB_permeant",     r'BBB permeant[^A-Za-z]*(Yes|No)'),
+        ("Pgp_substrate",    r'P-gp substrate[^A-Za-z]*(Yes|No)'),
+        ("CYP1A2_inhibitor", r'CYP1A2 inhibitor[^A-Za-z]*(Yes|No)'),
+        ("CYP2C19_inhibitor",r'CYP2C19 inhibitor[^A-Za-z]*(Yes|No)'),
+        ("CYP2C9_inhibitor", r'CYP2C9 inhibitor[^A-Za-z]*(Yes|No)'),
+        ("CYP2D6_inhibitor", r'CYP2D6 inhibitor[^A-Za-z]*(Yes|No)'),
+        ("CYP3A4_inhibitor", r'CYP3A4 inhibitor[^A-Za-z]*(Yes|No)'),
+        ("lipinski_ro5",     r'Lipinski[^A-Za-z]*(Yes|No)'),
+        ("veber_oral",       r'Veber[^A-Za-z]*(Yes|No)'),
+        ("PAINS_alerts",     r'PAINS[^0-9]*([0-9]+)\s*alert'),
+        ("synthetic_access", r'Synthetic accessibility[^0-9]*([0-9]+\.?[0-9]*)'),
+    ]
+    for key, pattern in patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            val = m.group(1)
+            try:
+                props[key] = float(val)
+            except ValueError:
+                props[key] = val
+
+    if props:
+        return json.dumps({
+            "status": "success",
+            "source": "SwissADME (swissadme.ch)",
+            "smiles": smiles,
+            "properties": props,
+            "full_result_url": f"http://www.swissadme.ch/?smi={encoded}",
+        }, indent=2), True
+
+    # Fallback: return URL only
+    return json.dumps({
+        "status": "parse_limited",
+        "message": "SwissADME responded but HTML structure could not be parsed. "
+                   "Visit the URL for full results, or use rdkit_admet for local prediction.",
+        "smiles": smiles,
+        "full_result_url": f"http://www.swissadme.ch/?smi={encoded}",
+        "fallback": "rdkit_admet",
+    }, indent=2), True
+
+
+# ---------------------------------------------------------------------------
+# pkcsm_fetch — pkCSM ADMET numerical predictions
+# ---------------------------------------------------------------------------
+
+_PKCSM_ENDPOINTS = {
+    "absorption":    "/absorption/predict",
+    "distribution":  "/distribution/predict",
+    "metabolism":    "/metabolism/predict",
+    "excretion":     "/excretion/predict",
+    "toxicity":      "/toxicity/predict",
+}
+_PKCSM_BASE = "https://biosig.unimelb.edu.au/pkcsm/api"
+
+
+def _pkcsm_fetch(smiles: str, endpoint: str = "all") -> tuple[str, bool]:
+    if err := _need_requests():
+        return err
+
+    if endpoint == "all":
+        targets = list(_PKCSM_ENDPOINTS.items())
+    elif endpoint in _PKCSM_ENDPOINTS:
+        targets = [(endpoint, _PKCSM_ENDPOINTS[endpoint])]
+    else:
+        return (
+            f"Unknown endpoint {endpoint!r}. "
+            f"Choose from: all, {', '.join(_PKCSM_ENDPOINTS)}", False
+        )
+
+    predictions: dict = {}
+    errors: dict = {}
+    for ep_name, ep_path in targets:
+        try:
+            r = _requests.post(
+                _PKCSM_BASE + ep_path,
+                data={"smiles": smiles},
+                headers={"Content-Type": "application/x-www-form-urlencoded",
+                         "User-Agent": "OctoSlave/0.1"},
+                timeout=30,
+            )
+            if r.status_code == 200:
+                try:
+                    predictions[ep_name] = r.json()
+                except Exception:
+                    predictions[ep_name] = {"raw_text": r.text[:500]}
+            else:
+                errors[ep_name] = f"HTTP {r.status_code}"
+        except Exception as e:
+            errors[ep_name] = str(e)
+
+    return json.dumps({
+        "smiles": smiles,
+        "endpoint": endpoint,
+        "source": "pkCSM (biosig.unimelb.edu.au/pkcsm)",
+        "citation": "Pires et al. (2015) J. Med. Chem. 58(9):4066-4072",
+        "predictions": predictions,
+        "errors": errors if errors else None,
+    }, indent=2), bool(predictions)
+
+
+# ---------------------------------------------------------------------------
+# surechembl_search — patent landscape via SureChEMBL
+# ---------------------------------------------------------------------------
+
+def _surechembl_search(
+    smiles: str = None,
+    query: str = None,
+    similarity: float = 0.85,
+    limit: int = 10,
+) -> tuple[str, bool]:
+    if err := _need_requests():
+        return err
+    if not smiles and not query:
+        return "Provide either smiles or query.", False
+
+    limit = max(1, min(int(limit or 10), 50))
+    similarity = float(similarity or 0.85)
+
+    import urllib.parse
+
+    try:
+        if smiles:
+            params = {
+                "smiles": smiles,
+                "type": "similarity",
+                "threshold": int(similarity * 100),
+                "limit": limit,
+            }
+            r = _http_get("https://www.surechembl.org/search/chemical", params=params)
+        else:
+            params = {"query": query, "limit": limit}
+            r = _http_get("https://www.surechembl.org/search/text", params=params)
+    except Exception as e:
+        return json.dumps({
+            "status": "connection_error",
+            "message": f"SureChEMBL unreachable: {e}",
+            "fallback": "Use web_search: site:surechembl.org " + (smiles or query or ""),
+        }, indent=2), False
+
+    patents: list[dict] = []
+    if r.status_code == 200:
+        try:
+            data = r.json()
+            raw = data.get("results") or data.get("patents") or data.get("hits") or []
+            for item in raw[:limit]:
+                pid = item.get("patent_number") or item.get("id") or item.get("doc_id")
+                patents.append({
+                    "patent_id": pid,
+                    "title": (item.get("title") or "")[:200],
+                    "publication_date": item.get("publication_date") or item.get("date"),
+                    "assignee": item.get("assignee") or item.get("applicant"),
+                    "url": f"https://www.surechembl.org/document/{pid}" if pid else None,
+                })
+        except Exception:
+            pass
+
+    if not patents:
+        encoded = urllib.parse.quote(smiles or query or "", safe="")
+        return json.dumps({
+            "status": "no_results_or_unavailable",
+            "query_smiles": smiles,
+            "query_text": query,
+            "patents": [],
+            "recommendation": "No results from SureChEMBL API. Verify manually.",
+            "manual_urls": [
+                f"https://www.surechembl.org/search/#q={encoded}",
+                "https://worldwide.espacenet.com/patent/search",
+                "https://patents.google.com",
+            ],
+        }, indent=2), True
+
+    ip_flag = (
+        f"Found {len(patents)} patent(s). Recommend FTO (freedom-to-operate) analysis "
+        "before progressing this scaffold, especially if >3 patents cover the same core."
+        if len(patents) >= 3 else
+        f"Found {len(patents)} patent(s). Low IP density — scaffold may have design freedom."
+    )
+    return json.dumps({
+        "query_smiles": smiles,
+        "query_text": query,
+        "similarity_cutoff": similarity if smiles else None,
+        "n_results": len(patents),
+        "patents": patents,
+        "ip_assessment": ip_flag,
+    }, indent=2), True
+
+
+# ---------------------------------------------------------------------------
+# vina_dock — AutoDock Vina / Smina / Gnina docking wrapper
+# ---------------------------------------------------------------------------
+
+def _vina_dock(
+    ligand_smiles: str,
+    receptor_source: str,
+    pocket_x: float,
+    pocket_y: float,
+    pocket_z: float,
+    box_size_x: float = 20.0,
+    box_size_y: float = 20.0,
+    box_size_z: float = 20.0,
+    exhaustiveness: int = 8,
+    n_poses: int = 5,
+    working_dir: str = ".",
+) -> tuple[str, bool]:
+    import subprocess
+    import shutil
+
+    # Check for docking binary
+    vina_bin = None
+    for candidate in ("vina", "smina", "gnina"):
+        if shutil.which(candidate):
+            vina_bin = candidate
+            break
+
+    if vina_bin is None:
+        return json.dumps({
+            "status": "binary_not_found",
+            "message": (
+                "No docking binary found (vina / smina / gnina). "
+                "Install with: conda install -c conda-forge vina  "
+                "or: pip install vina"
+            ),
+            "install_options": [
+                "conda install -c conda-forge vina",
+                "conda install -c conda-forge smina",
+                "pip install vina",
+            ],
+        }, indent=2), False
+
+    if not shutil.which("obabel"):
+        return json.dumps({
+            "status": "obabel_not_found",
+            "message": (
+                "obabel is required for PDBQT conversion. "
+                "Install with: conda install -c conda-forge openbabel"
+            ),
+        }, indent=2), False
+
+    dock_dir = Path(working_dir) / "docking_tmp"
+    dock_dir.mkdir(parents=True, exist_ok=True)
+
+    # Resolve receptor
+    receptor_pdbqt = dock_dir / "receptor.pdbqt"
+    receptor_pdb = None
+
+    if len(receptor_source) == 4 and receptor_source.replace("_", "").isalnum():
+        # PDB ID — download
+        pdb_out = dock_dir / f"{receptor_source.lower()}.pdb"
+        dl_result, dl_ok = _pdb_fetch(
+            pdb_id=receptor_source.upper(),
+            format="pdb",
+            output_path=str(pdb_out),
+            working_dir=working_dir,
+        )
+        if not dl_ok:
+            return f"Failed to download PDB {receptor_source}: {dl_result}", False
+        receptor_pdb = pdb_out
+    else:
+        candidate = Path(receptor_source)
+        if not candidate.is_absolute():
+            candidate = Path(working_dir) / receptor_source
+        if not candidate.exists():
+            return f"Receptor file not found: {receptor_source}", False
+        if candidate.suffix == ".pdbqt":
+            receptor_pdbqt = candidate
+            receptor_pdb = None  # skip conversion
+        else:
+            receptor_pdb = candidate
+
+    # Convert receptor PDB → PDBQT (strip HETATM/water, add H, Gasteiger charges)
+    if receptor_pdb is not None:
+        conv = subprocess.run(
+            ["obabel", str(receptor_pdb), "-O", str(receptor_pdbqt),
+             "-xr", "--partialcharge", "gasteiger", "--delete", "HOH"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if not receptor_pdbqt.exists():
+            return (
+                f"Receptor PDBQT conversion failed.\n"
+                f"obabel stdout: {conv.stdout[:400]}\n"
+                f"obabel stderr: {conv.stderr[:400]}"
+            ), False
+
+    # Convert ligand SMILES → 3D → PDBQT
+    ligand_pdbqt = dock_dir / "ligand.pdbqt"
+    lig_conv = subprocess.run(
+        ["obabel", f"-:{ligand_smiles}", "--gen3d", "-O", str(ligand_pdbqt),
+         "--partialcharge", "gasteiger"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if not ligand_pdbqt.exists():
+        return (
+            f"Ligand PDBQT preparation failed.\n"
+            f"obabel stdout: {lig_conv.stdout[:400]}\n"
+            f"obabel stderr: {lig_conv.stderr[:400]}"
+        ), False
+
+    # Write Vina config
+    config_path = dock_dir / "vina.conf"
+    out_pdbqt   = dock_dir / "docked.pdbqt"
+    config_path.write_text(
+        f"receptor = {receptor_pdbqt}\n"
+        f"ligand   = {ligand_pdbqt}\n"
+        f"center_x = {pocket_x}\ncenter_y = {pocket_y}\ncenter_z = {pocket_z}\n"
+        f"size_x   = {box_size_x}\nsize_y   = {box_size_y}\nsize_z   = {box_size_z}\n"
+        f"exhaustiveness = {exhaustiveness}\nnum_modes = {n_poses}\n"
+    )
+
+    # Run docking
+    vina_run = subprocess.run(
+        [vina_bin, "--config", str(config_path), "--out", str(out_pdbqt)],
+        capture_output=True, text=True, timeout=600,
+    )
+
+    # Parse affinity table from stdout
+    poses: list[dict] = []
+    for line in vina_run.stdout.splitlines():
+        parts = line.split()
+        if parts and parts[0].isdigit():
+            try:
+                poses.append({
+                    "pose": int(parts[0]),
+                    "affinity_kcal_mol": float(parts[1]),
+                    "rmsd_lb_A": float(parts[2]) if len(parts) > 2 else None,
+                    "rmsd_ub_A": float(parts[3]) if len(parts) > 3 else None,
+                })
+            except (ValueError, IndexError):
+                pass
+
+    if not poses and vina_run.returncode != 0:
+        return (
+            f"Docking failed (exit {vina_run.returncode}).\n"
+            f"STDOUT: {vina_run.stdout[:500]}\nSTDERR: {vina_run.stderr[:500]}"
+        ), False
+
+    best = poses[0]["affinity_kcal_mol"] if poses else None
+    interpretation = (
+        "No poses generated"
+        if not poses else
+        "Very potent (≤ −9 kcal/mol)" if best <= -9 else
+        "Moderate binding (−7 to −9 kcal/mol)" if best <= -7 else
+        "Weak binding (−5 to −7 kcal/mol)" if best <= -5 else
+        "Poor binding (> −5 kcal/mol)"
+    )
+
+    return json.dumps({
+        "status": "success",
+        "docking_binary": vina_bin,
+        "ligand_smiles": ligand_smiles,
+        "receptor": receptor_source,
+        "pocket_center": {"x": pocket_x, "y": pocket_y, "z": pocket_z},
+        "box_angstrom": {"x": box_size_x, "y": box_size_y, "z": box_size_z},
+        "exhaustiveness": exhaustiveness,
+        "top_poses": poses,
+        "best_affinity_kcal_mol": best,
+        "interpretation": interpretation,
+        "output_pdbqt": str(out_pdbqt),
+        "affinity_guide": {
+            "very_potent": "≤ −9 kcal/mol",
+            "moderate":    "−7 to −9 kcal/mol",
+            "weak":        "−5 to −7 kcal/mol",
+            "poor":        "> −5 kcal/mol",
+        },
+    }, indent=2), True
+
+
+# ---------------------------------------------------------------------------
+# bindingdb_lookup — off-target affinity data from BindingDB
+# ---------------------------------------------------------------------------
+
+def _bindingdb_lookup(
+    smiles: str = None,
+    target_gene: str = None,
+    ki_cutoff_nm: float = 10000.0,
+    limit: int = 10,
+) -> tuple[str, bool]:
+    if err := _need_requests():
+        return err
+    if not smiles and not target_gene:
+        return "Provide either smiles or target_gene.", False
+
+    limit = max(1, min(int(limit or 10), 50))
+    ki_cutoff = float(ki_cutoff_nm or 10000.0)
+    results: list[dict] = []
+
+    try:
+        if target_gene:
+            # Search by target gene/protein name
+            r = _http_get(
+                "https://bindingdb.org/rwd/bind/BDBClient/getTargets.json",
+                params={"targetname": target_gene, "response": "json"},
+            )
+            if r.status_code == 200:
+                data = r.json()
+                affinities = (
+                    data.get("affinities") or
+                    data.get("results") or
+                    data.get("bdb_affinities") or []
+                )
+                for entry in affinities:
+                    for aff_key in ("ki", "ic50", "kd", "ec50", "affinity_nm"):
+                        raw = entry.get(aff_key)
+                        if raw is None:
+                            continue
+                        try:
+                            val = float(str(raw).replace(">", "").replace("<", "").strip())
+                        except ValueError:
+                            continue
+                        if val <= ki_cutoff:
+                            results.append({
+                                "compound": entry.get("ligand_name") or entry.get("compound_name"),
+                                "smiles": entry.get("ligand_smiles"),
+                                "target": target_gene,
+                                "affinity_nM": val,
+                                "affinity_type": aff_key.upper(),
+                                "assay": entry.get("assay_description"),
+                                "pmid": entry.get("pmid") or entry.get("doi"),
+                            })
+                            break
+
+        if smiles and len(results) < limit:
+            # SMILES similarity search
+            import urllib.parse
+            r2 = _http_get(
+                "https://bindingdb.org/rwd/bind/chemsearch/marvin/MolStructure.jsp",
+                params={
+                    "action": "GetTargets",
+                    "smiles": smiles,
+                    "threshold": "85",
+                    "response": "json",
+                },
+            )
+            if r2.status_code == 200:
+                data2 = r2.json()
+                for entry in (data2.get("affinities") or []):
+                    for aff_key in ("ki", "ic50", "kd", "ec50"):
+                        raw = entry.get(aff_key)
+                        if raw is None:
+                            continue
+                        try:
+                            val = float(str(raw).replace(">", "").replace("<", "").strip())
+                        except ValueError:
+                            continue
+                        if val <= ki_cutoff:
+                            results.append({
+                                "compound": entry.get("ligand_smiles", smiles),
+                                "target": entry.get("target_name") or entry.get("gene_name"),
+                                "affinity_nM": val,
+                                "affinity_type": aff_key.upper(),
+                                "tanimoto_similarity": entry.get("similarity"),
+                                "pmid": entry.get("pmid"),
+                            })
+                            break
+
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "message": f"BindingDB request failed: {e}",
+            "fallback": (
+                "Use chembl_lookup with target gene name, or "
+                "web_search 'BindingDB [compound name]' for off-target data"
+            ),
+        }, indent=2), False
+
+    results.sort(key=lambda x: x.get("affinity_nM", 9e9))
+    results = results[:limit]
+
+    off_target_note = (
+        "No binding data found. Novel scaffold or not in BindingDB. "
+        "Verify with ChEMBL or PubChem BioAssay."
+        if not results else
+        f"Found {len(results)} binding event(s) ≤ {ki_cutoff:.0f} nM. "
+        "Review targets for selectivity risks (CYPs, hERG, kinase family)."
+    )
+
+    return json.dumps({
+        "query_smiles": smiles,
+        "query_target": target_gene,
+        "ki_cutoff_nm": ki_cutoff,
+        "n_results": len(results),
+        "off_target_note": off_target_note,
+        "affinities": results,
+    }, indent=2), True

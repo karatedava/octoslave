@@ -23,16 +23,19 @@ Web:
 - crawl_tree   — BFS-crawl a website tree (for documentation, catalogues, hierarchies)
 
 Biology / chemistry (prefer over read_file / web_fetch when applicable):
-- bio_inspect      — schema-aware preview of FASTA, FASTQ, VCF, GFF, GTF, PDB, mmCIF, MTX, h5ad, SMI, SDF
-- rdkit_describe   — physicochemical / drug-likeness profile of a SMILES (MW, logP, TPSA, QED, RO5, ...)
-- uniprot_lookup   — UniProtKB protein records and search
-- pubchem_lookup   — small molecules by name / CID / SMILES
-- chembl_lookup    — bioactive / drug-like compounds
-- pdb_fetch        — RCSB PDB experimental structures by 4-char ID
-- alphafold_fetch  — AlphaFold DB predicted structures by UniProt accession
-- geo_search       — NCBI GEO / SRA datasets via E-utilities
-- ena_fetch        — ENA / SRA file report (FASTQ download URLs, read counts)
-- pdf_ocr          — render PDF pages and OCR them (rescues numbers / labels stuck inside figures)
+- bio_inspect         — schema-aware preview of FASTA, FASTQ, VCF, GFF, GTF, PDB, mmCIF, MTX, h5ad, SMI, SDF
+- rdkit_describe      — physicochemical / drug-likeness profile of a SMILES (MW, logP, TPSA, QED, RO5, ...)
+- rdkit_admet         — comprehensive ADMET prediction: BBB, hERG, Ames alerts, ESOL solubility, enzymatic substrate class; use context="enzyme_substrate" for biocatalysis
+- kegg_lookup         — KEGG REST API: find/get/link compounds (C######), reactions (R######), enzymes (ec:X.X.X.X), pathways (path:map#####); free, no auth; replaces RetroBioCat for pathway enumeration
+- enzyme_cost_lookup  — verified static enzyme kit prices (Sigma-Aldrich, Prozomix, Novozymes); use INSTEAD of scraping JS-rendered supplier pages
+- uniprot_lookup      — UniProtKB protein records and search
+- pubchem_lookup      — small molecules by name / CID / SMILES
+- chembl_lookup       — bioactive / drug-like compounds
+- pdb_fetch           — RCSB PDB experimental structures by 4-char ID
+- alphafold_fetch     — AlphaFold DB predicted structures by UniProt accession
+- geo_search          — NCBI GEO / SRA datasets via E-utilities
+- ena_fetch           — ENA / SRA file report (FASTQ download URLs, read counts)
+- pdf_ocr             — render PDF pages and OCR them (rescues numbers / labels stuck inside figures)
 
 ## How to approach a task
 

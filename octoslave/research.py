@@ -40,7 +40,11 @@ ROLES: dict[str, dict] = {
                   "bio_inspect", "uniprot_lookup", "pubchem_lookup",
                   "chembl_lookup", "geo_search", "ena_fetch",
                   "pdb_fetch", "alphafold_fetch",
-                  "pdf_ocr"],  # no bash — researcher surveys, never installs
+                  "pdf_ocr",
+                  # ADMET / biocatalysis tools
+                  "kegg_lookup", "enzyme_cost_lookup",
+                  # Drug-discovery tools (patent landscape + off-target survey)
+                  "surechembl_search", "bindingdb_lookup", "pains_alerts"],
     },
     "hypothesis": {
         "label": "Experiment Designer",
@@ -49,7 +53,10 @@ ROLES: dict[str, dict] = {
         "default_model": "deepseek-v3.2-thinking",  # thinking — commit to the right experiment
         "max_iter": 8,
         "tools": ["read_file", "write_file", "list_dir", "glob",
-                  "bio_inspect", "rdkit_describe"],
+                  "bio_inspect", "rdkit_describe",
+                  "rdkit_admet", "kegg_lookup", "enzyme_cost_lookup",
+                  # Scaffold and selectivity planning tools
+                  "pains_alerts", "rdkit_scaffold", "surechembl_search"],
     },
     "skeptic": {
         "label": "Skeptic",
@@ -69,7 +76,13 @@ ROLES: dict[str, dict] = {
                   "glob", "grep", "list_dir",
                   "bio_inspect", "rdkit_describe", "pdb_fetch",
                   "alphafold_fetch", "uniprot_lookup", "pubchem_lookup",
-                  "chembl_lookup", "ena_fetch", "pdf_ocr"],
+                  "chembl_lookup", "ena_fetch", "pdf_ocr",
+                  "rdkit_admet", "kegg_lookup", "enzyme_cost_lookup",
+                  # Drug-discovery full toolset
+                  "pains_alerts", "rdkit_scaffold",
+                  "swissadme_fetch", "pkcsm_fetch",
+                  "surechembl_search", "bindingdb_lookup",
+                  "vina_dock"],
     },
     "debugger": {
         "label": "Debugger",
@@ -79,7 +92,10 @@ ROLES: dict[str, dict] = {
         "max_iter": 30,                             # was 20 — match coder cap proportions
         "tools": ["read_file", "write_file", "edit_file", "bash",
                   "glob", "grep", "list_dir",
-                  "bio_inspect", "rdkit_describe"],
+                  "bio_inspect", "rdkit_describe",
+                  "rdkit_admet", "kegg_lookup",
+                  # Scaffold and PAINS debugging
+                  "pains_alerts", "rdkit_scaffold"],
     },
     "evaluator": {
         "label": "Evaluator",
@@ -89,7 +105,11 @@ ROLES: dict[str, dict] = {
         "max_iter": 15,
         "tools": ["read_file", "bash", "write_file", "list_dir",
                   "web_search", "glob",
-                  "bio_inspect", "rdkit_describe"],
+                  "bio_inspect", "rdkit_describe",
+                  "rdkit_admet", "kegg_lookup", "enzyme_cost_lookup",
+                  # Scientific validity checks: PAINS, scaffold, patents, selectivity
+                  "pains_alerts", "rdkit_scaffold",
+                  "surechembl_search", "bindingdb_lookup"],
     },
     "orchestrator": {
         "label": "Orchestrator",
@@ -161,7 +181,7 @@ LOCAL_DATA_EXTENSIONS: frozenset[str] = frozenset({
     ".fasta", ".fa", ".faa", ".fna", ".fastq", ".fq",
     ".bed", ".vcf", ".gff", ".gff3", ".gtf",
     # chemistry / structure
-    ".pdb", ".cif", ".mol", ".mol2", ".sdf", ".smi", ".xyz",
+    ".pdb", ".cif", ".mol", ".mol2", ".sdf", ".smi", ".smiles", ".xyz",
     # arrays / scientific
     ".npy", ".npz", ".h5", ".hdf5", ".nc",
 })
@@ -2606,9 +2626,7 @@ def _build_inventory(research_dir: str, working_dir: str) -> Path:
             pass
         if p.is_dir() or p.name.startswith("."):
             continue
-        suffix = p.suffix.lower()
-        if suffix in INVENTORY_PROFILED_SUFFIXES:
-            candidates.append(p)
+        candidates.append(p)
 
     candidates.sort(key=lambda p: str(p.relative_to(wd)).lower())
 
@@ -2681,8 +2699,19 @@ def _build_inventory(research_dir: str, working_dir: str) -> Path:
                 type_label = "text"
                 profile = _profile_text(p, max_lines=20)
             else:
-                type_label = "binary"
-                profile = "(no profiler for this extension)"
+                # Unknown extension — sniff for binary (null bytes) then try text
+                try:
+                    raw = p.read_bytes()
+                    if b"\x00" in raw[:4096]:
+                        type_label = "binary/unknown"
+                        profile = "_(binary file — inspect manually)_"
+                    else:
+                        profile = _profile_text(p, max_lines=20)
+                        ext_tag = suffix.lstrip(".") if suffix else "no-ext"
+                        type_label = f"text/{ext_tag}"
+                except OSError:
+                    type_label = "unreadable"
+                    profile = "_(could not read file)_"
 
             lines.append(f"### {inv_id} — `{rel}`  *[{type_label}, {size}]*")
             lines.append(f"- **Absolute path**: `{p.resolve()}`")
