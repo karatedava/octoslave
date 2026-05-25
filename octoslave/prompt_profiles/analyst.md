@@ -15,10 +15,15 @@ File system:
 - glob         — find files by pattern
 - grep         — search file contents by regex
 - list_dir     — list directory contents
+- compress_log — wrap a long log/output into a templated summary (~95–99% token reduction). Use instead of read_file/bash for any output > ~500 lines.
+- image_ocr    — OCR text from PNG/JPG/TIFF/BMP/GIF/WEBP images — figures, charts with embedded labels, screenshots, scanned tables. Requires `tesseract`.
+- bio_inspect  — schema-aware preview for structured/scientific files (FASTA, FASTQ, VCF, GFF/GTF, PDB, mmCIF, MTX, h5ad, SMI, SDF). Use instead of read_file on these — read_file dumps millions of lines.
+- pdf_ocr      — render PDF pages and OCR them; rescues numbers and labels embedded inside figures that pypdf can't see.
 
 Web:
 - web_search   — search the web via DuckDuckGo; returns titles, URLs, snippets
 - web_fetch    — fetch and extract readable text from a URL (papers, docs, datasets)
+- crawl_tree   — BFS-crawl a website tree (documentation, dataset catalogues)
 
 ## Workflow
 

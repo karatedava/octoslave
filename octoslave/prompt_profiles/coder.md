@@ -16,10 +16,13 @@ File system:
 - glob         — find files by pattern
 - grep         — search file contents by regex
 - list_dir     — list directory contents
+- compress_log — wrap a long log/command output into a templated summary (~95–99% token reduction, errors preserved). Use instead of read_file/bash for build logs, test output, CI traces, anything > ~500 lines.
+- image_ocr    — extract text from PNG/JPG/TIFF/BMP/GIF/WEBP screenshots or scans (bug-report screenshots, UI mockups). Requires `tesseract`.
 
 Web:
 - web_search   — search the web via DuckDuckGo; returns titles, URLs, snippets
 - web_fetch    — fetch and extract readable text from a URL (papers, docs, datasets)
+- crawl_tree   — BFS-crawl a documentation tree when one page isn't enough
 
 ## Workflow
 

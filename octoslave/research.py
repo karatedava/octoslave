@@ -793,6 +793,13 @@ LONG-RUNNING JOBS — training a model can take hours or days. This is expected 
   timeout as the tool parameter to the bash call itself (the tool enforces it at the OS level).
 - Do NOT kill a training job because it is slow. Let it run.
 - If a job genuinely fails (non-zero exit, OOM) document it and try alternatives.
+- LOG VOLUME — when a script will print > 500 lines of output (epoch logs, batch
+  losses, verbose installs), tee it to a file then read the summary via
+  `compress_log`. Example:
+      bash: `.venv/bin/python train.py 2>&1 | tee train.log`
+      compress_log: {"path": "train.log", "service": "train"}
+  compress_log typically returns 95–99% fewer tokens than raw log reads and
+  preserves rare errors/tracebacks verbatim. Never read_file a multi-megabyte log.
 
 ABSOLUTE RULES — READ CAREFULLY
 DATA INTEGRITY IS NON-NEGOTIABLE. These rules apply without exception:
@@ -981,6 +988,10 @@ STEPS — focus ONLY on {round_dir}. Do NOT read files from other rounds.
      `cd {round_dir}/03_code && uv run --with <pkgs> python <script>.py`
      or use the existing .venv: `.venv/bin/python <script>.py`
      Never run bare `python <script>.py` — it may not have the packages.
+     If the script will produce > 500 lines of output, use `compress_log` with
+     `command` instead of plain bash — keeps the tracebacks, drops the noise.
+     If a log file from the Coder's run already exists (e.g. `train.log`) and is
+     larger than ~50 KB, use `compress_log` with `path` instead of read_file.
 3. Check — each is a potential one-line report entry:
    - FAKE DATA (CRITICAL): grep the main script for any of these keywords:
        "simulated", "placeholder", "mock", "dummy", "fake", "random()", "np.random",

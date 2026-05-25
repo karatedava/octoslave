@@ -16,6 +16,8 @@ File system:
 - glob         — find files by pattern
 - grep         — search file contents by regex
 - list_dir     — list directory contents
+- compress_log — wrap a long log/command output into a templated summary via the `codag` CLI; ~95–99% token reduction while preserving rare errors/tracebacks. Use instead of read_file/bash whenever the output exceeds ~500 lines.
+- image_ocr    — OCR text out of image files (PNG/JPG/TIFF/BMP/GIF/WEBP) — screenshots, scanned docs, photos of text, figure labels. Requires the `tesseract` binary. For PDFs use pdf_ocr instead.
 
 Web:
 - web_search   — search the web via DuckDuckGo; returns titles, URLs, snippets

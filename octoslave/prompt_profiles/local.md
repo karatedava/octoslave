@@ -15,10 +15,13 @@ File system:
 - glob         — find files by pattern
 - grep         — search file contents by regex
 - list_dir     — list directory contents
+- compress_log — wrap a long log/output into a templated summary (~95–99% token reduction). Use for any output > ~500 lines.
+- image_ocr    — OCR text from PNG/JPG/TIFF/BMP/GIF/WEBP images. Requires `tesseract`.
 
 Web:
 - web_search   — search the web via DuckDuckGo; returns titles, URLs, snippets
 - web_fetch    — fetch and extract readable text from a URL
+- crawl_tree   — BFS-crawl a website tree
 
 ## How to approach tasks
 

@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 import glob as glob_module
 from pathlib import Path
@@ -239,6 +240,58 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "compress_log",
+            "description": (
+                "Compress a long log, training output, or noisy command output into a compact "
+                "templated summary using the `codag` CLI. Drastically reduces context cost "
+                "(typically 95–99% token reduction) while preserving rare events like errors "
+                "and tracebacks verbatim. "
+                "USE THIS instead of read_file or bash whenever you would otherwise read a log "
+                "longer than ~500 lines: ML training logs, kubectl/docker logs, CI output, "
+                "stack traces from a failed run, anything tee'd to disk. "
+                "Provide exactly ONE of `command` (codag runs and wraps it) or `path` "
+                "(codag reads a local file). Default mode `compact` is plain text, free, "
+                "no auth. Mode `capsule` returns structured JSON but requires `codag auth login`."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Shell command whose output should be wrapped and compressed (e.g. 'python train.py --epochs 10'). Mutually exclusive with `path`."},
+                    "path": {"type": "string", "description": "Path to an existing log file to compress (absolute or relative to working dir). Mutually exclusive with `command`."},
+                    "service": {"type": "string", "description": "Optional tag for these lines (e.g. 'train', 'api'). Helps codag's template inference."},
+                    "mode": {"type": "string", "description": "Output mode: 'compact' (default, plain text, no auth) or 'capsule' (JSON, requires auth)."},
+                    "timeout": {"type": "integer", "description": "Max seconds for the wrapped command. Default 600 for compress_log of a file, matches the inner command's needs otherwise."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "image_ocr",
+            "description": (
+                "Extract text from an image file (PNG, JPG/JPEG, TIFF, BMP, GIF, WEBP) "
+                "using tesseract OCR. Use for screenshots, scanned documents, photos of "
+                "text, figures with embedded labels, plots with axis ticks, etc. "
+                "For PDFs use pdf_ocr instead. "
+                "Requires pytesseract + the `tesseract` binary "
+                "(macOS: `brew install tesseract`, Debian: `apt install tesseract-ocr`)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to image file"},
+                    "lang": {"type": "string", "description": "Tesseract language code (default 'eng'). Use 'eng+deu' for multilingual."},
+                    "preprocess": {"type": "boolean", "description": "Apply grayscale + threshold for noisy/low-contrast images (default false)"},
+                    "psm": {"type": "integer", "description": "Tesseract page segmentation mode (default 3 = auto). Try 6 for a single block of text, 11 for sparse text."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
 ] + BIO_TOOL_DEFINITIONS
 
 
@@ -297,6 +350,10 @@ def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str =
             return _web_fetch(**args)
         elif name == "crawl_tree":
             return _crawl_tree(**args)
+        elif name == "compress_log":
+            return _compress_log(working_dir=working_dir, **args)
+        elif name == "image_ocr":
+            return _image_ocr(working_dir=working_dir, **args)
         elif name in BIO_TOOL_NAMES:
             return execute_bio_tool(name, args, working_dir)
         else:
@@ -320,12 +377,14 @@ _REQUIRED_STR_ARGS: dict[str, tuple[str, ...]] = {
     "web_search": ("query",),
     "web_fetch": ("url",),
     "crawl_tree": ("root_url",),
+    "image_ocr": ("path",),
     # bio tools that need a string input
     "bio_inspect": ("path",),
     "rdkit_describe": ("smiles",),
     "pdb_fetch": ("pdb_id",),
     "alphafold_fetch": ("uniprot_id",),
     "ena_fetch": ("accession",),
+    "pdf_ocr": ("path",),
 }
 
 
@@ -376,6 +435,8 @@ _ARG_HINTS: dict[str, str] = {
     "web_search": "Pass `query`.",
     "web_fetch": "Pass `url` as a fully-qualified http(s) URL.",
     "crawl_tree": "Pass `root_url` as a fully-qualified http(s) URL.",
+    "image_ocr": "Pass `path` to an image file (PNG/JPG/TIFF/BMP/GIF/WEBP).",
+    "pdf_ocr": "Pass `path` to a PDF file. Use `pages` to limit page range.",
     "bio_inspect": "Pass `path` to a bio/chem data file.",
     "rdkit_describe": "Pass `smiles` (e.g. {\"smiles\": \"CC(=O)O\"}).",
     "pdb_fetch": "Pass `pdb_id` (4-char RCSB ID, e.g. \"1CRN\").",
@@ -643,6 +704,163 @@ def _bash(command: str, working_dir: str, timeout: int = 300) -> tuple[str, bool
         return output, result.returncode == 0
     except subprocess.TimeoutExpired:
         return f"Command timed out after {timeout}s", False
+
+
+def _find_codag() -> str | None:
+    """Locate the codag binary. Returns absolute path, or None if not installed."""
+    found = shutil.which("codag")
+    if found:
+        return found
+    # install.sh default location
+    fallback = Path.home() / ".local" / "bin" / "codag"
+    return str(fallback) if fallback.is_file() and os.access(fallback, os.X_OK) else None
+
+
+def _compress_log(
+    working_dir: str,
+    command: str = None,
+    path: str = None,
+    service: str = None,
+    mode: str = "compact",
+    timeout: int = 600,
+) -> tuple[str, bool]:
+    """Compress a log/command-output via the `codag` CLI."""
+    if (command and path) or (not command and not path):
+        return (
+            "compress_log requires exactly one of `command` or `path` "
+            "(got both, or neither). Pass `path` to compress a file, or `command` "
+            "to wrap and compress a shell command's output.",
+            False,
+        )
+
+    codag = _find_codag()
+    if codag is None:
+        return (
+            "codag CLI not installed. Install with: "
+            "`curl -fsSL https://codag.ai/install.sh | sh` "
+            "(installs to ~/.local/bin/codag — make sure that dir is on PATH).",
+            False,
+        )
+
+    if mode not in ("compact", "capsule", "parse"):
+        return f"Invalid mode '{mode}'. Use 'compact' (default, no auth) or 'capsule' (JSON, needs auth).", False
+
+    argv: list[str] = [codag, "wrap", "--mode", mode]
+    if service:
+        argv += ["--service", service]
+
+    if path:
+        resolved = _resolve(path, working_dir)
+        if not resolved.exists():
+            return f"compress_log: file not found: {resolved}", False
+        if not resolved.is_file():
+            return f"compress_log: not a regular file: {resolved}", False
+        # `codag wrap -- cat <path>` is the documented file shape.
+        argv += ["--", "cat", str(resolved)]
+    else:
+        # `command` may include shell metacharacters / pipes — let a shell parse it.
+        argv += ["--", "sh", "-c", command]
+
+    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            cwd=working_dir,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return f"compress_log timed out after {timeout}s", False
+    except FileNotFoundError:
+        return "codag binary disappeared between lookup and exec. Reinstall codag.", False
+
+    stdout = result.stdout or ""
+    stderr = result.stderr or ""
+    # codag's stderr carries the `[codag] N→M tok (X% reduction)` summary line.
+    # Surface it to the agent so it can see compression actually happened.
+    summary = ""
+    for line in stderr.splitlines():
+        if line.startswith("[codag]"):
+            summary = line.strip()
+            break
+
+    if result.returncode != 0:
+        err_body = stderr.strip() or stdout.strip() or "(no output)"
+        return (
+            f"codag failed (exit {result.returncode}):\n{err_body}\n"
+            f"Tip: `capsule` and `parse` modes require `codag auth login`; "
+            f"`compact` mode is free and works without auth.",
+            False,
+        )
+
+    output = stdout.strip()
+    if summary:
+        output = f"{summary}\n{output}"
+    return output or "(codag returned empty output)", True
+
+
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".gif", ".webp"}
+
+
+def _image_ocr(
+    path: str,
+    working_dir: str,
+    lang: str = "eng",
+    preprocess: bool = False,
+    psm: int = 3,
+) -> tuple[str, bool]:
+    try:
+        from PIL import Image
+    except ImportError:
+        return "Pillow is not installed. Run: pip install pillow", False
+    try:
+        import pytesseract  # type: ignore
+    except ImportError:
+        return "pytesseract is not installed. Run: pip install pytesseract", False
+
+    resolved = _resolve(path, working_dir)
+    if not resolved.exists():
+        return f"File not found: {path}", False
+    if not resolved.is_file():
+        return f"Not a file: {path}", False
+    if resolved.suffix.lower() not in _IMAGE_EXTS:
+        return (
+            f"Unsupported image format: {resolved.suffix!r}. "
+            f"Supported: {sorted(_IMAGE_EXTS)}. For PDFs use pdf_ocr.",
+            False,
+        )
+
+    try:
+        img = Image.open(str(resolved))
+        img.load()
+    except Exception as e:
+        return f"Could not open image: {e}", False
+
+    width, height = img.size
+
+    if preprocess:
+        img = img.convert("L")
+        img = img.point(lambda x: 0 if x < 140 else 255, "1")
+
+    config = f"--psm {int(psm)}"
+    try:
+        text = pytesseract.image_to_string(img, lang=lang, config=config)
+    except pytesseract.TesseractNotFoundError:
+        return (
+            "tesseract binary not found on PATH. Install: "
+            "macOS `brew install tesseract`, Debian `apt install tesseract-ocr`.",
+            False,
+        )
+    except Exception as e:
+        return f"OCR error: {e}", False
+
+    header = f"OCR: {resolved.name} ({width}x{height}, lang={lang}, psm={psm})\n\n"
+    if not text.strip():
+        hint = "" if preprocess else " Try preprocess=true for noisy/low-contrast images."
+        return header + f"(no text extracted —{hint} image may contain no readable text)", True
+    return header + text, True
 
 
 def _glob(pattern: str, working_dir: str, path: str = None) -> tuple[str, bool]:
