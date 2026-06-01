@@ -1,6 +1,7 @@
 """Core agent loop for octoslave."""
 
 import json
+import os
 import re
 from datetime import date, date as _date_cls
 from pathlib import Path
@@ -148,6 +149,12 @@ MAX_TOOL_RESULT_CHARS = 50_000
 # short conversations. 8192 is a generous interactive budget; raise if you need more.
 OLLAMA_NUM_CTX = 8192
 
+# Proactive context-budget. The agent estimates total tokens via chars/4 and
+# compacts message history BEFORE sending when this threshold is exceeded —
+# instead of waiting for the API to return a 400. Default ~96K tokens fits a
+# Kimi K2 / 128K-window safely. Override with OCTOSLAVE_SOFT_CONTEXT_TOKENS.
+_SOFT_CONTEXT_BUDGET = int(os.environ.get("OCTOSLAVE_SOFT_CONTEXT_TOKENS", "96000"))
+
 # Path to prompt profiles directory
 PROMPT_PROFILES_DIR = Path(__file__).parent / "prompt_profiles"
 
@@ -283,7 +290,117 @@ def load_system_prompt(profile: str = "base", working_dir: str = None) -> str:
     return content.format(working_dir=wd, date=date.today().isoformat())
 
 
-def _compact_and_trim(messages: list[dict], groups: int = 3) -> list[dict]:
+# Substrings that, when present in a provider error string, mean "you sent too
+# many tokens." Different providers phrase this very differently — Kimi via
+# e-INFRA, OpenAI, vLLM, NIM, and Ollama all use distinct wording. This list
+# is intentionally broad; false-positive trims are cheap, false-negative
+# break-the-loop errors are not.
+_CONTEXT_OVERFLOW_NEEDLES = (
+    "contextwindow",          # OpenAI: ContextWindowExceeded
+    "context window",         # human prose
+    "context length",         # vLLM / many OSS hosts
+    "context_length_exceeded",
+    "maximum context",        # OpenAI legacy
+    "max_tokens",             # some providers conflate
+    "max tokens",
+    "max_position_embeddings",
+    "max_seq_len",
+    "maximum_seq_length",
+    "prompt is too long",     # Anthropic-style
+    "input is too long",
+    "input too long",
+    "request too large",      # 413 prose
+    "payload too large",      # 413 prose
+    "too many tokens",
+    "token limit",
+    "exceeds the limit",
+    "exceeds the maximum",
+    "tokens in the messages",
+    "string too long",        # some proxies
+)
+
+
+def _is_context_window_error(err_str: str) -> bool:
+    """True if the error string looks like a context-window / too-many-tokens
+    rejection from any supported provider. Lowercased substring match —
+    intentionally broad."""
+    if not err_str:
+        return False
+    s = err_str.lower()
+    if any(needle in s for needle in _CONTEXT_OVERFLOW_NEEDLES):
+        return True
+    # HTTP 413 = payload too large; some hosts surface it bare.
+    if "413" in s and ("payload" in s or "request" in s or "too large" in s):
+        return True
+    return False
+
+
+def _estimated_tokens(messages: list[dict]) -> int:
+    """Fast char/4 token estimate over a message list. Good enough to decide
+    whether to compact proactively — actual tokenisation is provider-specific
+    and not worth importing tiktoken for a soft-budget decision."""
+    total = 0
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            # vision-style multimodal content blocks
+            for block in content:
+                if isinstance(block, dict):
+                    total += len(json.dumps(block, ensure_ascii=False))
+        tcs = m.get("tool_calls") or []
+        for tc in tcs:
+            try:
+                total += len(tc.get("function", {}).get("name", ""))
+                total += len(tc.get("function", {}).get("arguments", "") or "")
+            except Exception:
+                pass
+        # tiny per-message envelope overhead
+        total += 16
+    return total // 4
+
+
+def _proactive_trim(
+    messages: list[dict],
+    soft_budget: int = _SOFT_CONTEXT_BUDGET,
+    label: str = "",
+) -> list[dict]:
+    """If estimated tokens > soft_budget, compact in a loop until under budget
+    or no more groups can be compacted. Returns the trimmed list (or original
+    if no trim was needed / possible). Logs each round it actually trimmed."""
+    est = _estimated_tokens(messages)
+    if est <= soft_budget:
+        return messages
+    rounds = 0
+    while est > soft_budget:
+        trimmed = _compact_and_trim(messages, groups=6)
+        if len(trimmed) >= len(messages):
+            # Nothing left to compact — surrender to the API and let the
+            # reactive branch handle the hard failure.
+            break
+        messages = trimmed
+        rounds += 1
+        est = _estimated_tokens(messages)
+        if rounds >= 5:
+            # Safety: don't loop forever even if compaction keeps "working"
+            # with diminishing returns.
+            break
+    if rounds > 0:
+        tag = f"[{label}] " if label else ""
+        msg = (
+            f"{tag}Proactive context trim: {rounds} pass(es), "
+            f"~{est:,} tokens remaining (soft budget {soft_budget:,})."
+        )
+        display.print_info(msg)
+        try:
+            logger.log_info(msg, rounds=rounds, est_tokens=est, soft_budget=soft_budget)
+        except Exception:
+            pass
+    return messages
+
+
+def _compact_and_trim(messages: list[dict], groups: int = 6) -> list[dict]:
     """
     Replace the oldest N complete assistant-turn groups with a compact text
     summary instead of silently discarding them.  Preserves messages[:2]
@@ -317,12 +434,17 @@ def _compact_and_trim(messages: list[dict], groups: int = 3) -> list[dict]:
         return messages
 
     # Build a compact text log of the removed turns so information isn't lost.
+    # Keep enough content that the model can still recall what it learned —
+    # earlier versions of this summary lost too much (150 chars / 120 chars)
+    # and the model would re-run the same searches after a compaction.
     lines = [f"[COMPACTED HISTORY — {removed} earlier turn(s) summarised to save context]"]
     for msg in turns_to_compact:
         if msg.get("role") == "assistant":
             txt = (msg.get("content") or "").strip()
             if txt:
-                lines.append(f"  [note: {txt[:150]}]")
+                # 400 chars is enough to keep a short rationale / partial result
+                snippet = txt if len(txt) <= 400 else txt[:400] + "…"
+                lines.append(f"  [note: {snippet}]")
             for tc in msg.get("tool_calls") or []:
                 name = tc["function"]["name"]
                 try:
@@ -330,19 +452,32 @@ def _compact_and_trim(messages: list[dict], groups: int = 3) -> list[dict]:
                     label = (
                         args.get("path") or args.get("file_path") or
                         args.get("command") or args.get("query") or
-                        args.get("pattern") or json.dumps(args)[:50]
+                        args.get("pattern") or args.get("url") or
+                        json.dumps(args)[:60]
                     )
                     label = str(label)
-                    if len(label) > 70:
-                        label = label[:70] + "…"
+                    if len(label) > 90:
+                        label = label[:90] + "…"
                     lines.append(f"  called: {name}({label})")
                 except Exception:
                     lines.append(f"  called: {name}(...)")
         elif msg.get("role") == "tool":
             content = (msg.get("content") or "").strip()
-            if content:
-                first_line = content.splitlines()[0][:120]
-                lines.append(f"    → {first_line}")
+            if not content:
+                continue
+            # Keep the first ~3 lines (often the headline / summary) AND the
+            # last ~3 non-empty lines (often the error / exit code / final
+            # result) — same head-plus-tail strategy as the bash truncator,
+            # because errors and result keys tend to live at the end.
+            content_lines = [ln for ln in content.splitlines() if ln.strip()]
+            head_lines = content_lines[:3]
+            tail_lines = content_lines[-3:] if len(content_lines) > 6 else []
+            head = " | ".join(ln.strip()[:160] for ln in head_lines)
+            if head:
+                lines.append(f"    → {head[:480]}")
+            if tail_lines:
+                tail = " | ".join(ln.strip()[:160] for ln in tail_lines)
+                lines.append(f"    ⚠ {tail[:480]}")
 
     summary_msg = {"role": "user", "content": "\n".join(lines)}
     return system + [summary_msg] + remaining
@@ -617,6 +752,10 @@ def _agent_loop(
         # so a model that has finished can naturally return a text-only "done"
         # response instead of being pushed into redundant verification calls.
         _force = iteration == 1
+        # Proactive: compact BEFORE sending if we're already over the soft
+        # budget. Catches provider error-string mismatches and saves a wasted
+        # round-trip on hosts that 400 without a parseable error message.
+        messages = _proactive_trim(messages)
         try:
             response = _stream_completion(client, model, messages, force_tool=_force)
             _rate_limit_retries = 0
@@ -624,13 +763,17 @@ def _agent_loop(
         except BadRequestError as e:
             err_str = str(e)
             logger.log_error(f"BadRequestError on turn {iteration}", exc=e)
-            if "ContextWindowExceeded" in err_str or "context" in err_str.lower():
-                compacted = _compact_and_trim(messages)
+            if _is_context_window_error(err_str):
+                compacted = _compact_and_trim(messages, groups=10)
                 if len(compacted) < len(messages):
                     display.print_info(
-                        "Context window exceeded — compacting oldest turns and retrying."
+                        f"Context window exceeded — compacted oldest turns "
+                        f"(~{_estimated_tokens(compacted):,} tokens left) and retrying."
                     )
-                    logger.log_info("Context window exceeded — compacted and retrying.")
+                    logger.log_info(
+                        "Context window exceeded — compacted and retrying.",
+                        est_tokens=_estimated_tokens(compacted),
+                    )
                     messages = compacted
                     iteration -= 1  # compaction doesn't consume a turn
                     continue

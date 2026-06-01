@@ -138,6 +138,20 @@ pip install -e ".[all]"
 uv pip install -e ".[all]"
 ```
 
+### Optional: codag (powers `compress_log`)
+
+The `compress_log` tool drops noisy log streams (ML training output, kubectl logs, CI runs) into a templated summary — typically 95–99% token reduction with errors and tracebacks preserved verbatim. It shells out to the [`codag`](https://codag.ai) CLI.
+
+You don't usually need to do anything: `scripts/install.sh` installs codag at the end, and the platform installers (DMG / EXE / AppImage) auto-install codag the first time the agent calls `compress_log` — a one-time ~5-second fetch. The free `compact` mode needs no account.
+
+To install manually (or pre-warm a CI image):
+
+```bash
+curl -fsSL https://codag.ai/install.sh | sh
+```
+
+Opt out of all codag installs with `OCTOSLAVE_NO_CODAG=1` (during `scripts/install.sh`) or `OCTOSLAVE_NO_CODAG_AUTOINSTALL=1` (at runtime for the lazy path).
+
 <details>
 <summary><strong>Need help installing Python or pipx first?</strong></summary>
 
@@ -251,16 +265,24 @@ This prevents silent retry loops and forces an explicit change of approach.
 
 ### Smart context compaction (always on)
 
-When the context window fills, oldest turns are compacted into a human-readable summary rather than deleted silently:
+Two layers of automatic context management:
+
+**Proactive trim** estimates total tokens before each API call (char/4 heuristic) and compacts oldest tool-call groups whenever the conversation exceeds the soft budget (`OCTOSLAVE_SOFT_CONTEXT_TOKENS`, default `96000`). This catches provider error-string mismatches and saves a wasted round-trip on hosts that 400 without a parseable error message.
+
+**Reactive recovery** detects 20+ context-window error phrasings across providers (OpenAI, Anthropic, vLLM, Kimi via e-INFRA, HTTP 413) and compacts up to 10 groups per pass — usually one retry recovers from a deeply-overflowed conversation.
+
+The compacted summary keeps head + tail of each tool result so errors and tracebacks survive:
 
 ```
 [COMPACTED HISTORY — 3 earlier turn(s) summarised to save context]
-  called: bash(pip install numpy)
-    → Successfully installed numpy-1.26.4
-  called: write_file(train.py)
-    → # Training script for ResNet50
-  ...
+  called: bash(python train.py 2>&1 | tee train.log)
+    → INFO worker 0 batch loss=0.5 | INFO worker 1 batch loss=0.5 | INFO worker 2 batch loss=0.5
+    ⚠ ERROR: CUDA out of memory at batch 142 | RuntimeError: out of memory | Traceback (most recent call last):
+  called: read_file(train.log)
+    ...
 ```
+
+The model can also call **`compress_log`** explicitly to drop a noisy log into a templated summary via [codag](https://codag.ai) (≈95–99% token reduction with rare errors preserved). Use for ML training logs, kubectl/docker logs, CI output. See [debug/compress_log_demo/](debug/compress_log_demo/) for a worked example.
 
 Manual compaction: `/compact` (summarises via the model).
 

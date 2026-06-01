@@ -716,6 +716,142 @@ def _find_codag() -> str | None:
     return str(fallback) if fallback.is_file() and os.access(fallback, os.X_OK) else None
 
 
+# Module-level flag so we only attempt auto-install once per process. Without
+# this a failing install (no network, locked-down system) would re-attempt on
+# every compress_log call.
+_codag_autoinstall_attempted = False
+
+
+def _attempt_codag_install() -> bool:
+    """One-shot best-effort install of the codag CLI for users who got
+    octoslave via the platform installer (DMG/EXE/AppImage) — they never ran
+    scripts/install.sh and so don't have codag yet. Returns True if codag is
+    found on PATH afterward.
+
+    Opt out via OCTOSLAVE_NO_CODAG_AUTOINSTALL=1. Requires curl + sh (Unix);
+    on Windows or stripped-down environments, this is a no-op and the caller
+    gets the standard "not installed" error.
+    """
+    global _codag_autoinstall_attempted
+    if _codag_autoinstall_attempted:
+        return _find_codag() is not None
+    _codag_autoinstall_attempted = True
+
+    if os.environ.get("OCTOSLAVE_NO_CODAG_AUTOINSTALL") == "1":
+        return False
+    if not shutil.which("curl") or not shutil.which("sh"):
+        return False
+
+    try:
+        from . import display
+        display.print_info(
+            "compress_log: codag CLI not installed — fetching it now (one-time, ~5s)…"
+        )
+    except Exception:
+        pass
+
+    try:
+        result = subprocess.run(
+            "curl -fsSL https://codag.ai/install.sh | sh",
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        try:
+            from . import display
+            display.print_info(
+                "compress_log: codag install timed out — falling back to raw output. "
+                "Re-run with OCTOSLAVE_NO_CODAG_AUTOINSTALL=1 to silence this on future calls."
+            )
+        except Exception:
+            pass
+        return False
+    except Exception:
+        return False
+
+    ok = result.returncode == 0 and _find_codag() is not None
+    try:
+        from . import display
+        if ok:
+            display.print_info("compress_log: codag installed.")
+        else:
+            tail = (result.stderr or result.stdout or "").strip().splitlines()
+            tail_line = tail[-1] if tail else "(no output)"
+            display.print_info(
+                f"compress_log: codag install failed ({tail_line}). "
+                "Install manually with `curl -fsSL https://codag.ai/install.sh | sh`."
+            )
+    except Exception:
+        pass
+    return ok
+
+
+# Codag's free `compact` mode has a server-side cap of 5,000 input lines per
+# request. To handle real ML/CI logs we chunk above that. Headroom of 500.
+_CODAG_MAX_LINES_PER_CHUNK = 4500
+# Hard ceiling on chunk count to avoid burning many API calls on truly huge
+# files. 10 chunks * 4500 lines = ~45K input lines covered with full fidelity.
+_CODAG_MAX_CHUNKS = 10
+
+
+def _run_codag(codag: str, argv_prefix: list[str], stdin_text: str, cwd: str, timeout: int) -> tuple[str, str, int]:
+    """Pipe stdin_text to `codag wrap ...` and return (stdout, stderr, returncode)."""
+    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+    try:
+        result = subprocess.run(
+            argv_prefix,
+            input=stdin_text,
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            timeout=timeout,
+            env=env,
+        )
+        return result.stdout or "", result.stderr or "", result.returncode
+    except subprocess.TimeoutExpired:
+        return "", f"codag timed out after {timeout}s", 124
+    except FileNotFoundError:
+        return "", "codag binary disappeared between lookup and exec. Reinstall codag.", 127
+
+
+def _collect_lines(
+    working_dir: str,
+    command: str | None,
+    path: str | None,
+    timeout: int,
+) -> tuple[list[str] | None, str | None]:
+    """Resolve input into a list of lines. Returns (lines, error_message)."""
+    if path:
+        resolved = _resolve(path, working_dir)
+        if not resolved.exists():
+            return None, f"compress_log: file not found: {resolved}"
+        if not resolved.is_file():
+            return None, f"compress_log: not a regular file: {resolved}"
+        try:
+            text = resolved.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            return None, f"compress_log: could not read {resolved}: {e}"
+        return text.splitlines(), None
+
+    # command mode — run it ourselves so we control the input shape sent to codag
+    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+    try:
+        result = subprocess.run(
+            ["sh", "-c", command],
+            capture_output=True,
+            text=True,
+            cwd=working_dir,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"compress_log: command timed out after {timeout}s"
+    raw = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+    return raw.splitlines(), None
+
+
 def _compress_log(
     working_dir: str,
     command: str = None,
@@ -723,8 +859,15 @@ def _compress_log(
     service: str = None,
     mode: str = "compact",
     timeout: int = 600,
-) -> tuple[str, bool]:
-    """Compress a log/command-output via the `codag` CLI."""
+) -> tuple[str, str]:
+    """Compress a log/command-output via the `codag` CLI.
+
+    Free `compact` mode is capped at 5,000 input lines per request server-side;
+    larger inputs are split into ≤4,500-line chunks and compressed sequentially,
+    with each chunk's summary stitched together. Up to 10 chunks (~45K lines)
+    are processed; beyond that, the input is head+tail truncated to fit and a
+    notice is appended to the result.
+    """
     if (command and path) or (not command and not path):
         return (
             "compress_log requires exactly one of `command` or `path` "
@@ -735,70 +878,88 @@ def _compress_log(
 
     codag = _find_codag()
     if codag is None:
+        # First-call auto-install for platform-installer users who never ran
+        # scripts/install.sh. Best-effort; opt out via OCTOSLAVE_NO_CODAG_AUTOINSTALL=1.
+        if _attempt_codag_install():
+            codag = _find_codag()
+    if codag is None:
         return (
-            "codag CLI not installed. Install with: "
+            "codag CLI not installed and auto-install failed. Install manually with: "
             "`curl -fsSL https://codag.ai/install.sh | sh` "
-            "(installs to ~/.local/bin/codag — make sure that dir is on PATH).",
+            "(installs to ~/.local/bin/codag — make sure that dir is on PATH). "
+            "Then retry compress_log.",
             False,
         )
 
     if mode not in ("compact", "capsule", "parse"):
         return f"Invalid mode '{mode}'. Use 'compact' (default, no auth) or 'capsule' (JSON, needs auth).", False
 
-    argv: list[str] = [codag, "wrap", "--mode", mode]
+    lines, err = _collect_lines(working_dir, command, path, timeout)
+    if err is not None:
+        return err, False
+    if not lines:
+        return "(input was empty — nothing to compress)", True
+
+    argv_prefix = [codag, "wrap", "--mode", mode]
     if service:
-        argv += ["--service", service]
+        argv_prefix += ["--service", service]
+    # codag reads from stdin when no `-- cmd` is provided.
 
-    if path:
-        resolved = _resolve(path, working_dir)
-        if not resolved.exists():
-            return f"compress_log: file not found: {resolved}", False
-        if not resolved.is_file():
-            return f"compress_log: not a regular file: {resolved}", False
-        # `codag wrap -- cat <path>` is the documented file shape.
-        argv += ["--", "cat", str(resolved)]
-    else:
-        # `command` may include shell metacharacters / pipes — let a shell parse it.
-        argv += ["--", "sh", "-c", command]
+    # Single-shot path
+    if len(lines) <= _CODAG_MAX_LINES_PER_CHUNK:
+        stdout, stderr, rc = _run_codag(codag, argv_prefix, "\n".join(lines), working_dir, timeout)
+        if rc != 0:
+            return (
+                f"codag failed (exit {rc}):\n{(stderr or stdout).strip()}\n"
+                f"Tip: `capsule`/`parse` modes need `codag auth login`; "
+                f"`compact` is free.",
+                False,
+            )
+        summary_line = next((ln.strip() for ln in stderr.splitlines() if ln.startswith("[codag]")), "")
+        out = stdout.strip()
+        return (f"{summary_line}\n{out}" if summary_line else out) or "(empty output)", True
 
-    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
-    try:
-        result = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            cwd=working_dir,
-            timeout=timeout,
-            env=env,
+    # Chunked path: decide whether all lines fit within MAX_CHUNKS,
+    # otherwise head+tail truncate so the most valuable lines survive.
+    note = ""
+    max_lines_total = _CODAG_MAX_LINES_PER_CHUNK * _CODAG_MAX_CHUNKS
+    if len(lines) > max_lines_total:
+        head_count = max_lines_total // 2
+        tail_count = max_lines_total - head_count
+        truncated_count = len(lines) - max_lines_total
+        lines = (
+            lines[:head_count]
+            + [f"... [{truncated_count:,} middle lines omitted by compress_log — exceeds chunk budget] ..."]
+            + lines[-tail_count:]
         )
-    except subprocess.TimeoutExpired:
-        return f"compress_log timed out after {timeout}s", False
-    except FileNotFoundError:
-        return "codag binary disappeared between lookup and exec. Reinstall codag.", False
-
-    stdout = result.stdout or ""
-    stderr = result.stderr or ""
-    # codag's stderr carries the `[codag] N→M tok (X% reduction)` summary line.
-    # Surface it to the agent so it can see compression actually happened.
-    summary = ""
-    for line in stderr.splitlines():
-        if line.startswith("[codag]"):
-            summary = line.strip()
-            break
-
-    if result.returncode != 0:
-        err_body = stderr.strip() or stdout.strip() or "(no output)"
-        return (
-            f"codag failed (exit {result.returncode}):\n{err_body}\n"
-            f"Tip: `capsule` and `parse` modes require `codag auth login`; "
-            f"`compact` mode is free and works without auth.",
-            False,
+        note = (
+            f"\n[compress_log: input was {len(lines) + truncated_count - 1:,} lines; "
+            f"head {head_count:,} + tail {tail_count:,} were compressed, middle dropped]"
         )
 
-    output = stdout.strip()
-    if summary:
-        output = f"{summary}\n{output}"
-    return output or "(codag returned empty output)", True
+    # Split into chunks
+    chunks: list[list[str]] = [
+        lines[i : i + _CODAG_MAX_LINES_PER_CHUNK]
+        for i in range(0, len(lines), _CODAG_MAX_LINES_PER_CHUNK)
+    ]
+    total = len(chunks)
+    pieces: list[str] = []
+    for idx, chunk in enumerate(chunks, 1):
+        stdout, stderr, rc = _run_codag(codag, argv_prefix, "\n".join(chunk), working_dir, timeout)
+        if rc != 0:
+            return (
+                f"codag failed on chunk {idx}/{total} (exit {rc}):\n{(stderr or stdout).strip()}",
+                False,
+            )
+        summary_line = next((ln.strip() for ln in stderr.splitlines() if ln.startswith("[codag]")), "")
+        body = stdout.strip()
+        header = f"=== chunk {idx}/{total} ({len(chunk):,} lines)"
+        if summary_line:
+            header += f" — {summary_line[len('[codag]'):].strip()}"
+        header += " ==="
+        pieces.append(f"{header}\n{body}")
+
+    return ("\n\n".join(pieces) + note).strip() or "(empty output)", True
 
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".gif", ".webp"}

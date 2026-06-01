@@ -20,7 +20,13 @@ from pathlib import Path
 from openai import OpenAI, BadRequestError, APIStatusError, APITimeoutError, APIConnectionError
 
 from . import display
-from .agent import _cap_result, _compact_and_trim as _trim_messages
+from .agent import (
+    _cap_result,
+    _compact_and_trim as _trim_messages,
+    _is_context_window_error,
+    _proactive_trim,
+    _estimated_tokens,
+)
 from .tools import TOOL_DEFINITIONS, execute_tool
 
 # ---------------------------------------------------------------------------
@@ -1585,18 +1591,21 @@ def _run_specialist(
                     iteration -= 1
                     continue
 
+        # Proactive context trim BEFORE sending — broader provider coverage
+        # than waiting for a 400.
+        messages = _proactive_trim(messages, label=cfg["label"])
         try:
             response = _stream_completion_with_tools(client, model, messages, tools)
             _rate_limit_retries = 0
             _timeout_retries = 0
         except BadRequestError as e:
             err = str(e)
-            if "ContextWindow" in err or "context" in err.lower():
-                trimmed = _trim_messages(messages)
+            if _is_context_window_error(err):
+                trimmed = _trim_messages(messages, groups=10)
                 if len(trimmed) < len(messages):
                     display.print_info(
-                        f"[{cfg['label']}] Context window exceeded — "
-                        "trimming oldest tool results and retrying."
+                        f"[{cfg['label']}] Context window exceeded — compacted "
+                        f"(~{_estimated_tokens(trimmed):,} tokens left) and retrying."
                     )
                     messages = trimmed
                     iteration -= 1  # context trim doesn't consume a turn
@@ -1928,15 +1937,20 @@ def _run_merger(
 
     while iteration < cfg["max_iter"]:
         iteration += 1
+        messages = _proactive_trim(messages, label="Merger")
         try:
             response = _stream_completion_with_tools(client, _model, messages, tools)
             _rate_limit_retries = 0
             _timeout_retries = 0
         except BadRequestError as e:
             err = str(e)
-            if "ContextWindow" in err or "context" in err.lower():
-                trimmed = _trim_messages(messages)
+            if _is_context_window_error(err):
+                trimmed = _trim_messages(messages, groups=10)
                 if len(trimmed) < len(messages):
+                    display.print_info(
+                        f"[Merger] Context window exceeded — compacted "
+                        f"(~{_estimated_tokens(trimmed):,} tokens left) and retrying."
+                    )
                     messages = trimmed
                     iteration -= 1
                     continue
@@ -3120,15 +3134,20 @@ def _run_master_reporter(
 
     while iteration < cfg["max_iter"]:
         iteration += 1
+        messages = _proactive_trim(messages, label="Master Reporter")
         try:
             response = _stream_completion_with_tools(client, model, messages, tools)
             _rate_limit_retries = 0
             _timeout_retries = 0
         except BadRequestError as e:
             err = str(e)
-            if "ContextWindow" in err or "context" in err.lower():
-                trimmed = _trim_messages(messages)
+            if _is_context_window_error(err):
+                trimmed = _trim_messages(messages, groups=10)
                 if len(trimmed) < len(messages):
+                    display.print_info(
+                        f"[Master Reporter] Context window exceeded — compacted "
+                        f"(~{_estimated_tokens(trimmed):,} tokens left) and retrying."
+                    )
                     messages = trimmed
                     iteration -= 1
                     continue

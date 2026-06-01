@@ -23,6 +23,8 @@
 #   OCTOSLAVE_EXTRAS     pip extras spec (default: [all]; use "" to skip extras)
 #   OCTOSLAVE_NO_PIPX    set to 1 to skip pipx and go straight to venv install
 #   OCTOSLAVE_VENV_DIR   where the fallback venv lives (default: ~/.local/share/octoslave-venv)
+#   OCTOSLAVE_NO_CODAG   set to 1 to skip installing the codag CLI
+#                        (used by the `compress_log` tool — optional)
 #
 
 set -euo pipefail
@@ -33,6 +35,7 @@ OCTOSLAVE_REF="${OCTOSLAVE_REF:-}"
 OCTOSLAVE_EXTRAS="${OCTOSLAVE_EXTRAS-[all]}"
 OCTOSLAVE_NO_PIPX="${OCTOSLAVE_NO_PIPX:-0}"
 OCTOSLAVE_VENV_DIR="${OCTOSLAVE_VENV_DIR:-$HOME/.local/share/octoslave-venv}"
+OCTOSLAVE_NO_CODAG="${OCTOSLAVE_NO_CODAG:-0}"
 
 # ── Pretty output helpers ─────────────────────────────────────────────────
 bold()   { printf "\033[1m%s\033[0m\n" "$*"; }
@@ -202,7 +205,42 @@ echo
 green "✓ octoslave installed"
 echo
 
-# ── 6. Next steps ──────────────────────────────────────────────────────────
+# ── 6. Install codag CLI (optional — powers the `compress_log` tool) ──────
+#
+# codag compresses noisy log streams into compact summaries so the agent
+# can read them without blowing the context window. Free `compact` mode
+# needs no account. Skip with OCTOSLAVE_NO_CODAG=1.
+#
+install_codag() {
+    if [ "$OCTOSLAVE_NO_CODAG" = "1" ]; then
+        info "skipping codag install (OCTOSLAVE_NO_CODAG=1)"
+        return 0
+    fi
+    if command -v codag >/dev/null 2>&1; then
+        green "✓ codag already installed at $(command -v codag)"
+        return 0
+    fi
+    if [ -x "$HOME/.local/bin/codag" ]; then
+        green "✓ codag already installed at $HOME/.local/bin/codag"
+        return 0
+    fi
+    info "installing codag CLI (used by the compress_log tool)"
+    if ! command -v curl >/dev/null 2>&1; then
+        yellow "  curl not found — skipping codag install"
+        return 0
+    fi
+    if curl -fsSL https://codag.ai/install.sh | sh >/dev/null 2>&1; then
+        green "✓ codag installed (free 'compact' mode needs no account)"
+    else
+        yellow "  codag install failed — compress_log will be unavailable."
+        yellow "  Re-run later with: curl -fsSL https://codag.ai/install.sh | sh"
+    fi
+}
+install_codag
+
+echo
+
+# ── 7. Next steps ──────────────────────────────────────────────────────────
 bold "Next steps:"
 echo
 echo "  1.  Configure a backend (e-INFRA CZ / NVIDIA NIM / Ollama):"
