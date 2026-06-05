@@ -41,6 +41,7 @@ It ships several modes:
 - [Interactive TUI](#interactive-tui)
 - [Slash commands](#slash-commands)
 - [Parallel agents](#parallel-agents)
+- [MCP — wire in custom tools](#mcp--wire-in-custom-tools)
 - [CLI commands](#cli-commands)
 - [Long-research pipeline](#long-research-pipeline)
 - [Vault improve](#vault-improve)
@@ -175,7 +176,7 @@ pipx ensurepath
 ots config                                     # interactive wizard (einfra / nim / ollama)
 ots config --api-key sk-YOUR_KEY               # e-INFRA CZ key directly
 ots config --nim-api-key nvapi-YOUR_KEY        # NVIDIA NIM key
-ots config --model deepseek-v3.2               # default model
+ots config --model kimi-k2.6                   # default model
 ots config --show                              # print current config (keys masked)
 ```
 
@@ -339,11 +340,11 @@ All research outputs (HTML reports, plots, markdown) are accessible in the Files
   │             ╰██╯ ╰██╯ ╰██╯ ╰██╯                │
   │                                                │
   │               OCTOSLAVE                        │
-  │  model deepseek-v3.2   dir ~/project           │
+  │  model kimi-k2.6   dir ~/project                │
   │  /help for commands                            │
   ╰────────────────────────────────────────────────╯
 
-◆ [deepseek-v3.2] _
+◆ [kimi-k2.6] _
 ```
 
 - Type any task in natural language — the agent streams its thinking and tool calls live
@@ -385,6 +386,8 @@ All research outputs (HTML reports, plots, markdown) are accessible in the Files
 | `/einfra` | Switch back to e-INFRA CZ backend |
 | `/nim [model]` | Switch to NVIDIA NIM backend |
 | `/pull MODEL` | Pull a new Ollama model without leaving the session |
+| `/provider …` | Manage custom OpenAI-compatible providers |
+| `/mcp …` | Wire in external tools via MCP servers (see below) |
 | `/long-research TOPIC [flags]` | Launch the multi-agent research pipeline (see below) |
 | `/research-roles` | Inspect or override per-role models for `/long-research` |
 | `/vault-improve [path]` | Launch autonomous vault-wide note improvement |
@@ -423,6 +426,143 @@ between agents comes from rotating prompt profiles
 
 In the web UI, `/parallel 3 task description` runs the same flow and shows
 each candidate as a side-by-side card with the winner highlighted.
+
+---
+
+## MCP — wire in custom tools
+
+OctoSlave speaks the [Model Context Protocol](https://modelcontextprotocol.io),
+so you can plug in external tools — git, GitHub, a real browser, databases, live
+docs, your own scripts — and the agent uses them right alongside the built-in
+tools. MCP tools are available everywhere: single-agent runs, the research
+pipeline, and the web UI.
+
+The MCP client is **built in** — no extra Python dependency. It supports both
+MCP transports:
+
+- **stdio** — OctoSlave launches the server as a local subprocess and exchanges
+  JSON-RPC over its stdin/stdout. The common case for local tool servers
+  (run via `npx` or `uvx`).
+- **http** — OctoSlave POSTs JSON-RPC to a remote URL (the "Streamable HTTP"
+  transport) with optional auth headers; handles both JSON and SSE responses.
+
+### How MCP tools appear to the agent
+
+Once a server is connected, each of its tools is exposed to the model as
+`mcp__<server>__<tool>` (e.g. `mcp__git__git_log`). The namespacing means MCP
+tools never collide with the built-in tool names, and you can always tell which
+server a call went to. In the research pipeline, MCP tools are offered to the
+doer/reader roles (researcher, coder, debugger, evaluator, reporter) and kept
+off the review-only roles to keep them lean.
+
+### Quickest path: install from the catalog
+
+OctoSlave ships a curated catalog of well-known servers so you get competitive
+capabilities out of the box — you only supply the bits that are yours (a
+directory, a DB path, a token):
+
+```bash
+/mcp registry            # browse the catalog, grouped by category
+/mcp install filesystem  # prompts for a directory, then connects
+/mcp install github      # 🔑 prompts for a token, wired as an auth header
+/mcp install git sqlite  # (install several, one at a time)
+```
+
+You can also pre-fill inputs inline so it never prompts:
+
+```bash
+/mcp install filesystem path=/Users/me/project
+/mcp install brave-search BRAVE_API_KEY=...
+```
+
+**Catalog (20 servers):**
+
+| category | ids |
+|---|---|
+| Files & code | `filesystem`, `git`, `github` 🔑, `context7` |
+| Web & browser | `fetch`, `playwright`, `brave-search` 🔑, `tavily` 🔑, `puppeteer` |
+| Data & databases | `sqlite`, `postgres` |
+| Reasoning & memory | `memory`, `sequential-thinking`, `time` |
+| Productivity & cloud | `slack` 🔑, `notion` 🔑, `google-drive` 🔑, `sentry`, `aws-docs`, `e2b` 🔑 |
+
+🔑 = needs an API key/token (you'll be prompted; it's stored locally and, for
+remote servers, sent only as an auth header). stdio servers run via `npx` (Node)
+or `uvx` (uv); the catalog shows whether a required runtime is on your `PATH` and
+how to install it if not.
+
+### Managing servers from the TUI
+
+```bash
+/mcp                       # list configured servers + live status (tool counts)
+/mcp registry              # browse the catalog
+/mcp install <id> [k=v…]   # install a catalog server
+/mcp add                   # interactive wizard for a custom server (stdio/http)
+/mcp add NAME CMD [args…]   # quick-add a custom stdio server
+/mcp disable NAME           # turn a server off without deleting it
+/mcp enable  NAME           # turn it back on
+/mcp remove  NAME           # delete a server
+/mcp reconnect              # re-read config and reconnect everything
+```
+
+Quick-add example (any server not in the catalog):
+
+```bash
+/mcp add my-tool npx -y @scope/some-mcp-server --flag value
+```
+
+### Managing servers from the Web UI
+
+Open the **Settings** tab → **MCP Tools** card. There you can:
+
+- see every configured server with a live status dot (connected / disabled /
+  error) and its discovered tool count;
+- browse the **Catalog** and click **install** on any server (you'll be prompted
+  for any required path/token);
+- enable / disable / remove servers, or **Reconnect all**;
+- add a custom server (stdio or http) via the **+ Add a custom server** form.
+
+Installs and reconnects run server-side and the panel refreshes with live
+status. The same `~/.octoslave/config.json` is used, so servers added in the TUI
+show up in the web UI and vice-versa.
+
+### Config format
+
+Servers are persisted in `~/.octoslave/config.json` under `mcp_servers` and
+connected automatically at startup:
+
+```json
+{
+  "mcp_servers": [
+    {
+      "name": "filesystem",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/project"],
+      "env": { "SOME_VAR": "value" },
+      "enabled": true
+    },
+    {
+      "name": "internal-api",
+      "url": "https://tools.example.com/mcp",
+      "headers": { "Authorization": "Bearer YOUR_TOKEN" },
+      "enabled": true
+    }
+  ]
+}
+```
+
+A server entry needs either a `command` (stdio) or a `url` (http). Anything you
+add via `/mcp add` or the catalog ends up here.
+
+### Safety & failure handling
+
+- In `controlled` [permission mode](#permission-modes), MCP tool calls require
+  confirmation just like file edits and shell commands.
+- A server that fails to start (missing runtime, bad command, network error) is
+  reported and **skipped** — it never blocks the rest of the toolbox. Fix it and
+  run `/mcp reconnect`.
+- On first use a stdio server may need to download its package (e.g. `npx`
+  fetching from npm); if a freshly-installed server shows "not connected", give
+  it a moment and `/mcp reconnect`.
 
 ---
 
@@ -639,10 +779,10 @@ The default backend. Run `ots models` for the live list. Recommended defaults:
 
 | Goal | Model |
 |------|-------|
-| Best all-round (reasoning + coding) | `deepseek-v3.2` ← **start here** |
+| Best all-round (reasoning + coding, long-context) | `kimi-k2.6` ← **start here / default** |
 | Chain-of-thought / hard problems | `deepseek-v3.2-thinking` |
 | Code generation focus | `qwen3-coder-30b` |
-| Long-context tasks | `kimi-k2.6` |
+| General reasoning | `deepseek-v3.2` |
 | Writing-heavy tasks | `gpt-oss-120b` |
 
 Common available models on e-INFRA CZ: `deepseek-v3.2`, `deepseek-v3.2-thinking`, `qwen3.5`, `qwen3.5-122b`, `qwen3-coder`, `qwen3-coder-30b`, `qwen3-coder-next`, `gpt-oss-120b`, `kimi-k2.5`, `kimi-k2.6`, `mistral-medium-3.5`, `llama-4-scout-17b-16e-instruct`, `gemma4`, `glm-4.7`, `glm-5`, `glm-5.1`.
@@ -759,10 +899,21 @@ Run `ots models --local` at any time to see what you have pulled.
 | `read_file` | Read file contents (offset/limit for large files); PDFs auto-extracted to text |
 | `write_file` | Create or fully overwrite a file |
 | `edit_file` | Targeted string replacement (use `replace_all=true` for renames) |
+| `apply_patch` | Apply several string-replacement edits to one file in a single atomic call |
 | `bash` | Run any shell command: builds, tests, git, data processing, package installs |
 | `glob` | Find files by pattern (e.g. `**/*.py`) |
 | `grep` | Regex search across files with context lines |
 | `list_dir` | Directory listing with sizes and modification times |
+
+**Process &amp; workflow**
+
+| Tool | Description |
+|------|-------------|
+| `run_background` | Start a long-running/blocking command (dev server, training job) in the background, returns a process id |
+| `check_process` | Read a background process's status, exit code, and recent output (or list all) |
+| `stop_process` | Stop a background process (SIGTERM → SIGKILL) |
+| `todo_write` | Maintain a live task checklist for multi-step work — renders in the TUI and web UI |
+| `ask_user` | Ask the human a clarifying question and wait for the answer (web round-trip / CLI prompt; no-ops in non-interactive runs) |
 
 **Web**
 

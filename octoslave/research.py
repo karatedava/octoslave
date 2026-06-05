@@ -71,7 +71,8 @@ ROLES: dict[str, dict] = {
         "color": "bold green",
         "default_model": "qwen3-coder-30b",         # large code model — fewer mistakes
         "max_iter": 80,                             # was 50 — 120b coder thrashes longer
-        "tools": ["read_file", "write_file", "edit_file", "bash",
+        "tools": ["read_file", "write_file", "edit_file", "apply_patch", "bash",
+                  "todo_write", "run_background", "check_process", "stop_process",
                   "glob", "grep", "list_dir",
                   "bio_inspect", "rdkit_describe", "pdb_fetch",
                   "alphafold_fetch", "uniprot_lookup", "pubchem_lookup",
@@ -83,7 +84,8 @@ ROLES: dict[str, dict] = {
         "color": "bold red",
         "default_model": "qwen3-coder-30b",         # same coder — knows the code
         "max_iter": 30,                             # was 20 — match coder cap proportions
-        "tools": ["read_file", "write_file", "edit_file", "bash",
+        "tools": ["read_file", "write_file", "edit_file", "apply_patch", "bash",
+                  "todo_write", "run_background", "check_process", "stop_process",
                   "glob", "grep", "list_dir",
                   "bio_inspect", "rdkit_describe"],
     },
@@ -1390,11 +1392,25 @@ def _build_system_prompt(
 # Filtered tool list per role
 # ---------------------------------------------------------------------------
 
+# Roles that get access to user-wired MCP tools. The doer/reader roles benefit
+# most; review-only roles (skeptic, merger, orchestrator) stay lean.
+_MCP_ENABLED_ROLES: frozenset[str] = frozenset(
+    {"researcher", "coder", "debugger", "evaluator", "reporter"}
+)
+
+
 def _tools_for_role(role: str, scrape_mode: bool = False) -> list[dict]:
     allowed = set(ROLES[role]["tools"])
     if scrape_mode and role == "researcher":
         allowed.add("crawl_tree")
-    return [t for t in TOOL_DEFINITIONS if t["function"]["name"] in allowed]
+    defs = [t for t in TOOL_DEFINITIONS if t["function"]["name"] in allowed]
+    if role in _MCP_ENABLED_ROLES:
+        try:
+            from .mcp_client import manager
+            defs = defs + manager.tool_definitions()
+        except Exception:
+            pass
+    return defs
 
 
 # ---------------------------------------------------------------------------
@@ -3827,6 +3843,13 @@ def run_long_research(
                          researcher the crawl_tree tool and a scraping-focused prompt.
         min_rounds:      Never converge/complete before this round count.
     """
+    # Connect user-configured MCP servers so research roles can use them.
+    try:
+        from .tools import init_mcp
+        init_mcp()
+    except Exception:
+        pass
+
     # Auto-detect scrape intent from topic
     topic_lower = topic.lower()
     if not scrape_mode:

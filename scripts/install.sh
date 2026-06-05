@@ -238,6 +238,40 @@ install_codag() {
 }
 install_codag
 
+# Register codag's MCP server (tail_kubernetes / tail_docker / tail_aws_logs /
+# tail_vercel / tail_gh_actions / wrap / compact / health) in ~/.octoslave/
+# config.json so the agent can reach those tools without manual /mcp setup.
+# Idempotent. Skip with OCTOSLAVE_NO_CODAG_MCP_REGISTER=1.
+register_codag_mcp() {
+    if [ "$OCTOSLAVE_NO_CODAG_MCP_REGISTER" = "1" ]; then
+        info "skipping codag MCP registration (OCTOSLAVE_NO_CODAG_MCP_REGISTER=1)"
+        return 0
+    fi
+    if ! command -v codag >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/codag" ]; then
+        return 0  # codag missing — nothing to register
+    fi
+    # Find a Python that can import octoslave. pipx puts the venv under
+    # ~/.local/share/pipx/venvs/octoslave/bin/python; the venv fallback uses
+    # $OCTOSLAVE_VENV_DIR/bin/python.
+    local OTS_PY=""
+    for cand in \
+        "$HOME/.local/share/pipx/venvs/octoslave/bin/python" \
+        "$OCTOSLAVE_VENV_DIR/bin/python"; do
+        if [ -x "$cand" ] && "$cand" -c "import octoslave.config" >/dev/null 2>&1; then
+            OTS_PY="$cand"
+            break
+        fi
+    done
+    if [ -z "$OTS_PY" ]; then
+        info "  (could not locate octoslave's Python — skipping MCP auto-register; will happen on first compress_log call)"
+        return 0
+    fi
+    if "$OTS_PY" -c "from octoslave.config import ensure_codag_mcp_registered; print('registered' if ensure_codag_mcp_registered() else 'already-registered')" 2>/dev/null | grep -q registered; then
+        green "✓ codag MCP server registered (tail_kubernetes, tail_docker, tail_aws_logs, …)"
+    fi
+}
+register_codag_mcp
+
 echo
 
 # ── 7. Next steps ──────────────────────────────────────────────────────────

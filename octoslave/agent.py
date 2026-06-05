@@ -9,10 +9,8 @@ from openai import OpenAI, BadRequestError
 
 from . import display
 from . import logger
-from .tools import TOOL_DEFINITIONS, execute_tool
+from .tools import TOOL_DEFINITIONS, execute_tool, all_tool_definitions, valid_tool_names
 from .config import load_config, OLLAMA_BASE_URL
-
-_VALID_TOOL_NAMES = {td["function"]["name"] for td in TOOL_DEFINITIONS}
 
 
 def _extract_text_tool_calls(content: str) -> tuple[list[dict], str]:
@@ -33,6 +31,7 @@ def _extract_text_tool_calls(content: str) -> tuple[list[dict], str]:
     calls: list[dict] = []
     call_idx = 0
     first_call_start: int | None = None  # position in original content
+    _valid_names = valid_tool_names()  # built-in + MCP (recomputed each call)
 
     # Build a mapping from positions in stripped → original content.
     # Simple approach: track fence spans and map stripped indices back.
@@ -107,12 +106,12 @@ def _extract_text_tool_calls(content: str) -> tuple[list[dict], str]:
             if isinstance(obj, dict):
                 name = obj.get("name") or obj.get("function", {}).get("name", "")
                 args = obj.get("arguments") or obj.get("parameters") or {}
-                if name in _VALID_TOOL_NAMES and isinstance(args, dict):
+                if name in _valid_names and isinstance(args, dict):
                     calls.append(_make_call(name, args))
                     matched = True
             elif isinstance(obj, list) and len(obj) >= 2:
                 name, args = obj[0], obj[1]
-                if isinstance(name, str) and name in _VALID_TOOL_NAMES and isinstance(args, dict):
+                if isinstance(name, str) and name in _valid_names and isinstance(args, dict):
                     calls.append(_make_call(name, args))
                     matched = True
         except (json.JSONDecodeError, AttributeError, TypeError):
@@ -595,7 +594,7 @@ def _stream_completion(client: OpenAI, model: str, messages: list, force_tool: b
     with client.chat.completions.create(
         model=model,
         messages=messages,
-        tools=TOOL_DEFINITIONS,
+        tools=all_tool_definitions(),
         tool_choice="required" if force_tool else "auto",
         stream=True,
         **extra,
@@ -663,6 +662,10 @@ def run_agent(
         cfg = load_config()
         permission_mode = cfg.get("permission_mode", "autonomous")
 
+    # Connect any user-configured MCP servers (idempotent across calls).
+    from .tools import init_mcp
+    init_mcp()
+
     system_prompt = load_system_prompt(prompt_profile, working_dir)
 
     # Inject session memory into system prompt when available
@@ -722,7 +725,10 @@ def continue_agent(
     if permission_mode is None:
         cfg = load_config()
         permission_mode = cfg.get("permission_mode", "autonomous")
-    
+
+    from .tools import init_mcp
+    init_mcp()
+
     messages.append({"role": "user", "content": follow_up})
     return _agent_loop(messages, model, working_dir, client, permission_mode)
 

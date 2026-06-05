@@ -10,7 +10,7 @@ CONFIG_DIR = Path.home() / ".octoslave"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 BASE_URL = "https://llm.ai.e-infra.cz/v1"
-DEFAULT_MODEL = "deepseek-v3.2"
+DEFAULT_MODEL = "kimi-k2.6"
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
 NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NIM_DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b"
@@ -427,6 +427,7 @@ def load_config() -> dict:
         "role_models_nim": {},
         "role_models_ollama": {},
         "custom_providers": [],     # list of {id, name, base_url, api_key, default_model, models?}
+        "mcp_servers": [],          # list of {name, enabled, command/args/env | url/headers}
     }
     # Env vars override config file
     if os.environ.get("OCTOSLAVE_API_KEY"):
@@ -468,6 +469,12 @@ def load_config() -> dict:
             if isinstance(providers, list):
                 config["custom_providers"] = [
                     p for p in providers if isinstance(p, dict) and p.get("id")
+                ]
+            # MCP servers list — only loaded from file
+            mcp = saved.get("mcp_servers")
+            if isinstance(mcp, list):
+                config["mcp_servers"] = [
+                    s for s in mcp if isinstance(s, dict) and s.get("name")
                 ]
             # role_models_* are dicts — no env-var override, just load from file.
             # We also pick up role_models_<custom-id> dynamically.
@@ -655,6 +662,118 @@ def remove_custom_provider(provider_id: str) -> bool:
     cfg.pop(f"role_models_{provider_id}", None)
     _write_config_file(cfg)
     return True
+
+
+# ---------------------------------------------------------------------------
+# MCP server CRUD
+# ---------------------------------------------------------------------------
+
+def get_mcp_servers(cfg: dict | None = None) -> list[dict]:
+    """Return the list of configured MCP servers."""
+    if cfg is None:
+        cfg = load_config()
+    servers = cfg.get("mcp_servers") or []
+    return [s for s in servers if isinstance(s, dict) and s.get("name")]
+
+
+def _normalize_mcp_server(s: dict) -> dict:
+    """Clean a raw MCP server entry. A `url` means http transport; otherwise
+    `command` means stdio transport."""
+    name = (s.get("name") or "").strip()
+    out: dict = {"name": name, "enabled": bool(s.get("enabled", True))}
+    if s.get("url"):
+        out["url"] = (s.get("url") or "").strip()
+        headers = s.get("headers") or {}
+        if isinstance(headers, dict) and headers:
+            out["headers"] = {str(k): str(v) for k, v in headers.items()}
+    else:
+        out["command"] = (s.get("command") or "").strip()
+        args = s.get("args") or []
+        if isinstance(args, str):
+            import shlex
+            args = shlex.split(args)
+        out["args"] = list(args)
+        env = s.get("env") or {}
+        if isinstance(env, dict) and env:
+            out["env"] = {str(k): str(v) for k, v in env.items()}
+        if s.get("cwd"):
+            out["cwd"] = str(s["cwd"])
+    return out
+
+
+def add_mcp_server(server: dict) -> dict:
+    """Add a new MCP server. Raises ValueError on validation errors."""
+    s = _normalize_mcp_server(server)
+    if not s["name"]:
+        raise ValueError("MCP server name is required.")
+    if not s.get("url") and not s.get("command"):
+        raise ValueError("MCP server requires either a 'command' (stdio) or a 'url' (http).")
+    cfg = load_config()
+    existing = cfg.get("mcp_servers") or []
+    if any(e.get("name") == s["name"] for e in existing):
+        raise ValueError(f"MCP server '{s['name']}' already exists.")
+    existing.append(s)
+    cfg["mcp_servers"] = existing
+    _write_config_file(cfg)
+    return s
+
+
+def ensure_codag_mcp_registered() -> bool:
+    """Register the codag MCP server in config.json if codag is installed and
+    not already registered. Idempotent and safe to call repeatedly. Returns
+    True iff a new registration was written this call.
+
+    Opt out by exporting OCTOSLAVE_NO_CODAG_MCP_REGISTER=1 before octoslave
+    starts (or before the lazy auto-install fires).
+    """
+    if os.environ.get("OCTOSLAVE_NO_CODAG_MCP_REGISTER") == "1":
+        return False
+    import shutil as _shutil
+    if not (_shutil.which("codag") or (Path.home() / ".local" / "bin" / "codag").is_file()):
+        return False
+    try:
+        from .mcp_registry import get_entry, build_config
+    except Exception:
+        return False
+    entry = get_entry("codag")
+    if entry is None:
+        return False
+    for existing in get_mcp_servers():
+        if (existing.get("name") or "").lower() == entry["id"]:
+            return False
+    try:
+        server_cfg = build_config(entry, values={})
+        add_mcp_server(server_cfg)
+        return True
+    except Exception:
+        return False
+
+
+def remove_mcp_server(name: str) -> bool:
+    """Remove an MCP server by name. Returns True if removed."""
+    cfg = load_config()
+    existing = cfg.get("mcp_servers") or []
+    new_list = [e for e in existing if e.get("name") != name]
+    if len(new_list) == len(existing):
+        return False
+    cfg["mcp_servers"] = new_list
+    _write_config_file(cfg)
+    return True
+
+
+def set_mcp_server_enabled(name: str, enabled: bool) -> bool:
+    """Toggle an MCP server's enabled flag. Returns True if the server exists."""
+    cfg = load_config()
+    existing = cfg.get("mcp_servers") or []
+    found = False
+    for e in existing:
+        if e.get("name") == name:
+            e["enabled"] = bool(enabled)
+            found = True
+    if found:
+        cfg["mcp_servers"] = existing
+        _write_config_file(cfg)
+    return found
 
 
 # ---------------------------------------------------------------------------

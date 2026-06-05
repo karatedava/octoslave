@@ -1,7 +1,12 @@
+import atexit
 import json
 import os
 import shutil
+import signal
 import subprocess
+import tempfile
+import threading
+import time as _time
 import glob as glob_module
 from pathlib import Path
 
@@ -37,10 +42,11 @@ except ImportError:
     _HAS_PLAYWRIGHT = False
 
 # Tools that require permission in controlled mode
-MODIFYING_TOOLS = {"write_file", "edit_file", "bash"}
+MODIFYING_TOOLS = {"write_file", "edit_file", "apply_patch", "bash",
+                   "run_background", "stop_process"}
 
 # Tools that require permission only in controlled mode (not supervised)
-FILE_MODIFYING_TOOLS = {"write_file", "edit_file"}
+FILE_MODIFYING_TOOLS = {"write_file", "edit_file", "apply_patch"}
 
 # ---------------------------------------------------------------------------
 # Tool schemas (sent to the model)
@@ -292,7 +298,194 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_patch",
+            "description": (
+                "Apply MULTIPLE find-and-replace edits to a SINGLE file in one call. "
+                "Each edit replaces an exact old_string with a new_string; edits apply "
+                "in order and the file is written only if ALL edits succeed (atomic). "
+                "Much cheaper than several edit_file calls when changing several regions "
+                "of the same file. Each old_string must be unique in the file when its "
+                "edit runs, unless that edit sets replace_all=true. Preserve indentation "
+                "and surrounding context exactly."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File to patch"},
+                    "edits": {
+                        "type": "array",
+                        "description": "Edits applied in order",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_string": {"type": "string", "description": "Exact text to replace"},
+                                "new_string": {"type": "string", "description": "Replacement text"},
+                                "replace_all": {"type": "boolean", "description": "Replace every occurrence for this edit (default false)"},
+                            },
+                            "required": ["old_string", "new_string"],
+                        },
+                    },
+                },
+                "required": ["path", "edits"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "todo_write",
+            "description": (
+                "Create or update a task checklist for the current work. Pass the FULL "
+                "list every time — it REPLACES the previous list. Use it on any multi-step "
+                "task: keep exactly one item 'in_progress', mark items 'completed' as you "
+                "finish them, and add new items as they emerge. This keeps you and the user "
+                "oriented on long tasks and shows live progress in the UI. Skip it for "
+                "trivial single-step requests."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "description": "The complete, ordered task list",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string", "description": "Imperative description of the step"},
+                                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                            },
+                            "required": ["content", "status"],
+                        },
+                    },
+                },
+                "required": ["todos"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_background",
+            "description": (
+                "Start a long-running or blocking command in the BACKGROUND and return "
+                "immediately with a process id. Use this — not bash — for dev servers, "
+                "training jobs, file watchers, or anything that does not exit on its own "
+                "(the bash tool blocks until the command finishes). Output is captured to a "
+                "file; read it with check_process and stop the job with stop_process."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Shell command to run in the background"},
+                    "cwd": {"type": "string", "description": "Working directory (defaults to the session working dir)"},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_process",
+            "description": (
+                "Check a background process started with run_background: returns its "
+                "running/exited status, exit code, and recent output. Call with no id to "
+                "list all background processes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Process id from run_background (omit to list all)"},
+                    "tail_lines": {"type": "integer", "description": "Trailing output lines to return (default 50)"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stop_process",
+            "description": "Stop a background process started with run_background (SIGTERM, then SIGKILL).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Process id from run_background"},
+                },
+                "required": ["id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_user",
+            "description": (
+                "Ask the human a clarifying question and wait for their answer. Use ONLY "
+                "when genuinely blocked on a decision that is the user's to make and cannot "
+                "be resolved from the task, the code, or sensible defaults — not for routine "
+                "choices you can make yourself. In autonomous or non-interactive runs the "
+                "user may be unavailable; if no answer comes back, proceed with your best "
+                "judgement."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The question to ask"},
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional suggested answers the user can pick from",
+                    },
+                },
+                "required": ["question"],
+            },
+        },
+    },
 ] + BIO_TOOL_DEFINITIONS
+
+
+# ---------------------------------------------------------------------------
+# MCP (Model Context Protocol) — user-wired external tools
+# ---------------------------------------------------------------------------
+
+def init_mcp(cfg: dict | None = None, force: bool = False) -> None:
+    """Connect to configured MCP servers (idempotent). Safe to call from every
+    entry point — single-agent REPL, research pipeline, web UI."""
+    try:
+        from .mcp_client import manager
+        manager.init_from_config(cfg, force=force)
+    except Exception:
+        # MCP is strictly additive — never let it break the core toolbox.
+        pass
+
+
+def _mcp_manager():
+    try:
+        from .mcp_client import manager
+        return manager
+    except Exception:
+        return None
+
+
+def all_tool_definitions() -> list[dict]:
+    """Built-in tools plus any tools exposed by connected MCP servers."""
+    mgr = _mcp_manager()
+    if mgr is None:
+        return list(TOOL_DEFINITIONS)
+    return list(TOOL_DEFINITIONS) + mgr.tool_definitions()
+
+
+def valid_tool_names() -> set[str]:
+    """Names of all callable tools (built-in + MCP). Used by the text-format
+    tool-call fallback parser."""
+    names = {td["function"]["name"] for td in TOOL_DEFINITIONS}
+    mgr = _mcp_manager()
+    if mgr is not None:
+        names |= mgr.tool_names()
+    return names
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +497,10 @@ def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str =
     # Check permission for modifying tools
     # - controlled: ask for all modifying tools (file ops + bash)
     # - supervised: ask only for file operations (allow bash without asking)
-    if permission_mode == "controlled" and name in MODIFYING_TOOLS:
+    _is_mcp = name.startswith("mcp__")
+    # MCP tools call out to external servers (which may write files, hit APIs,
+    # mutate state) — gate them like modifying tools in controlled mode.
+    if permission_mode == "controlled" and (name in MODIFYING_TOOLS or _is_mcp):
         try:
             from . import display
             if not display.request_permission(name, args, working_dir, permission_mode):
@@ -336,8 +532,20 @@ def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str =
             return _write_file(working_dir=working_dir, **args)
         elif name == "edit_file":
             return _edit_file(working_dir=working_dir, **args)
+        elif name == "apply_patch":
+            return _apply_patch(working_dir=working_dir, **args)
+        elif name == "todo_write":
+            return _todo_write(working_dir=working_dir, **args)
         elif name == "bash":
             return _bash(working_dir=working_dir, **args)
+        elif name == "run_background":
+            return _run_background(working_dir=working_dir, **args)
+        elif name == "check_process":
+            return _check_process(working_dir=working_dir, **args)
+        elif name == "stop_process":
+            return _stop_process(working_dir=working_dir, **args)
+        elif name == "ask_user":
+            return _ask_user(working_dir=working_dir, **args)
         elif name == "glob":
             return _glob(working_dir=working_dir, **args)
         elif name == "grep":
@@ -356,6 +564,11 @@ def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str =
             return _image_ocr(working_dir=working_dir, **args)
         elif name in BIO_TOOL_NAMES:
             return execute_bio_tool(name, args, working_dir)
+        elif _is_mcp:
+            mgr = _mcp_manager()
+            if mgr is None:
+                return f"MCP is unavailable; cannot run {name}", False
+            return mgr.call(name, args)
         else:
             return f"Unknown tool: {name}", False
     except TypeError as e:
@@ -371,7 +584,11 @@ _REQUIRED_STR_ARGS: dict[str, tuple[str, ...]] = {
     "read_file": ("path",),
     "write_file": ("path", "content"),
     "edit_file": ("path", "old_string", "new_string"),
+    "apply_patch": ("path",),
     "bash": ("command",),
+    "run_background": ("command",),
+    "stop_process": ("id",),
+    "ask_user": ("question",),
     "glob": ("pattern",),
     "grep": ("pattern",),
     "web_search": ("query",),
@@ -429,7 +646,11 @@ _ARG_HINTS: dict[str, str] = {
                  "(e.g. {\"path\": \"round_001/01_literature.md\"}).",
     "write_file": "Pass `path` and `content` (e.g. {\"path\": \"round_001/06_synthesis.md\", \"content\": \"...\"}).",
     "edit_file": "Pass `path`, `old_string`, `new_string`. Use replace_all=true for renames.",
+    "apply_patch": "Pass `path` and `edits` (a list of {old_string, new_string} objects).",
     "bash": "Pass `command` as a shell string (e.g. {\"command\": \"ls\"}).",
+    "run_background": "Pass `command` as a shell string (e.g. {\"command\": \"python app.py\"}).",
+    "stop_process": "Pass `id` as the process id returned by run_background (e.g. \"bg1\").",
+    "ask_user": "Pass `question` as a clear, specific question string.",
     "glob": "Pass `pattern` (e.g. {\"pattern\": \"**/*.py\"}).",
     "grep": "Pass `pattern` as a regex (e.g. {\"pattern\": \"def \\\\w+\"}).",
     "web_search": "Pass `query`.",
@@ -672,6 +893,268 @@ def _edit_file(
     return f"Edited {path}", True
 
 
+def _apply_patch(path: str, edits: list, working_dir: str) -> tuple[str, bool]:
+    """Apply several old→new string replacements to one file, atomically.
+
+    The file is written only after every edit has matched, so a failure
+    mid-list leaves the file untouched.
+    """
+    resolved = _resolve(path, working_dir)
+    if not resolved.exists():
+        return f"File not found: {path}", False
+    if not resolved.is_file():
+        return f"Not a file: {path}", False
+    if not isinstance(edits, list) or not edits:
+        return "apply_patch requires a non-empty `edits` list of {old_string, new_string}.", False
+    if _is_binary(resolved):
+        return f"Cannot edit binary file: {resolved.name}", False
+
+    content = resolved.read_text(errors="replace")
+    applied = 0
+    notes: list[str] = []
+    for i, e in enumerate(edits, 1):
+        if not isinstance(e, dict):
+            return f"Edit #{i} is not an object — expected {{old_string, new_string}}.", False
+        old = e.get("old_string", "")
+        new = e.get("new_string", "")
+        replace_all = bool(e.get("replace_all", False))
+        if old == "":
+            return f"Edit #{i}: old_string must not be empty. (no changes written)", False
+        if old == new:
+            return f"Edit #{i}: old_string and new_string are identical. (no changes written)", False
+        count = content.count(old)
+        if count == 0:
+            return (
+                f"Edit #{i}: string not found:\n{old[:200]}\n"
+                f"(applied {applied}/{len(edits)} so far — file left UNCHANGED)",
+                False,
+            )
+        if count > 1 and not replace_all:
+            return (
+                f"Edit #{i}: old_string appears {count} times — make it unique or set "
+                f"replace_all=true for this edit. (file left UNCHANGED)",
+                False,
+            )
+        content = content.replace(old, new)
+        applied += 1
+        if replace_all and count > 1:
+            notes.append(f"#{i}×{count}")
+
+    resolved.write_text(content)
+    suffix = f" ({', '.join(notes)} replace_all)" if notes else ""
+    return f"Applied {applied} edit(s) to {path}{suffix}", True
+
+
+# ---------------------------------------------------------------------------
+# Task checklist (todo_write)
+# ---------------------------------------------------------------------------
+
+_TODO_STORE: dict[str, list[dict]] = {}
+_VALID_TODO_STATUS = {"pending", "in_progress", "completed"}
+
+
+def get_todos(working_dir: str) -> list[dict]:
+    """Return the current task list for a working dir (used by the web UI)."""
+    return list(_TODO_STORE.get(working_dir, []))
+
+
+def _todo_write(todos: list, working_dir: str) -> tuple[str, bool]:
+    if not isinstance(todos, list):
+        return "todo_write requires `todos` to be a list of {content, status} objects.", False
+    norm: list[dict] = []
+    for t in todos:
+        if not isinstance(t, dict):
+            continue
+        content = str(t.get("content", "")).strip()
+        if not content:
+            continue
+        status = t.get("status", "pending")
+        if status not in _VALID_TODO_STATUS:
+            status = "pending"
+        norm.append({"content": content, "status": status})
+
+    if not norm:
+        return "todo_write received no valid tasks (each needs `content` and `status`).", False
+
+    _TODO_STORE[working_dir] = norm
+    try:
+        from . import display
+        display.print_todos(norm)
+    except Exception:
+        pass
+
+    done = sum(1 for t in norm if t["status"] == "completed")
+    in_prog = [t["content"] for t in norm if t["status"] == "in_progress"]
+    summary = f"Task list updated — {done}/{len(norm)} completed."
+    if in_prog:
+        summary += f" Now working on: {in_prog[0]}"
+    return summary, True
+
+
+# ---------------------------------------------------------------------------
+# Background processes (run_background / check_process / stop_process)
+# ---------------------------------------------------------------------------
+
+_BG_PROCS: dict[str, dict] = {}
+_bg_counter = 0
+_bg_lock = threading.Lock()
+
+
+def _run_background(command: str, working_dir: str, cwd: str = None) -> tuple[str, bool]:
+    global _bg_counter
+    run_dir = cwd or working_dir
+    try:
+        log_fd, log_path = tempfile.mkstemp(prefix="ots_bg_", suffix=".log")
+        log_file = os.fdopen(log_fd, "w")
+    except OSError as e:
+        return f"Could not allocate a log file: {e}", False
+
+    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+    try:
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=run_dir,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            start_new_session=True,  # own process group → killable as a unit
+        )
+    except Exception as e:
+        try:
+            log_file.close()
+        except Exception:
+            pass
+        return f"Failed to start background process: {e}", False
+
+    with _bg_lock:
+        _bg_counter += 1
+        proc_id = f"bg{_bg_counter}"
+        _BG_PROCS[proc_id] = {
+            "proc": proc,
+            "command": command,
+            "log": log_path,
+            "file": log_file,
+            "started": _time.time(),
+            "cwd": run_dir,
+        }
+    return (
+        f"Started background process {proc_id} (pid {proc.pid}): {command}\n"
+        f"Use check_process(id=\"{proc_id}\") to read output, "
+        f"stop_process(id=\"{proc_id}\") to stop it.",
+        True,
+    )
+
+
+def _read_bg_log(info: dict, tail_lines: int) -> str:
+    try:
+        info["file"].flush()
+    except Exception:
+        pass
+    try:
+        with open(info["log"], errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return "(could not read output)"
+    if tail_lines and len(lines) > tail_lines:
+        return f"[last {tail_lines} of {len(lines)} lines]\n" + "\n".join(lines[-tail_lines:])
+    return "\n".join(lines) if lines else "(no output yet)"
+
+
+def _check_process(working_dir: str, id: str = None, tail_lines: int = 50) -> tuple[str, bool]:
+    if not id:
+        with _bg_lock:
+            items = list(_BG_PROCS.items())
+        if not items:
+            return "No background processes have been started.", True
+        lines = ["Background processes:"]
+        for pid_id, info in items:
+            rc = info["proc"].poll()
+            status = "running" if rc is None else f"exited ({rc})"
+            lines.append(f"  {pid_id}: {status} — {info['command'][:70]}")
+        return "\n".join(lines), True
+
+    info = _BG_PROCS.get(id)
+    if not info:
+        return f"No background process with id '{id}'. Use check_process() to list them.", False
+    rc = info["proc"].poll()
+    status = "running" if rc is None else f"exited with code {rc}"
+    elapsed = int(_time.time() - info["started"])
+    header = f"Process {id} — {status} (running {elapsed}s): {info['command'][:80]}\n"
+    return header + _read_bg_log(info, tail_lines), True
+
+
+def _stop_process(id: str, working_dir: str) -> tuple[str, bool]:
+    info = _BG_PROCS.get(id)
+    if not info:
+        return f"No background process with id '{id}'.", False
+    proc = info["proc"]
+    if proc.poll() is not None:
+        return f"Process {id} already exited (code {proc.poll()}).", True
+    _terminate_proc(proc)
+    try:
+        info["file"].close()
+    except Exception:
+        pass
+    return f"Stopped background process {id}.", True
+
+
+def _terminate_proc(proc: subprocess.Popen) -> None:
+    """SIGTERM the process group, escalate to SIGKILL if it doesn't exit."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            return
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+def _shutdown_bg_procs() -> None:
+    """Kill any still-running background processes on interpreter exit."""
+    for info in list(_BG_PROCS.values()):
+        try:
+            if info["proc"].poll() is None:
+                _terminate_proc(info["proc"])
+        except Exception:
+            pass
+
+
+atexit.register(_shutdown_bg_procs)
+
+
+# ---------------------------------------------------------------------------
+# ask_user
+# ---------------------------------------------------------------------------
+
+def _ask_user(question: str, working_dir: str, options: list = None) -> tuple[str, bool]:
+    opts = [str(o) for o in options] if isinstance(options, list) else None
+    try:
+        from . import display
+        answer, answered = display.ask_user_question(question, opts)
+    except Exception:
+        answered, answer = False, ""
+    if not answered:
+        return (
+            "No answer was received — the user is unavailable or this is a "
+            "non-interactive/autonomous run. Proceed with your best judgement "
+            "based on the task and sensible defaults; do not ask again.",
+            True,
+        )
+    return f"The user answered: {answer}", True
+
+
 def _bash(command: str, working_dir: str, timeout: int = 300) -> tuple[str, bool]:
     # Unset VIRTUAL_ENV so uv doesn't emit a mismatch warning when the conda/system
     # venv doesn't match the project's .venv.
@@ -890,6 +1373,23 @@ def _compress_log(
             "Then retry compress_log.",
             False,
         )
+
+    # Also register codag's richer MCP server (tail_kubernetes, tail_docker,
+    # tail_aws_logs, tail_vercel, tail_gh_actions, wrap, compact, health) on
+    # first successful use, so future runs of any role can use them directly.
+    # Idempotent; opt out via OCTOSLAVE_NO_CODAG_MCP_REGISTER=1.
+    try:
+        from .config import ensure_codag_mcp_registered
+        if ensure_codag_mcp_registered():
+            from . import display
+            display.print_info(
+                "compress_log: registered the codag MCP server "
+                "(exposes tail_kubernetes / tail_docker / tail_aws_logs / "
+                "tail_vercel / tail_gh_actions / wrap / compact). "
+                "Restart octoslave to load it."
+            )
+    except Exception:
+        pass
 
     if mode not in ("compact", "capsule", "parse"):
         return f"Invalid mode '{mode}'. Use 'compact' (default, no auth) or 'capsule' (JSON, needs auth).", False

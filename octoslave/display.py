@@ -291,6 +291,12 @@ _TOOL_ICONS = {
     "list_dir":   "📁",
     "web_search": "🌐",
     "web_fetch":  "🌍",
+    "apply_patch": "🩹",
+    "todo_write":  "✅",
+    "run_background": "🚀",
+    "check_process":  "📡",
+    "stop_process":   "🛑",
+    "ask_user":    "❓",
 }
 
 
@@ -450,6 +456,21 @@ def _tool_summary(name: str, args: dict) -> str:
     if name == "web_fetch":
         url = args.get("url", "")
         return (url[:80] + "…") if len(url) > 80 else url
+    if name == "apply_patch":
+        edits = args.get("edits") or []
+        n = len(edits) if isinstance(edits, list) else 0
+        return f"{args.get('path', '')}  ({n} edit{'s' if n != 1 else ''})"
+    if name == "todo_write":
+        todos = args.get("todos") or []
+        n = len(todos) if isinstance(todos, list) else 0
+        return f"{n} task{'s' if n != 1 else ''}"
+    if name in ("run_background", "check_process", "stop_process"):
+        return args.get("command", "") or args.get("id", "") or "(all)"
+    if name == "ask_user":
+        q = args.get("question", "")
+        return (q[:90] + "…") if len(q) > 90 else q
+    if name.startswith("mcp__"):
+        return name
     return json.dumps(args)[:80]
 
 
@@ -487,6 +508,106 @@ def print_done(iterations: int):
         f"{iterations} iteration{'s' if iterations != 1 else ''}[/dim #7a7d86]"
     )
     console.print()
+
+
+# ---------------------------------------------------------------------------
+# Todo list (task tracking)
+# ---------------------------------------------------------------------------
+
+_TODO_GLYPHS = {
+    "completed":   ("[#7fd88f]✓[/#7fd88f]", "#7a7d86", "s"),
+    "in_progress": ("[#f5a742]▸[/#f5a742]", "#f5a742", ""),
+    "pending":     ("[#7a7d86]○[/#7a7d86]", "#d0d1d6", ""),
+}
+
+
+def print_todos(todos: list[dict]):
+    """Render a task checklist and emit a structured event for the web UI."""
+    _emit({"type": "todos", "todos": todos})
+    if _silent():
+        return
+    from rich.markup import escape as _escape
+    if not todos:
+        return
+    console.print()
+    done = sum(1 for t in todos if t.get("status") == "completed")
+    console.print(
+        f"  [bold]Tasks[/bold] [dim]· {done}/{len(todos)} done[/dim]"
+    )
+    for t in todos:
+        status = t.get("status", "pending")
+        glyph, text_color, _ = _TODO_GLYPHS.get(status, _TODO_GLYPHS["pending"])
+        content = t.get("content", "")
+        if status == "completed":
+            console.print(f"    {glyph} [dim {text_color}]{_escape(content)}[/dim {text_color}]")
+        else:
+            console.print(f"    {glyph} [{text_color}]{_escape(content)}[/{text_color}]")
+    console.print()
+
+
+# ---------------------------------------------------------------------------
+# ask_user — interactive question round-trip (CLI input / web event / fallback)
+# ---------------------------------------------------------------------------
+
+_ask_lock = _threading.Lock()
+_ask_event: "_threading.Event | None" = None
+_ask_answer: str = ""
+
+
+def resolve_user_response(answer: str) -> None:
+    """Called from the web handler to unblock a pending ask_user request."""
+    global _ask_answer, _ask_event
+    with _ask_lock:
+        _ask_answer = answer or ""
+        if _ask_event is not None:
+            _ask_event.set()
+
+
+def ask_user_question(question: str, options: list[str] | None = None) -> tuple[str, bool]:
+    """Ask the user a question and return (answer, answered).
+
+    Web mode  → emit a ``user_question`` event and block for the browser reply.
+    CLI mode  → prompt on the console.
+    Otherwise → not answerable (autonomous/non-interactive); caller should
+    proceed with its own judgement.
+    """
+    options = [o for o in (options or []) if o]
+
+    # Web mode: emit and wait for resolve_user_response.
+    if getattr(_tl, "emit", None) is not None:
+        global _ask_event, _ask_answer
+        with _ask_lock:
+            _ask_event = _threading.Event()
+            _ask_answer = ""
+        _emit({"type": "user_question", "question": question, "options": options})
+        got = _ask_event.wait(timeout=600)  # 10-min window
+        with _ask_lock:
+            answer = _ask_answer
+            _ask_event = None
+        if not got:
+            return "", False
+        return answer, True
+
+    # CLI mode: only if we have a real interactive stdin.
+    if sys.stdin and sys.stdin.isatty() and not _silent():
+        console.print()
+        console.print(f"  [bold #f5a742]▌[/bold #f5a742] [bold]The agent is asking:[/bold]")
+        console.print(f"  [bold #f5a742]▌[/bold #f5a742] {question}")
+        if options:
+            for i, opt in enumerate(options, 1):
+                console.print(f"  [bold #f5a742]▌[/bold #f5a742]   [cyan]{i}.[/cyan] {opt}")
+        try:
+            resp = console.input("  [bold #f5a742]▌[/bold #f5a742] your answer: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            return "", False
+        # Allow choosing an option by number.
+        if options and resp.isdigit() and 1 <= int(resp) <= len(options):
+            resp = options[int(resp) - 1]
+        return resp, bool(resp)
+
+    # Non-interactive (autonomous pipeline, no tty).
+    return "", False
 
 
 def print_local_research_assignment(assignment: dict[str, str]):
@@ -586,7 +707,17 @@ def print_help():
         "  [cyan]/local [MODEL][/cyan]          Switch to local Ollama models\n"
         "  [cyan]/einfra[/cyan]                 Switch to e-INFRA CZ\n"
         "  [cyan]/nim [MODEL][/cyan]            Switch to NVIDIA NIM\n"
-        "  [cyan]/pull MODEL[/cyan]             Pull a new Ollama model\n\n"
+        "  [cyan]/pull MODEL[/cyan]             Pull a new Ollama model\n"
+        "  [cyan]/provider …[/cyan]            Manage custom OpenAI-compatible providers\n\n"
+        "[bold white]MCP — wire in custom tools:[/bold white]\n"
+        "  [cyan]/mcp[/cyan]                    List configured MCP servers + live status\n"
+        "  [cyan]/mcp registry[/cyan]           Browse the catalog of recommended servers\n"
+        "  [cyan]/mcp install ID[/cyan]         Install a server from the catalog\n"
+        "  [cyan]/mcp add[/cyan]                Add a custom server (stdio or http) — interactive\n"
+        "  [cyan]/mcp add NAME CMD…[/cyan]      Quick-add a custom stdio server\n"
+        "  [cyan]/mcp remove NAME[/cyan]        Delete a server\n"
+        "  [cyan]/mcp enable|disable NAME[/cyan]  Toggle a server\n"
+        "  [cyan]/mcp reconnect[/cyan]          Reconnect all servers\n\n"
         "[bold white]Permission modes:[/bold white]\n"
         "  [cyan]autonomous[/cyan]  — work without asking (default)\n"
         "  [cyan]controlled[/cyan]  — ask before file edits or commands\n"

@@ -13,6 +13,7 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.completion import Completer, Completion
 
 from . import display
+from . import __version__
 from .agent import make_client, run_agent, continue_agent, load_session_memory, save_session_memory, MEMORY_FILE
 from .research import run_long_research, ROLES as RESEARCH_ROLES
 from .vault import run_vault_improve
@@ -29,6 +30,7 @@ from .config import (
     resolve_backend, list_providers,
     get_custom_providers, get_custom_provider,
     add_custom_provider, update_custom_provider, remove_custom_provider,
+    get_mcp_servers, add_mcp_server, remove_mcp_server, set_mcp_server_enabled,
 )
 
 # ---------------------------------------------------------------------------
@@ -54,15 +56,8 @@ _HISTORY_FILE = Path.home() / ".octoslave" / "history"
 # ---------------------------------------------------------------------------
 # Main CLI group
 # ---------------------------------------------------------------------------
-
-try:
-    from importlib.metadata import version as _pkg_version, PackageNotFoundError
-    try:
-        __version__ = _pkg_version("octoslave")
-    except PackageNotFoundError:
-        __version__ = "0.0.0+local"
-except Exception:
-    __version__ = "0.0.0+local"
+# __version__ is single-sourced from octoslave/__init__.py (derived from the
+# package metadata that pyproject.toml generates). Bump it in pyproject.toml.
 
 
 @click.group(
@@ -782,6 +777,14 @@ def _repl_loop(client, cfg: dict, messages: list[dict]):
     if state["verbose"]:
         display.set_verbose(True)
 
+    # Connect any user-configured MCP servers up front so their tools are ready
+    # for the first task and /mcp shows live status.
+    try:
+        from .tools import init_mcp
+        init_mcp()  # reads ~/.octoslave/config.json mcp_servers
+    except Exception:
+        pass
+
     session = PromptSession(
         history=FileHistory(str(_HISTORY_FILE)),
         style=_PT_STYLE,
@@ -928,6 +931,9 @@ def _handle_slash(cmd: str, state: dict, cfg: dict, messages: list, client) -> s
 
     if name == "/provider":
         return _handle_provider_command(arg, state, messages)
+
+    if name == "/mcp":
+        return _handle_mcp_command(arg, state, messages)
 
     if name == "/pull":
         if not arg:
@@ -1483,6 +1489,290 @@ def _handle_provider_command(arg: str, state: dict, messages: list) -> str:
         "Unknown subcommand. Try: /provider list · /provider use <id> · "
         "/provider add · /provider remove <id>"
     )
+    return "ok"
+
+
+def _handle_mcp_command(arg: str, state: dict, messages: list) -> str:
+    """Manage MCP (Model Context Protocol) servers — wire in custom tools.
+
+    /mcp                          — list configured MCP servers + live status
+    /mcp list                     — same
+    /mcp registry                 — browse the catalog of known/recommended servers
+    /mcp install <id> [k=v …]     — install a server from the catalog
+    /mcp add                      — interactive add wizard (stdio or http)
+    /mcp add <name> <command...>  — quick add a stdio server
+    /mcp remove <name>            — delete a server
+    /mcp enable|disable <name>    — toggle a server without deleting it
+    /mcp reconnect                — re-read config and reconnect all servers
+    """
+    from .mcp_client import manager
+
+    tokens = arg.split() if arg else []
+    sub = tokens[0].lower() if tokens else "list"
+
+    if sub in ("registry", "catalog", "store", "browse"):
+        return _mcp_registry_list()
+
+    if sub in ("install", "add-known"):
+        if len(tokens) < 2:
+            display.print_error("Usage: /mcp install <id> [key=value …]   (see /mcp registry)")
+            return "ok"
+        return _mcp_install(tokens[1], tokens[2:], state)
+
+    if sub in ("list", "ls", ""):
+        configured = get_mcp_servers()
+        status = {s["name"]: s for s in manager.status()}
+        display.console.print("[bold]MCP servers[/bold]")
+        if not configured:
+            display.console.print(
+                "  [dim](none configured)[/dim]\n"
+                "[dim]Browse the catalog:  /mcp registry   ·   "
+                "Install:  /mcp install <id>   ·   Custom:  /mcp add[/dim]"
+            )
+            return "ok"
+        for s in configured:
+            nm = s["name"]
+            enabled = s.get("enabled", True)
+            transport = "http" if s.get("url") else "stdio"
+            live = status.get(nm)
+            if not enabled:
+                state_str = "[dim]disabled[/dim]"
+            elif live and live["connected"]:
+                state_str = f"[green]connected[/green] [dim]({live['tool_count']} tools)[/dim]"
+            elif live and live["error"]:
+                state_str = f"[red]error[/red] [dim]{live['error']}[/dim]"
+            else:
+                state_str = "[yellow]not connected[/yellow]"
+            target = s.get("url") or " ".join([s.get("command", ""), *s.get("args", [])]).strip()
+            display.console.print(
+                f"  [bold]{nm}[/bold]  [dim]{transport}[/dim]  {state_str}\n"
+                f"      [dim]{target}[/dim]"
+            )
+        display.console.print(
+            "\n[dim]Catalog: /mcp registry   ·   Install: /mcp install <id>   ·   "
+            "Remove: /mcp remove <name>   ·   Toggle: /mcp enable|disable <name>   ·   "
+            "Reconnect: /mcp reconnect[/dim]"
+        )
+        return "ok"
+
+    if sub == "add":
+        # Quick form:  /mcp add <name> <command> [args...]
+        if len(tokens) >= 3:
+            name = tokens[1]
+            command = tokens[2]
+            args = tokens[3:]
+            entry = {"name": name, "command": command, "args": args, "enabled": True}
+        else:
+            display.console.print("[bold]Add MCP server[/bold]")
+            try:
+                name = click.prompt("Name (unique, e.g. 'filesystem')").strip()
+                transport = click.prompt(
+                    "Transport", type=click.Choice(["stdio", "http"]), default="stdio"
+                ).strip()
+                if transport == "http":
+                    url = click.prompt("URL (e.g. https://host/mcp)").strip()
+                    headers_raw = click.prompt(
+                        "Headers as KEY=VALUE comma-separated (optional)", default=""
+                    ).strip()
+                    headers = {}
+                    for pair in headers_raw.split(","):
+                        if "=" in pair:
+                            k, _, v = pair.partition("=")
+                            headers[k.strip()] = v.strip()
+                    entry = {"name": name, "url": url, "headers": headers, "enabled": True}
+                else:
+                    command = click.prompt("Command (e.g. 'npx' or 'uvx')").strip()
+                    args_raw = click.prompt(
+                        "Arguments (space-separated)", default=""
+                    ).strip()
+                    import shlex
+                    env_raw = click.prompt(
+                        "Env as KEY=VALUE comma-separated (optional)", default=""
+                    ).strip()
+                    env = {}
+                    for pair in env_raw.split(","):
+                        if "=" in pair:
+                            k, _, v = pair.partition("=")
+                            env[k.strip()] = v.strip()
+                    entry = {
+                        "name": name,
+                        "command": command,
+                        "args": shlex.split(args_raw),
+                        "env": env,
+                        "enabled": True,
+                    }
+            except click.Abort:
+                display.console.print("[dim]Cancelled.[/dim]")
+                return "ok"
+
+        try:
+            add_mcp_server(entry)
+        except ValueError as exc:
+            display.print_error(str(exc))
+            return "ok"
+
+        display.console.print(
+            f"[bold green]✓ MCP server '{entry['name']}' added.[/bold green] Connecting…"
+        )
+        manager.init_from_config(load_config(), force=True)
+        live = {s["name"]: s for s in manager.status()}.get(entry["name"])
+        if live and live["connected"]:
+            display.console.print(
+                f"[green]Connected[/green] — {live['tool_count']} tool(s) available."
+            )
+        elif live and live["error"]:
+            display.print_error(f"Connection failed: {live['error']}")
+        return "ok"
+
+    if sub in ("remove", "rm", "delete"):
+        if len(tokens) < 2:
+            display.print_error("Usage: /mcp remove <name>")
+            return "ok"
+        nm = tokens[1]
+        if remove_mcp_server(nm):
+            display.console.print(f"[dim]MCP server '{nm}' removed.[/dim]")
+            manager.init_from_config(load_config(), force=True)
+        else:
+            display.print_error(f"No MCP server named '{nm}'.")
+        return "ok"
+
+    if sub in ("enable", "disable"):
+        if len(tokens) < 2:
+            display.print_error(f"Usage: /mcp {sub} <name>")
+            return "ok"
+        nm = tokens[1]
+        if set_mcp_server_enabled(nm, sub == "enable"):
+            display.console.print(f"[dim]MCP server '{nm}' {sub}d.[/dim]")
+            manager.init_from_config(load_config(), force=True)
+        else:
+            display.print_error(f"No MCP server named '{nm}'.")
+        return "ok"
+
+    if sub in ("reconnect", "reload", "refresh"):
+        display.console.print("[dim]Reconnecting MCP servers…[/dim]")
+        manager.init_from_config(load_config(), force=True)
+        for s in manager.status():
+            if s["connected"]:
+                display.console.print(
+                    f"  [green]✓[/green] {s['name']} [dim]({s['tool_count']} tools)[/dim]"
+                )
+            else:
+                display.console.print(
+                    f"  [red]✗[/red] {s['name']} [dim]{s['error'] or 'not connected'}[/dim]"
+                )
+        return "ok"
+
+    display.print_error(
+        "Unknown subcommand. Try: /mcp list · /mcp registry · /mcp install <id> · "
+        "/mcp add · /mcp remove <name> · /mcp enable|disable <name> · /mcp reconnect"
+    )
+    return "ok"
+
+
+def _mcp_registry_list() -> str:
+    """Render the curated MCP server catalog, grouped by category."""
+    from . import mcp_registry as reg
+
+    configured = {s["name"] for s in get_mcp_servers()}
+    display.console.print("[bold]MCP catalog[/bold]  [dim](install with /mcp install <id>)[/dim]\n")
+    for category, entries in reg.by_category().items():
+        display.console.print(f"[bold #fab283]{category}[/bold #fab283]")
+        for e in entries:
+            runtime = e.get("runtime", "stdio")
+            ok = reg.runtime_available(runtime)
+            if e["id"] in configured:
+                badge = "[green]installed[/green]"
+            elif runtime == "http":
+                badge = "[dim]remote[/dim]"
+            elif ok:
+                badge = f"[dim]{runtime}[/dim]"
+            else:
+                badge = f"[red]needs {runtime}[/red]"
+            needs_key = any(i.get("secret") for i in e.get("inputs", []))
+            key_tag = " [yellow]🔑[/yellow]" if needs_key else ""
+            display.console.print(
+                f"  [bold cyan]{e['id']:<20}[/bold cyan] {badge}{key_tag}\n"
+                f"      [dim]{e['summary']}[/dim]"
+            )
+        display.console.print("")
+    display.console.print(
+        "[dim]🔑 = needs an API key/token.  "
+        "Install: /mcp install <id>   ·   e.g. /mcp install filesystem[/dim]"
+    )
+    return "ok"
+
+
+def _mcp_install(entry_id: str, inline_args: list[str], state: dict) -> str:
+    """Install a server from the catalog. Collects required inputs (inline
+    key=value or interactive prompt), then adds + connects it."""
+    from . import mcp_registry as reg
+    from .mcp_client import manager
+
+    entry = reg.get_entry(entry_id)
+    if entry is None:
+        display.print_error(
+            f"No catalog entry '{entry_id}'. Run /mcp registry to see available ids."
+        )
+        return "ok"
+
+    runtime = entry.get("runtime", "stdio")
+    if not reg.runtime_available(runtime):
+        hint = reg.runtime_hint(runtime)
+        display.print_error(
+            f"'{entry['id']}' needs the [bold]{runtime}[/bold] runtime, which isn't on PATH."
+            + (f"\n{hint}" if hint else "")
+        )
+        return "ok"
+
+    # Parse inline key=value overrides.
+    inline: dict = {}
+    for tok in inline_args:
+        if "=" in tok:
+            k, _, v = tok.partition("=")
+            inline[k.strip()] = v.strip()
+
+    wd = state.get("working_dir")
+    values: dict = {}
+    for spec in reg.required_inputs(entry, wd):
+        key = spec["key"]
+        if key in inline:
+            values[key] = inline[key]
+            continue
+        try:
+            if spec["secret"]:
+                val = click.prompt(spec["prompt"], hide_input=True, show_default=False, default="").strip()
+            else:
+                val = click.prompt(spec["prompt"], default=spec.get("default", "")).strip()
+        except click.Abort:
+            display.console.print("[dim]Cancelled.[/dim]")
+            return "ok"
+        if not val and spec["secret"]:
+            display.print_error(f"'{key}' is required for {entry['id']}.")
+            return "ok"
+        values[key] = val
+
+    cfg = reg.build_config(entry, values, wd)
+    try:
+        add_mcp_server(cfg)
+    except ValueError as exc:
+        # Most likely the name already exists — offer a hint.
+        display.print_error(f"{exc}  (remove it first with /mcp remove {cfg['name']})")
+        return "ok"
+
+    display.console.print(
+        f"[bold green]✓ Installed '{cfg['name']}' from the catalog.[/bold green] Connecting…"
+    )
+    manager.init_from_config(load_config(), force=True)
+    live = {s["name"]: s for s in manager.status()}.get(cfg["name"])
+    if live and live["connected"]:
+        display.console.print(
+            f"[green]Connected[/green] — {live['tool_count']} tool(s) available."
+        )
+    elif live and live["error"]:
+        display.print_error(
+            f"Connection failed: {live['error']}\n"
+            f"[dim]First run may need to download the package — try /mcp reconnect in a moment.[/dim]"
+        )
     return "ok"
 
 

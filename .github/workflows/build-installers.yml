@@ -35,16 +35,22 @@ jobs:
       - name: Install create-dmg
         run: brew install create-dmg
 
+      - name: Resolve version
+        id: version
+        run: echo "version=$(python scripts/version.py)" >> "$GITHUB_OUTPUT"
+
       - name: Build .app and DMG
         # build_dmg.sh runs PyInstaller, codesign, and create-dmg in one pass.
         # --skip-pyinstaller is NOT passed here so PyInstaller runs inside the script.
+        env:
+          OTS_VERSION: ${{ steps.version.outputs.version }}
         run: bash installers/macos/build_dmg.sh
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
           name: OctoSlave-macOS
-          path: dist/OctoSlave-macOS.dmg
+          path: dist/OctoSlave-macOS-*.dmg
 
   # ── Windows (.exe installer) ─────────────────────────────────────────────
   build-windows:
@@ -67,6 +73,11 @@ jobs:
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
 
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: echo "version=$(python scripts/version.py)" >> "$GITHUB_OUTPUT"
+
       - name: Build ots.exe (CLI binary)
         run: python -m PyInstaller --clean --noconfirm installers\windows\ots_cli.spec
 
@@ -75,16 +86,18 @@ jobs:
 
       - name: Build installer with Inno Setup
         shell: cmd
+        env:
+          OTS_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set "ISCC=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           if not exist "%ISCC%" set "ISCC=C:\Program Files\Inno Setup 6\ISCC.exe"
-          "%ISCC%" installers\windows\installer.iss
+          "%ISCC%" /DAppVersion=%OTS_VERSION% installers\windows\installer.iss
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
           name: OctoSlave-Windows
-          path: dist/OctoSlave-Windows-Installer.exe
+          path: dist/OctoSlave-Windows-Installer-*.exe
 
   # ── Linux (.AppImage) ────────────────────────────────────────────────────
   build-linux:
@@ -118,18 +131,47 @@ jobs:
           chmod +x /tmp/appimagetool
           sudo mv /tmp/appimagetool /usr/local/bin/appimagetool
 
+      - name: Resolve version
+        id: version
+        run: echo "version=$(python scripts/version.py)" >> "$GITHUB_OUTPUT"
+
       - name: Build AppImage
+        env:
+          OTS_VERSION: ${{ steps.version.outputs.version }}
         run: bash installers/linux/build_appimage.sh
 
       - name: Upload AppImage artifact
         uses: actions/upload-artifact@v4
         with:
           name: OctoSlave-Linux
-          path: dist/OctoSlave-x86_64.AppImage
+          path: dist/OctoSlave-*-x86_64.AppImage
+
+  # ── Verify tag matches pyproject version (tag pushes only) ───────────────
+  verify-version:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Git tag must match pyproject.toml version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PYPROJECT="$(python scripts/version.py)"
+          echo "git tag: ${GITHUB_REF_NAME} (-> ${TAG})   pyproject: ${PYPROJECT}"
+          if [ "$TAG" != "$PYPROJECT" ]; then
+            echo "::error::Tag '${GITHUB_REF_NAME}' does not match pyproject version '${PYPROJECT}'. Bump pyproject.toml to ${TAG} (or re-tag) so the version is unambiguous."
+            exit 1
+          fi
 
   # ── GitHub Release (tag pushes only) ─────────────────────────────────────
   release:
-    needs: [build-macos, build-windows, build-linux]
+    needs: [verify-version, build-macos, build-windows, build-linux]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     permissions:

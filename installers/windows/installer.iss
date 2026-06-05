@@ -7,7 +7,12 @@
 ; Output: dist\OctoSlave-Windows-Installer.exe
 
 #define AppName      "OctoSlave"
-#define AppVersion   "0.2.0"
+; AppVersion is single-sourced from pyproject.toml. CI passes the real value
+; with  ISCC /DAppVersion=0.3.0 . The fallback below is only used for manual
+; local builds that don't override it.
+#ifndef AppVersion
+  #define AppVersion "0.0.0"
+#endif
 #define AppPublisher "David Kopecky"
 #define AppURL       "https://octoslave.karamazov.website"
 #define AppExeName   "ots.exe"
@@ -26,7 +31,7 @@ DefaultGroupName={#AppName}
 AllowNoIcons=yes
 LicenseFile=..\..\LICENSE
 OutputDir=..\..\dist
-OutputBaseFilename=OctoSlave-Windows-Installer
+OutputBaseFilename=OctoSlave-Windows-Installer-{#AppVersion}
 ; SetupIconFile requires .ico — omitted until an .ico asset is added to the repo
 Compression=lzma2/max
 SolidCompression=yes
