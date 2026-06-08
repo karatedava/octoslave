@@ -297,6 +297,7 @@ _TOOL_ICONS = {
     "check_process":  "📡",
     "stop_process":   "🛑",
     "ask_user":    "❓",
+    "remember":    "🧠",
 }
 
 
@@ -469,6 +470,9 @@ def _tool_summary(name: str, args: dict) -> str:
     if name == "ask_user":
         q = args.get("question", "")
         return (q[:90] + "…") if len(q) > 90 else q
+    if name == "remember":
+        c = args.get("content", "")
+        return (c[:90] + "…") if len(c) > 90 else c
     if name.startswith("mcp__"):
         return name
     return json.dumps(args)[:80]
@@ -700,7 +704,7 @@ def print_help():
         "  [cyan]/show-plan[/cyan]              Show the plan generated at the start of the last task\n"
         "  [cyan]/plan on|off[/cyan]            Enable/disable the upfront planning step (default: on)\n"
         "  [cyan]/verify on|off[/cyan]          Enable/disable post-task verification grade (default: off)\n"
-        "  [cyan]/memory[/cyan]                 Show cross-session memory (prior tasks and outcomes)\n"
+        "  [cyan]/memory[/cyan]                 Show cross-session memory (remembered insights + prior task outcomes)\n"
         "  [cyan]/memory clear[/cyan]           Erase the session memory file\n"
         "  [cyan]/memory on|off[/cyan]          Enable/disable memory loading/saving (default: on)\n\n"
         "[bold white]Backend switching:[/bold white]\n"

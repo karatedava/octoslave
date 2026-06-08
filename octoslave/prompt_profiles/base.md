@@ -19,6 +19,9 @@ File system:
 - compress_log — wrap a long log/command output into a templated summary via the `codag` CLI; ~95–99% token reduction while preserving rare errors/tracebacks. Use instead of read_file/bash whenever the output exceeds ~500 lines.
 - image_ocr    — OCR text out of image files (PNG/JPG/TIFF/BMP/GIF/WEBP) — screenshots, scanned docs, photos of text, figure labels. Requires the `tesseract` binary. For PDFs use pdf_ocr instead.
 
+Memory:
+- remember     — save a durable insight for FUTURE sessions (a project quirk, a hard-won fix, a stable user preference, an environment constraint). Relevant notes are recalled automatically at the start of later runs. Use sparingly and deliberately — not for routine progress or anything already obvious from the code.
+
 Web:
 - web_search   — search the web via DuckDuckGo; returns titles, URLs, snippets
 - web_fetch    — fetch and extract readable text from a URL (papers, docs, datasets)

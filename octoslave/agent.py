@@ -166,85 +166,244 @@ def list_prompt_profiles() -> list[str]:
 
 # ---------------------------------------------------------------------------
 # Cross-session memory
+#
+# One file, two kinds of entry:
+#   • "session" — task outcomes recorded automatically at the end of a run
+#                 (date / task / status / note).
+#   • "insight" — facts the agent itself decided are worth keeping, written
+#                 through the `remember` tool (date / kind:insight / tags / text).
+#
+# Recall is relevance-ranked against the current task rather than "dump the
+# last N", so we can retain a larger pool without bloating the prompt — only
+# the top lexical matches (plus a recency fallback) are injected.
 # ---------------------------------------------------------------------------
 
 MEMORY_FILE = Path.home() / ".octoslave" / "session_memory.md"
-_MEMORY_MAX_ENTRIES = 10
+_SESSION_MAX_ENTRIES = 40   # session outcomes retained on disk
+_INSIGHT_MAX_ENTRIES = 60   # agent-authored insights retained on disk
+_RECALL_SESSIONS = 4        # session entries injected into a prompt
+_RECALL_INSIGHTS = 6        # insight entries injected into a prompt
+
+_MEMORY_STOPWORDS = frozenset(
+    "the a an and or but for to of in on at by with from into is are was were be "
+    "this that these those it its as do does did how what when where why which who "
+    "use used using make made get got run ran add added fix fixed via your you we "
+    "can will should would could not now then code file files task please help".split()
+)
 
 
-def load_session_memory() -> str:
-    """
-    Return a formatted summary of the last 3 sessions for context injection.
-    Returns empty string if no memory exists or on any read error.
-    """
+def _mem_tokenize(text: str) -> set[str]:
+    """Lowercase alphanumeric tokens (len >= 3) minus common stopwords. A cheap
+    lexical fingerprint — good enough to rank relevance without embeddings or
+    tiktoken, consistent with how _estimated_tokens approximates token counts."""
+    toks = re.findall(r"[a-z0-9_]{3,}", (text or "").lower())
+    return {t for t in toks if t not in _MEMORY_STOPWORDS}
+
+
+def _entry_match_text(e: dict) -> str:
+    """The text of an entry used for relevance scoring."""
+    if e.get("kind") == "insight":
+        return f"{e.get('tags', '')} {e.get('text', '')}"
+    return f"{e.get('task', '')} {e.get('note', '')}"
+
+
+def _mem_relevance(query_tokens: set[str], entry: dict) -> float:
+    """Token overlap of the query with an entry, penalised by entry length so a
+    long entry can't win purely by containing more words. 0.0 with no query."""
+    if not query_tokens:
+        return 0.0
+    et = _mem_tokenize(_entry_match_text(entry))
+    if not et:
+        return 0.0
+    overlap = len(query_tokens & et)
+    if overlap == 0:
+        return 0.0
+    return overlap / (len(et) ** 0.5 + 1.0)
+
+
+def _parse_memory_entries() -> list[dict]:
+    """Parse the memory file into a chronological list of entry dicts. Each has
+    a 'kind' of 'session' or 'insight'. Tolerant of missing fields and of older
+    files that predate the insight format. Never raises."""
     if not MEMORY_FILE.exists():
-        return ""
+        return []
     try:
         text = MEMORY_FILE.read_text(encoding="utf-8")
-        # Parse --- delimited blocks
-        entries: list[dict] = []
-        for block in text.split("---"):
-            block = block.strip()
-            if not block or block.startswith("#"):
+    except OSError:
+        return []
+    entries: list[dict] = []
+    for block in text.split("---"):
+        block = block.strip()
+        if not block or block.startswith("#"):
+            continue
+        parsed: dict = {}
+        body_lines: list[str] = []
+        in_text = False
+        for line in block.splitlines():
+            if in_text:
+                body_lines.append(line)
                 continue
-            parsed: dict = {}
-            for line in block.splitlines():
-                if ":" in line:
-                    k, _, v = line.partition(":")
-                    parsed[k.strip()] = v.strip()
-            if parsed.get("task"):
+            if ":" in line:
+                k, _, v = line.partition(":")
+                k = k.strip().lower()
+                v = v.strip()
+                if k == "text":
+                    in_text = True
+                    if v:
+                        body_lines.append(v)
+                else:
+                    parsed[k] = v
+        if body_lines:
+            parsed["text"] = "\n".join(body_lines).strip()
+        # Classify. An explicit kind wins; otherwise a `text` body with no
+        # `task` is an insight, and anything with a `task` is a session entry.
+        if parsed.get("kind") == "insight" or ("text" in parsed and "task" not in parsed):
+            if parsed.get("text"):
+                parsed["kind"] = "insight"
                 entries.append(parsed)
+        elif parsed.get("task"):
+            parsed["kind"] = "session"
+            entries.append(parsed)
+    return entries
 
-        recent = entries[-3:] if len(entries) > 3 else entries
-        if not recent:
+
+def _select_memory(pool: list[dict], query_tokens: set[str], k: int) -> list[dict]:
+    """Pick up to k entries from pool. With a query, return the highest-scoring
+    matches (most relevant first); with no query or no lexical hit, fall back to
+    the k most recent (chronological order)."""
+    if not pool:
+        return []
+    if query_tokens:
+        scored = [(_mem_relevance(query_tokens, e), i, e) for i, e in enumerate(pool)]
+        hits = sorted((s for s in scored if s[0] > 0.0),
+                      key=lambda s: (s[0], s[1]), reverse=True)
+        if hits:
+            return [e for _, _, e in hits[:k]]
+    return pool[-k:]
+
+
+def load_session_memory(query: str | None = None) -> str:
+    """
+    Return a formatted block of relevant prior context for system-prompt
+    injection. When `query` (the current task) is given, entries are ranked by
+    lexical relevance to it; otherwise the most recent entries are used.
+    Returns empty string when there is nothing to recall.
+    """
+    try:
+        entries = _parse_memory_entries()
+        if not entries:
+            return ""
+        insights = [e for e in entries if e["kind"] == "insight"]
+        sessions = [e for e in entries if e["kind"] == "session"]
+
+        qtok = _mem_tokenize(query) if query else set()
+        sel_ins = _select_memory(insights, qtok, _RECALL_INSIGHTS)
+        sel_ses = _select_memory(sessions, qtok, _RECALL_SESSIONS)
+        if not sel_ins and not sel_ses:
             return ""
 
-        parts = ["[PRIOR SESSIONS — for context only, do not repeat completed work]"]
-        for e in reversed(recent):
-            d = e.get("date", "?")
-            task = e.get("task", "?")
-            status = e.get("status", "?")
-            note = e.get("note", "")
-            line = f"  {d}: {task} — {status}"
-            if note:
-                line += f" ({note[:100]})"
-            parts.append(line)
+        parts = ["[MEMORY — relevant prior context; do not repeat completed work]"]
+        if sel_ins:
+            parts.append("\nThings you chose to remember:")
+            for e in sel_ins:
+                tags = e.get("tags", "").strip()
+                suffix = f"  [{tags}]" if tags else ""
+                parts.append(f"  • {e.get('text', '').strip()}{suffix}")
+        if sel_ses:
+            parts.append("\nPrior sessions:")
+            for e in sel_ses:
+                d = e.get("date", "?")
+                task = e.get("task", "?")
+                status = e.get("status", "?")
+                note = e.get("note", "")
+                line = f"  {d}: {task} — {status}"
+                if note:
+                    line += f" ({note[:100]})"
+                parts.append(line)
         return "\n".join(parts)
     except Exception:
         return ""
 
 
-def save_session_memory(task: str, status: str = "completed", note: str = "") -> None:
-    """Append one session entry to the memory file, trimming to _MEMORY_MAX_ENTRIES."""
-    MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    entry_lines = [
+def _serialize_memory_entry(e: dict) -> str:
+    """Render one entry as a `---`-delimited block matching the parser."""
+    if e.get("kind") == "insight":
+        out = ["---", f"date: {e.get('date', '')}", "kind: insight"]
+        if e.get("tags"):
+            out.append(f"tags: {e['tags']}")
+        out.append(f"text: {e.get('text', '')}")
+        out.append("")
+        return "\n".join(out)
+    return "\n".join([
         "---",
-        f"date: {_date_cls.today().isoformat()}",
-        f"task: {task[:200].replace(chr(10), ' ')}",
-        f"status: {status}",
-        f"note: {note[:300].replace(chr(10), ' ')}",
+        f"date: {e.get('date', '')}",
+        f"task: {e.get('task', '')}",
+        f"status: {e.get('status', '')}",
+        f"note: {e.get('note', '')}",
         "",
-    ]
-    entry = "\n".join(entry_lines)
+    ])
 
-    existing = ""
-    if MEMORY_FILE.exists():
-        try:
-            existing = MEMORY_FILE.read_text(encoding="utf-8")
-        except Exception:
-            existing = ""
 
-    # Trim to max entries
-    blocks = [b for b in existing.split("---") if b.strip() and not b.strip().startswith("#")]
-    if len(blocks) >= _MEMORY_MAX_ENTRIES:
-        blocks = blocks[-(  _MEMORY_MAX_ENTRIES - 1):]
-        existing = "# OctoSlave Session Memory\n\n" + "---".join([""] + blocks)
+def _write_memory(entries: list[dict]) -> None:
+    """Trim each kind to its cap (keeping the most recent) and rewrite the file
+    in chronological order. Rewriting wholesale keeps per-kind trimming correct
+    — insights are never evicted to make room for session outcomes."""
+    sessions = [e for e in entries if e.get("kind") == "session"][-_SESSION_MAX_ENTRIES:]
+    insights = [e for e in entries if e.get("kind") == "insight"][-_INSIGHT_MAX_ENTRIES:]
+    keep = {id(e) for e in sessions} | {id(e) for e in insights}
+    ordered = [e for e in entries if id(e) in keep]
 
-    if not existing.strip():
-        existing = "# OctoSlave Session Memory\n"
+    MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    body = "\n".join(_serialize_memory_entry(e) for e in ordered)
+    MEMORY_FILE.write_text(
+        "# OctoSlave Session Memory\n\n" + body + ("\n" if body else ""),
+        encoding="utf-8",
+    )
 
-    with open(MEMORY_FILE, "a", encoding="utf-8") as f:
-        f.write("\n" + entry)
+
+def save_session_memory(task: str, status: str = "completed", note: str = "") -> None:
+    """Record one task-outcome entry, trimming session history to its cap."""
+    try:
+        entries = _parse_memory_entries()
+        entries.append({
+            "kind": "session",
+            "date": _date_cls.today().isoformat(),
+            "task": task[:200].replace(chr(10), " "),
+            "status": status,
+            "note": note[:300].replace(chr(10), " "),
+        })
+        _write_memory(entries)
+    except Exception:
+        pass
+
+
+def save_memory_insight(content: str, tags=None) -> bool:
+    """Persist an agent-authored insight (the `remember` tool). Returns True on
+    success. Multi-line content is allowed; a lone `---` line is defused so it
+    can't be mistaken for a block separator on the next read."""
+    content = (content or "").strip()
+    if not content:
+        return False
+    content = content.replace("\r", "")
+    content = re.sub(r"(?m)^---\s*$", "- - -", content)[:1000]
+    if isinstance(tags, str):
+        tag_str = tags.strip()
+    elif tags:
+        tag_str = ", ".join(str(t).strip() for t in tags if str(t).strip())
+    else:
+        tag_str = ""
+    try:
+        entries = _parse_memory_entries()
+        entries.append({
+            "kind": "insight",
+            "date": _date_cls.today().isoformat(),
+            "tags": tag_str[:120],
+            "text": content,
+        })
+        _write_memory(entries)
+        return True
+    except Exception:
+        return False
 
 
 def load_system_prompt(profile: str = "base", working_dir: str = None) -> str:
@@ -668,9 +827,10 @@ def run_agent(
 
     system_prompt = load_system_prompt(prompt_profile, working_dir)
 
-    # Inject session memory into system prompt when available
+    # Inject session memory into system prompt when available, ranked by
+    # relevance to the current task.
     if enable_memory:
-        memory_ctx = load_session_memory()
+        memory_ctx = load_session_memory(query=task)
         if memory_ctx:
             system_prompt = system_prompt + f"\n\n{memory_ctx}"
 

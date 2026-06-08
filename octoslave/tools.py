@@ -444,6 +444,36 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": (
+                "Save a durable insight to cross-session memory — a fact, lesson, "
+                "preference, or gotcha that will help in FUTURE sessions, not just "
+                "this one. Use it sparingly and deliberately when you learn "
+                "something worth carrying forward: a non-obvious project quirk, a "
+                "fix that took effort to find, a stable user preference, an "
+                "environment constraint (e.g. a tool that isn't installed), or a "
+                "dead end worth avoiding next time. Write the insight so it makes "
+                "sense out of context, with specifics. Do NOT use it for routine "
+                "progress, transient state, or things already obvious from the code "
+                "or the task. These notes are recalled automatically when relevant."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "The insight to remember, self-contained and specific."},
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional short tags for retrieval (e.g. ['build', 'macos']).",
+                    },
+                },
+                "required": ["content"],
+            },
+        },
+    },
 ] + BIO_TOOL_DEFINITIONS
 
 
@@ -546,6 +576,8 @@ def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str =
             return _stop_process(working_dir=working_dir, **args)
         elif name == "ask_user":
             return _ask_user(working_dir=working_dir, **args)
+        elif name == "remember":
+            return _remember(**args)
         elif name == "glob":
             return _glob(working_dir=working_dir, **args)
         elif name == "grep":
@@ -589,6 +621,7 @@ _REQUIRED_STR_ARGS: dict[str, tuple[str, ...]] = {
     "run_background": ("command",),
     "stop_process": ("id",),
     "ask_user": ("question",),
+    "remember": ("content",),
     "glob": ("pattern",),
     "grep": ("pattern",),
     "web_search": ("query",),
@@ -651,6 +684,7 @@ _ARG_HINTS: dict[str, str] = {
     "run_background": "Pass `command` as a shell string (e.g. {\"command\": \"python app.py\"}).",
     "stop_process": "Pass `id` as the process id returned by run_background (e.g. \"bg1\").",
     "ask_user": "Pass `question` as a clear, specific question string.",
+    "remember": "Pass `content` as a self-contained insight string (e.g. {\"content\": \"This repo uses uv, not pip.\"}).",
     "glob": "Pass `pattern` (e.g. {\"pattern\": \"**/*.py\"}).",
     "grep": "Pass `pattern` as a regex (e.g. {\"pattern\": \"def \\\\w+\"}).",
     "web_search": "Pass `query`.",
@@ -1153,6 +1187,20 @@ def _ask_user(question: str, working_dir: str, options: list = None) -> tuple[st
             True,
         )
     return f"The user answered: {answer}", True
+
+
+def _remember(content: str, tags=None) -> tuple[str, bool]:
+    """Persist an agent-authored insight to cross-session memory."""
+    # Lazy import — agent.py imports tools.py at module load, so importing it
+    # at the top here would be a circular import.
+    from .agent import save_memory_insight
+    ok = save_memory_insight(content, tags)
+    if not ok:
+        return "Could not save the insight (empty content or write error).", False
+    preview = content.strip().replace("\n", " ")
+    if len(preview) > 80:
+        preview = preview[:77] + "…"
+    return f"Saved to memory: {preview}", True
 
 
 def _bash(command: str, working_dir: str, timeout: int = 300) -> tuple[str, bool]:
