@@ -20,6 +20,10 @@ DIST_DIR="${ROOT_DIR}/dist"
 BUILD_DIR="${DIST_DIR}/AppImage-build"
 APPNAME="OctoSlave"
 
+# Single-source the version: OTS_VERSION env (set by CI) wins, else read pyproject.
+VERSION="${OTS_VERSION:-$(python3 -c "import tomllib,pathlib;print(tomllib.loads(pathlib.Path('${ROOT_DIR}/pyproject.toml').read_text())['project']['version'])" 2>/dev/null || echo 0.0.0)}"
+export OTS_VERSION="${VERSION}"
+
 # ── 1. Install / update PyInstaller if needed
 echo "==> Checking PyInstaller…"
 python3 -m pip install --quiet --upgrade pyinstaller
@@ -86,7 +90,7 @@ chmod +x "${BUILD_DIR}/AppRun"
 
 # ── 4. Build AppImage
 echo "==> Building AppImage…"
-APPIMAGE_OUTPUT="${DIST_DIR}/OctoSlave-x86_64.AppImage"
+APPIMAGE_OUTPUT="${DIST_DIR}/OctoSlave-${VERSION}-x86_64.AppImage"
 rm -f "${APPIMAGE_OUTPUT}"
 
 if ! command -v appimagetool &> /dev/null; then

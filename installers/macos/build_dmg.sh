@@ -21,6 +21,10 @@ DIST_DIR="${ROOT_DIR}/dist"
 APP_PATH="${DIST_DIR}/OctoSlave.app"
 SKIP_BUILD=false
 
+# Single-source the version: OTS_VERSION env (set by CI) wins, else read pyproject.
+VERSION="${OTS_VERSION:-$(python3 -c "import tomllib,pathlib;print(tomllib.loads(pathlib.Path('${ROOT_DIR}/pyproject.toml').read_text())['project']['version'])" 2>/dev/null || echo 0.0.0)}"
+export OTS_VERSION="${VERSION}"   # ensure the PyInstaller spec sees it too
+
 for arg in "$@"; do
     [[ "$arg" == "--skip-pyinstaller" ]] && SKIP_BUILD=true
 done
@@ -71,7 +75,7 @@ else
 fi
 
 # ── 5. Create the DMG
-DMG_PATH="${DIST_DIR}/OctoSlave-macOS.dmg"
+DMG_PATH="${DIST_DIR}/OctoSlave-macOS-${VERSION}.dmg"
 echo "==> Creating DMG at ${DMG_PATH}…"
 rm -f "${DMG_PATH}"
 

@@ -23,6 +23,8 @@
 #   OCTOSLAVE_EXTRAS     pip extras spec (default: [all]; use "" to skip extras)
 #   OCTOSLAVE_NO_PIPX    set to 1 to skip pipx and go straight to venv install
 #   OCTOSLAVE_VENV_DIR   where the fallback venv lives (default: ~/.local/share/octoslave-venv)
+#   OCTOSLAVE_NO_CODAG   set to 1 to skip installing the codag CLI
+#                        (used by the `compress_log` tool — optional)
 #
 
 set -euo pipefail
@@ -33,6 +35,7 @@ OCTOSLAVE_REF="${OCTOSLAVE_REF:-}"
 OCTOSLAVE_EXTRAS="${OCTOSLAVE_EXTRAS-[all]}"
 OCTOSLAVE_NO_PIPX="${OCTOSLAVE_NO_PIPX:-0}"
 OCTOSLAVE_VENV_DIR="${OCTOSLAVE_VENV_DIR:-$HOME/.local/share/octoslave-venv}"
+OCTOSLAVE_NO_CODAG="${OCTOSLAVE_NO_CODAG:-0}"
 
 # ── Pretty output helpers ─────────────────────────────────────────────────
 bold()   { printf "\033[1m%s\033[0m\n" "$*"; }
@@ -202,7 +205,76 @@ echo
 green "✓ octoslave installed"
 echo
 
-# ── 6. Next steps ──────────────────────────────────────────────────────────
+# ── 6. Install codag CLI (optional — powers the `compress_log` tool) ──────
+#
+# codag compresses noisy log streams into compact summaries so the agent
+# can read them without blowing the context window. Free `compact` mode
+# needs no account. Skip with OCTOSLAVE_NO_CODAG=1.
+#
+install_codag() {
+    if [ "$OCTOSLAVE_NO_CODAG" = "1" ]; then
+        info "skipping codag install (OCTOSLAVE_NO_CODAG=1)"
+        return 0
+    fi
+    if command -v codag >/dev/null 2>&1; then
+        green "✓ codag already installed at $(command -v codag)"
+        return 0
+    fi
+    if [ -x "$HOME/.local/bin/codag" ]; then
+        green "✓ codag already installed at $HOME/.local/bin/codag"
+        return 0
+    fi
+    info "installing codag CLI (used by the compress_log tool)"
+    if ! command -v curl >/dev/null 2>&1; then
+        yellow "  curl not found — skipping codag install"
+        return 0
+    fi
+    if curl -fsSL https://codag.ai/install.sh | sh >/dev/null 2>&1; then
+        green "✓ codag installed (free 'compact' mode needs no account)"
+    else
+        yellow "  codag install failed — compress_log will be unavailable."
+        yellow "  Re-run later with: curl -fsSL https://codag.ai/install.sh | sh"
+    fi
+}
+install_codag
+
+# Register codag's MCP server (tail_kubernetes / tail_docker / tail_aws_logs /
+# tail_vercel / tail_gh_actions / wrap / compact / health) in ~/.octoslave/
+# config.json so the agent can reach those tools without manual /mcp setup.
+# Idempotent. Skip with OCTOSLAVE_NO_CODAG_MCP_REGISTER=1.
+register_codag_mcp() {
+    if [ "$OCTOSLAVE_NO_CODAG_MCP_REGISTER" = "1" ]; then
+        info "skipping codag MCP registration (OCTOSLAVE_NO_CODAG_MCP_REGISTER=1)"
+        return 0
+    fi
+    if ! command -v codag >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/codag" ]; then
+        return 0  # codag missing — nothing to register
+    fi
+    # Find a Python that can import octoslave. pipx puts the venv under
+    # ~/.local/share/pipx/venvs/octoslave/bin/python; the venv fallback uses
+    # $OCTOSLAVE_VENV_DIR/bin/python.
+    local OTS_PY=""
+    for cand in \
+        "$HOME/.local/share/pipx/venvs/octoslave/bin/python" \
+        "$OCTOSLAVE_VENV_DIR/bin/python"; do
+        if [ -x "$cand" ] && "$cand" -c "import octoslave.config" >/dev/null 2>&1; then
+            OTS_PY="$cand"
+            break
+        fi
+    done
+    if [ -z "$OTS_PY" ]; then
+        info "  (could not locate octoslave's Python — skipping MCP auto-register; will happen on first compress_log call)"
+        return 0
+    fi
+    if "$OTS_PY" -c "from octoslave.config import ensure_codag_mcp_registered; print('registered' if ensure_codag_mcp_registered() else 'already-registered')" 2>/dev/null | grep -q registered; then
+        green "✓ codag MCP server registered (tail_kubernetes, tail_docker, tail_aws_logs, …)"
+    fi
+}
+register_codag_mcp
+
+echo
+
+# ── 7. Next steps ──────────────────────────────────────────────────────────
 bold "Next steps:"
 echo
 echo "  1.  Configure a backend (e-INFRA CZ / NVIDIA NIM / Ollama):"

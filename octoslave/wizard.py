@@ -7,8 +7,16 @@ import json
 import sys
 import threading
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import messagebox
+
+# ---------------------------------------------------------------------------
+# API-key registration pages — where users generate the key for each backend
+# ---------------------------------------------------------------------------
+_EINFRA_SIGNUP_URL = "https://llm.ai.e-infra.cz"
+_NIM_SIGNUP_URL    = "https://build.nvidia.com"
+_OLLAMA_DOWNLOAD_URL = "https://ollama.com/download"
 
 # ---------------------------------------------------------------------------
 # Constants (mirrors config.py to avoid import cycles during early startup)
@@ -21,6 +29,7 @@ _NIM_URL    = "https://integrate.api.nvidia.com/v1"
 _OLLAMA_URL = "http://localhost:11434/v1"
 
 _EINFRA_MODELS = [
+    "kimi-k2.6",
     "deepseek-v3.2",
     "deepseek-v3.2-thinking",
     "qwen3.5",
@@ -28,7 +37,6 @@ _EINFRA_MODELS = [
     "qwen3-coder",
     "qwen3-coder-30b",
     "kimi-k2.5",
-    "kimi-k2.6",
     "mistral-medium-3.5",
     "llama-4-scout-17b-16e-instruct",
     "gemma4",
@@ -95,6 +103,24 @@ class _Page(tk.Frame):
                      bg=_C["bg"], fg=_C["muted"]).pack(anchor="w")
         return e
 
+    def link(self, parent: tk.Widget, text: str, url: str,
+             bg: str | None = None) -> tk.Label:
+        """A clickable hyperlink that opens `url` in the default browser."""
+        bg = bg or _C["bg"]
+        lbl = tk.Label(parent, text=text, font=("Helvetica", 10, "underline"),
+                       bg=bg, fg=_C["blue"], cursor="hand2", anchor="w")
+
+        def _open(_event=None, u=url):
+            try:
+                webbrowser.open(u)
+            except Exception:
+                pass
+
+        lbl.bind("<Button-1>", _open)
+        lbl.bind("<Enter>", lambda e: lbl.config(fg=_C["orange"]))
+        lbl.bind("<Leave>", lambda e: lbl.config(fg=_C["blue"]))
+        return lbl
+
     def card(self, text: str, subtext: str = "") -> tk.Frame:
         f = tk.Frame(self, bg=_C["panel"], padx=12, pady=8)
         f.pack(fill=tk.X, pady=4)
@@ -135,16 +161,16 @@ class _PageBackend(_Page):
                      "Select the AI service you want to connect to.")
         backends = [
             ("einfra", "e-INFRA CZ  (Recommended)",
-             "Czech research infrastructure — free API for .cz researchers.\n"
-             "Get your key at: https://llm.ai.e-infra.cz"),
+             "Czech research infrastructure — free API for .cz researchers.",
+             _EINFRA_SIGNUP_URL, "🔗  Generate your free API key  →"),
             ("nim",    "NVIDIA NIM",
-             "Cloud-hosted open-weight models. Free tier available.\n"
-             "Get your key at: https://build.nvidia.com"),
+             "Cloud-hosted open-weight models. Free tier available.",
+             _NIM_SIGNUP_URL, "🔗  Get your API key  →"),
             ("ollama", "Ollama  (Local / Offline)",
-             "100 % private, runs on your machine. No API key needed.\n"
-             "Install from: https://ollama.com/download"),
+             "100 % private, runs on your machine. No API key needed.",
+             _OLLAMA_DOWNLOAD_URL, "🔗  Download Ollama  →"),
         ]
-        for value, label, desc in backends:
+        for value, label, desc, url, link_text in backends:
             f = tk.Frame(self, bg=_C["panel"], padx=14, pady=10, cursor="hand2")
             f.pack(fill=tk.X, pady=5)
             rb = tk.Radiobutton(f, text=label, variable=backend_var, value=value,
@@ -155,7 +181,8 @@ class _PageBackend(_Page):
             rb.pack(anchor="w")
             tk.Label(f, text=desc, font=("Helvetica", 9), bg=_C["panel"],
                      fg=_C["muted"], wraplength=470, justify="left").pack(anchor="w", padx=24)
-            # clicking frame also selects
+            self.link(f, link_text, url, bg=_C["panel"]).pack(anchor="w", padx=24, pady=(3, 0))
+            # clicking frame/radiobutton selects (link clicks open the browser)
             for widget in (f, rb):
                 widget.bind("<Button-1>", lambda e, v=value: (backend_var.set(v), on_change()))
 
@@ -165,16 +192,18 @@ class _PageCredentials(_Page):
         super().__init__(parent)
         if backend == "einfra":
             self.heading("e-INFRA CZ — API Credentials",
-                         "Free for Czech research organisations (.cz accounts).\n"
-                         "Register and get your key at: https://llm.ai.e-infra.cz")
+                         "Free for Czech research organisations (.cz accounts).")
+            self.link(self, f"🔗  Click here to generate your API key  —  {_EINFRA_SIGNUP_URL}",
+                      _EINFRA_SIGNUP_URL).pack(anchor="w", pady=(0, 6))
             self.labeled_entry(self, "API Key", key_var, show="•",
                                hint="Paste your e-INFRA CZ key (usually starts with sk-…)")
             self.labeled_entry(self, "API Base URL", url_var,
                                hint="Leave as-is unless you have a custom endpoint.")
         elif backend == "nim":
             self.heading("NVIDIA NIM — API Credentials",
-                         "Free developer tier available.\n"
-                         "Register at: https://build.nvidia.com  →  Get API Key")
+                         "Free developer tier available.")
+            self.link(self, f"🔗  Click here to generate your API key  —  {_NIM_SIGNUP_URL}",
+                      _NIM_SIGNUP_URL).pack(anchor="w", pady=(0, 6))
             self.labeled_entry(self, "NIM API Key", key_var, show="•",
                                hint="Paste your NIM key (starts with nvapi-…)")
             self.labeled_entry(self, "NIM Base URL", url_var,
@@ -185,7 +214,9 @@ class _PageCredentials(_Page):
                          "No API key required — everything stays on your device.")
             tk.Label(self, text="No API key needed — Ollama is fully local.",
                      font=("Helvetica", 10, "bold"), bg=_C["bg"],
-                     fg=_C["green"]).pack(anchor="w", pady=(0, 10))
+                     fg=_C["green"]).pack(anchor="w", pady=(0, 6))
+            self.link(self, f"🔗  Download & install Ollama  —  {_OLLAMA_DOWNLOAD_URL}",
+                      _OLLAMA_DOWNLOAD_URL).pack(anchor="w", pady=(0, 10))
             self.labeled_entry(self, "Ollama API URL", ollama_var,
                                hint="Default: http://localhost:11434/v1")
             tk.Label(self,

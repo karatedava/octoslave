@@ -1,17 +1,23 @@
 """Core agent loop for octoslave."""
 
 import json
+import os
 import re
+import threading
 from datetime import date, date as _date_cls
 from pathlib import Path
-from openai import OpenAI, BadRequestError
+from openai import (
+    OpenAI,
+    BadRequestError,
+    APIConnectionError,
+    APITimeoutError,
+    APIStatusError,
+)
 
 from . import display
 from . import logger
-from .tools import TOOL_DEFINITIONS, execute_tool
+from .tools import TOOL_DEFINITIONS, execute_tool, all_tool_definitions, valid_tool_names
 from .config import load_config, OLLAMA_BASE_URL
-
-_VALID_TOOL_NAMES = {td["function"]["name"] for td in TOOL_DEFINITIONS}
 
 
 def _extract_text_tool_calls(content: str) -> tuple[list[dict], str]:
@@ -32,6 +38,7 @@ def _extract_text_tool_calls(content: str) -> tuple[list[dict], str]:
     calls: list[dict] = []
     call_idx = 0
     first_call_start: int | None = None  # position in original content
+    _valid_names = valid_tool_names()  # built-in + MCP (recomputed each call)
 
     # Build a mapping from positions in stripped → original content.
     # Simple approach: track fence spans and map stripped indices back.
@@ -106,12 +113,12 @@ def _extract_text_tool_calls(content: str) -> tuple[list[dict], str]:
             if isinstance(obj, dict):
                 name = obj.get("name") or obj.get("function", {}).get("name", "")
                 args = obj.get("arguments") or obj.get("parameters") or {}
-                if name in _VALID_TOOL_NAMES and isinstance(args, dict):
+                if name in _valid_names and isinstance(args, dict):
                     calls.append(_make_call(name, args))
                     matched = True
             elif isinstance(obj, list) and len(obj) >= 2:
                 name, args = obj[0], obj[1]
-                if isinstance(name, str) and name in _VALID_TOOL_NAMES and isinstance(args, dict):
+                if isinstance(name, str) and name in _valid_names and isinstance(args, dict):
                     calls.append(_make_call(name, args))
                     matched = True
         except (json.JSONDecodeError, AttributeError, TypeError):
@@ -137,7 +144,58 @@ def _extract_text_tool_calls(content: str) -> tuple[list[dict], str]:
 
     return calls, truncated
 
+
+def _looks_like_tool_attempt(content: str, valid_names) -> bool:
+    """True if a text-only response looks like a *failed* attempt to call a tool
+    rather than a genuine "I'm done" message.
+
+    Some endpoints (e.g. e-INFRA's gemma4) emit tool calls as broken custom text
+    like ``<|tool_call>call:list_dir{path:<|"|>results/<|"|>}<tool_call|>`` that is
+    neither the structured function-calling protocol nor valid JSON, so
+    ``_extract_text_tool_calls`` cannot parse it. Such a turn must NOT be counted
+    toward the "model declared done" text-only total — the model is trying to act,
+    not finishing — otherwise three of them trigger a false completion."""
+    if not content:
+        return False
+    low = content.lower()
+    # Generic tool-call framing markers various templates emit.
+    if "tool_call" in low or "tool▁call" in low or "<tool" in low:
+        return True
+    if '"name"' in low and ('"arguments"' in low or '"parameters"' in low):
+        return True
+    # A real tool name used in a call-ish position: call:NAME / NAME( / NAME{ .
+    for n in valid_names:
+        nl = n.lower()
+        if f"call:{nl}" in low or f"{nl}(" in low or f"{nl}{{" in low:
+            return True
+    return False
+
+
 MAX_ITERATIONS = 100
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    """True if the exception looks like a transient upstream gateway hiccup that
+    we should retry rather than abort on.
+
+    Covers connection drops mid-stream (``APIConnectionError`` →
+    "peer closed connection without sending complete message body",
+    "incomplete chunked read", "connection reset"), request timeouts, and
+    gateway 502/503/504s. e-INFRA / NIM endpoints throw these on long-TTFT
+    calls when a model "thinks" for tens of seconds before the first token."""
+    if isinstance(exc, (APIConnectionError, APITimeoutError)):
+        return True
+    if isinstance(exc, APIStatusError):
+        return exc.status_code in (502, 503, 504)
+    s = str(exc).lower()
+    return (
+        "peer closed connection" in s
+        or "incomplete chunked read" in s
+        or "connection reset" in s
+        or "connection error" in s
+        or "server disconnected" in s
+    )
+
 
 # Hard cap on characters in a single tool result that goes into the message history.
 # Prevents a single large file/page from blowing up the context window.
@@ -145,11 +203,128 @@ MAX_TOOL_RESULT_CHARS = 50_000
 
 # Ollama allocates a KV cache sized to num_ctx at load time. Without this hint it
 # uses the model's full trained context length, which drains GPU memory even for
-# short conversations. 8192 is a generous interactive budget; raise if you need more.
+# short conversations. This is only a *fallback* — at run time we auto-size from
+# the model's advertised context_length (see _resolve_ollama_num_ctx), capped to
+# keep the KV cache RAM-reasonable. Override the cap with
+# OCTOSLAVE_OLLAMA_NUM_CTX_MAX, or force an exact value with OCTOSLAVE_OLLAMA_NUM_CTX.
 OLLAMA_NUM_CTX = 8192
+# Upper bound on auto-sized local context (KV-cache RAM guard). gemma4:12b et al.
+# advertise 131072 — we don't want to allocate that much KV cache by default.
+_OLLAMA_NUM_CTX_MAX = int(os.environ.get("OCTOSLAVE_OLLAMA_NUM_CTX_MAX", "32768"))
+
+# Proactive context-budget. The agent estimates total tokens via chars/4 and
+# compacts message history BEFORE sending when this threshold is exceeded —
+# instead of waiting for the API to return a 400. Default ~96K tokens fits a
+# Kimi K2 / 128K-window safely. Override with OCTOSLAVE_SOFT_CONTEXT_TOKENS.
+# For local Ollama models this is overridden at run time to track the (much
+# smaller) real window — see configure_runtime / _RT.
+_SOFT_CONTEXT_BUDGET = int(os.environ.get("OCTOSLAVE_SOFT_CONTEXT_TOKENS", "96000"))
 
 # Path to prompt profiles directory
 PROMPT_PROFILES_DIR = Path(__file__).parent / "prompt_profiles"
+
+# Per-thread runtime knobs, set once per run by configure_runtime() based on the
+# backend. Lets the context/tool helpers adapt to small local models WITHOUT
+# threading params through every call site, and WITHOUT touching the big-model
+# (e-INFRA / NIM / custom) path. threading.local() keeps parallel runs isolated
+# (mirrors display.py's _streaming_started pattern).
+_RT = threading.local()
+
+
+def _rt(attr: str, default):
+    return getattr(_RT, attr, default)
+
+
+# model → {"num_ctx": int, "thinking": bool}, populated from /api/show
+_OLLAMA_INFO_CACHE: dict[str, dict] = {}
+
+
+def _is_ollama_client(client) -> bool:
+    try:
+        return OLLAMA_BASE_URL.rstrip("/").rsplit("/v1", 1)[0] in str(client.base_url)
+    except Exception:
+        return False
+
+
+def _ollama_model_info(client, model: str) -> dict:
+    """Probe /api/show once per model: advertised context_length (capped to
+    _OLLAMA_NUM_CTX_MAX; OCTOSLAVE_OLLAMA_NUM_CTX forces an exact value) and
+    whether the model has the 'thinking' capability. Cached; safe on any error."""
+    if model in _OLLAMA_INFO_CACHE:
+        return _OLLAMA_INFO_CACHE[model]
+    info = {"num_ctx": OLLAMA_NUM_CTX, "thinking": False}
+    try:
+        import urllib.request
+        base = str(client.base_url).rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        req = urllib.request.Request(
+            f"{base}/api/show",
+            data=json.dumps({"name": model}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.load(resp)
+        mi = data.get("model_info", {})
+        ctx = next((v for k, v in mi.items()
+                    if k.endswith("context_length") and isinstance(v, int)), None)
+        if ctx and ctx > 0:
+            info["num_ctx"] = min(ctx, _OLLAMA_NUM_CTX_MAX)
+        info["thinking"] = "thinking" in (data.get("capabilities") or [])
+    except Exception:
+        pass
+    forced = os.environ.get("OCTOSLAVE_OLLAMA_NUM_CTX")
+    if forced and forced.isdigit():
+        info["num_ctx"] = int(forced)
+    _OLLAMA_INFO_CACHE[model] = info
+    return info
+
+
+def _ollama_extra_body() -> dict:
+    """Ollama-specific request knobs (passed via the SDK's extra_body).
+
+    - num_ctx: KV-cache size hint (honored by GGUF/llama.cpp models; ignored by
+      the MLX runner, which always uses the model's full window — harmless).
+    - think: thinking models (e.g. gemma3/gemma4, nemotron) reason internally
+      before each turn. Kept ON by default so local models run at full power; the
+      reasoning is streamed to the display (see stream_reason) so a long thinking
+      turn shows visible progress instead of looking hung. Set
+      OCTOSLAVE_OLLAMA_THINK=0 to disable thinking for much faster tool calls."""
+    body: dict = {"options": {"num_ctx": _rt("num_ctx", None) or OLLAMA_NUM_CTX}}
+    # Only touch `think` for models that actually support it (passing it to a
+    # non-thinking model can be rejected by Ollama). Default: leave thinking on;
+    # only send think:false when the user explicitly opts out for speed.
+    think_env = os.environ.get("OCTOSLAVE_OLLAMA_THINK")
+    if _rt("ollama_thinking", False) and think_env is not None \
+            and think_env.lower() in ("0", "false", "no", "off"):
+        body["think"] = False
+    return body
+
+
+def configure_runtime(client, model: str, prompt_profile: str) -> bool:
+    """Set per-thread runtime knobs based on the backend. Returns True for local
+    (Ollama) runs. For local: auto-size num_ctx, then derive a soft trim budget
+    (75% of the real window, so the proactive trimmer fires BEFORE Ollama
+    silently truncates) and a per-tool-result cap (~1/3 of the window, so one
+    big read can't overflow). For everything else: keep the defaults verbatim."""
+    if _is_ollama_client(client):
+        meta = _ollama_model_info(client, model)
+        num_ctx = meta["num_ctx"]
+        _RT.num_ctx = num_ctx
+        _RT.soft_budget = max(2048, int(num_ctx * 0.75))
+        _RT.tool_result_chars = max(4000, num_ctx * 4 // 3)  # ~1/3 window, tokens→chars
+        _RT.ollama_thinking = meta["thinking"]
+        # Curate the tool surface for ANY local run, regardless of the prompt
+        # profile name — the auto-"local" switch lives in a config dict that may
+        # not reach this function, so we key off the backend, not the name.
+        _RT.tool_profile = "local"
+        return True
+    _RT.num_ctx = None
+    _RT.soft_budget = _SOFT_CONTEXT_BUDGET
+    _RT.tool_result_chars = MAX_TOOL_RESULT_CHARS
+    _RT.ollama_thinking = False
+    _RT.tool_profile = None
+    return False
 
 
 def list_prompt_profiles() -> list[str]:
@@ -160,85 +335,244 @@ def list_prompt_profiles() -> list[str]:
 
 # ---------------------------------------------------------------------------
 # Cross-session memory
+#
+# One file, two kinds of entry:
+#   • "session" — task outcomes recorded automatically at the end of a run
+#                 (date / task / status / note).
+#   • "insight" — facts the agent itself decided are worth keeping, written
+#                 through the `remember` tool (date / kind:insight / tags / text).
+#
+# Recall is relevance-ranked against the current task rather than "dump the
+# last N", so we can retain a larger pool without bloating the prompt — only
+# the top lexical matches (plus a recency fallback) are injected.
 # ---------------------------------------------------------------------------
 
 MEMORY_FILE = Path.home() / ".octoslave" / "session_memory.md"
-_MEMORY_MAX_ENTRIES = 10
+_SESSION_MAX_ENTRIES = 40   # session outcomes retained on disk
+_INSIGHT_MAX_ENTRIES = 60   # agent-authored insights retained on disk
+_RECALL_SESSIONS = 4        # session entries injected into a prompt
+_RECALL_INSIGHTS = 6        # insight entries injected into a prompt
+
+_MEMORY_STOPWORDS = frozenset(
+    "the a an and or but for to of in on at by with from into is are was were be "
+    "this that these those it its as do does did how what when where why which who "
+    "use used using make made get got run ran add added fix fixed via your you we "
+    "can will should would could not now then code file files task please help".split()
+)
 
 
-def load_session_memory() -> str:
-    """
-    Return a formatted summary of the last 3 sessions for context injection.
-    Returns empty string if no memory exists or on any read error.
-    """
+def _mem_tokenize(text: str) -> set[str]:
+    """Lowercase alphanumeric tokens (len >= 3) minus common stopwords. A cheap
+    lexical fingerprint — good enough to rank relevance without embeddings or
+    tiktoken, consistent with how _estimated_tokens approximates token counts."""
+    toks = re.findall(r"[a-z0-9_]{3,}", (text or "").lower())
+    return {t for t in toks if t not in _MEMORY_STOPWORDS}
+
+
+def _entry_match_text(e: dict) -> str:
+    """The text of an entry used for relevance scoring."""
+    if e.get("kind") == "insight":
+        return f"{e.get('tags', '')} {e.get('text', '')}"
+    return f"{e.get('task', '')} {e.get('note', '')}"
+
+
+def _mem_relevance(query_tokens: set[str], entry: dict) -> float:
+    """Token overlap of the query with an entry, penalised by entry length so a
+    long entry can't win purely by containing more words. 0.0 with no query."""
+    if not query_tokens:
+        return 0.0
+    et = _mem_tokenize(_entry_match_text(entry))
+    if not et:
+        return 0.0
+    overlap = len(query_tokens & et)
+    if overlap == 0:
+        return 0.0
+    return overlap / (len(et) ** 0.5 + 1.0)
+
+
+def _parse_memory_entries() -> list[dict]:
+    """Parse the memory file into a chronological list of entry dicts. Each has
+    a 'kind' of 'session' or 'insight'. Tolerant of missing fields and of older
+    files that predate the insight format. Never raises."""
     if not MEMORY_FILE.exists():
-        return ""
+        return []
     try:
         text = MEMORY_FILE.read_text(encoding="utf-8")
-        # Parse --- delimited blocks
-        entries: list[dict] = []
-        for block in text.split("---"):
-            block = block.strip()
-            if not block or block.startswith("#"):
+    except OSError:
+        return []
+    entries: list[dict] = []
+    for block in text.split("---"):
+        block = block.strip()
+        if not block or block.startswith("#"):
+            continue
+        parsed: dict = {}
+        body_lines: list[str] = []
+        in_text = False
+        for line in block.splitlines():
+            if in_text:
+                body_lines.append(line)
                 continue
-            parsed: dict = {}
-            for line in block.splitlines():
-                if ":" in line:
-                    k, _, v = line.partition(":")
-                    parsed[k.strip()] = v.strip()
-            if parsed.get("task"):
+            if ":" in line:
+                k, _, v = line.partition(":")
+                k = k.strip().lower()
+                v = v.strip()
+                if k == "text":
+                    in_text = True
+                    if v:
+                        body_lines.append(v)
+                else:
+                    parsed[k] = v
+        if body_lines:
+            parsed["text"] = "\n".join(body_lines).strip()
+        # Classify. An explicit kind wins; otherwise a `text` body with no
+        # `task` is an insight, and anything with a `task` is a session entry.
+        if parsed.get("kind") == "insight" or ("text" in parsed and "task" not in parsed):
+            if parsed.get("text"):
+                parsed["kind"] = "insight"
                 entries.append(parsed)
+        elif parsed.get("task"):
+            parsed["kind"] = "session"
+            entries.append(parsed)
+    return entries
 
-        recent = entries[-3:] if len(entries) > 3 else entries
-        if not recent:
+
+def _select_memory(pool: list[dict], query_tokens: set[str], k: int) -> list[dict]:
+    """Pick up to k entries from pool. With a query, return the highest-scoring
+    matches (most relevant first); with no query or no lexical hit, fall back to
+    the k most recent (chronological order)."""
+    if not pool:
+        return []
+    if query_tokens:
+        scored = [(_mem_relevance(query_tokens, e), i, e) for i, e in enumerate(pool)]
+        hits = sorted((s for s in scored if s[0] > 0.0),
+                      key=lambda s: (s[0], s[1]), reverse=True)
+        if hits:
+            return [e for _, _, e in hits[:k]]
+    return pool[-k:]
+
+
+def load_session_memory(query: str | None = None) -> str:
+    """
+    Return a formatted block of relevant prior context for system-prompt
+    injection. When `query` (the current task) is given, entries are ranked by
+    lexical relevance to it; otherwise the most recent entries are used.
+    Returns empty string when there is nothing to recall.
+    """
+    try:
+        entries = _parse_memory_entries()
+        if not entries:
+            return ""
+        insights = [e for e in entries if e["kind"] == "insight"]
+        sessions = [e for e in entries if e["kind"] == "session"]
+
+        qtok = _mem_tokenize(query) if query else set()
+        sel_ins = _select_memory(insights, qtok, _RECALL_INSIGHTS)
+        sel_ses = _select_memory(sessions, qtok, _RECALL_SESSIONS)
+        if not sel_ins and not sel_ses:
             return ""
 
-        parts = ["[PRIOR SESSIONS — for context only, do not repeat completed work]"]
-        for e in reversed(recent):
-            d = e.get("date", "?")
-            task = e.get("task", "?")
-            status = e.get("status", "?")
-            note = e.get("note", "")
-            line = f"  {d}: {task} — {status}"
-            if note:
-                line += f" ({note[:100]})"
-            parts.append(line)
+        parts = ["[MEMORY — relevant prior context; do not repeat completed work]"]
+        if sel_ins:
+            parts.append("\nThings you chose to remember:")
+            for e in sel_ins:
+                tags = e.get("tags", "").strip()
+                suffix = f"  [{tags}]" if tags else ""
+                parts.append(f"  • {e.get('text', '').strip()}{suffix}")
+        if sel_ses:
+            parts.append("\nPrior sessions:")
+            for e in sel_ses:
+                d = e.get("date", "?")
+                task = e.get("task", "?")
+                status = e.get("status", "?")
+                note = e.get("note", "")
+                line = f"  {d}: {task} — {status}"
+                if note:
+                    line += f" ({note[:100]})"
+                parts.append(line)
         return "\n".join(parts)
     except Exception:
         return ""
 
 
-def save_session_memory(task: str, status: str = "completed", note: str = "") -> None:
-    """Append one session entry to the memory file, trimming to _MEMORY_MAX_ENTRIES."""
-    MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    entry_lines = [
+def _serialize_memory_entry(e: dict) -> str:
+    """Render one entry as a `---`-delimited block matching the parser."""
+    if e.get("kind") == "insight":
+        out = ["---", f"date: {e.get('date', '')}", "kind: insight"]
+        if e.get("tags"):
+            out.append(f"tags: {e['tags']}")
+        out.append(f"text: {e.get('text', '')}")
+        out.append("")
+        return "\n".join(out)
+    return "\n".join([
         "---",
-        f"date: {_date_cls.today().isoformat()}",
-        f"task: {task[:200].replace(chr(10), ' ')}",
-        f"status: {status}",
-        f"note: {note[:300].replace(chr(10), ' ')}",
+        f"date: {e.get('date', '')}",
+        f"task: {e.get('task', '')}",
+        f"status: {e.get('status', '')}",
+        f"note: {e.get('note', '')}",
         "",
-    ]
-    entry = "\n".join(entry_lines)
+    ])
 
-    existing = ""
-    if MEMORY_FILE.exists():
-        try:
-            existing = MEMORY_FILE.read_text(encoding="utf-8")
-        except Exception:
-            existing = ""
 
-    # Trim to max entries
-    blocks = [b for b in existing.split("---") if b.strip() and not b.strip().startswith("#")]
-    if len(blocks) >= _MEMORY_MAX_ENTRIES:
-        blocks = blocks[-(  _MEMORY_MAX_ENTRIES - 1):]
-        existing = "# OctoSlave Session Memory\n\n" + "---".join([""] + blocks)
+def _write_memory(entries: list[dict]) -> None:
+    """Trim each kind to its cap (keeping the most recent) and rewrite the file
+    in chronological order. Rewriting wholesale keeps per-kind trimming correct
+    — insights are never evicted to make room for session outcomes."""
+    sessions = [e for e in entries if e.get("kind") == "session"][-_SESSION_MAX_ENTRIES:]
+    insights = [e for e in entries if e.get("kind") == "insight"][-_INSIGHT_MAX_ENTRIES:]
+    keep = {id(e) for e in sessions} | {id(e) for e in insights}
+    ordered = [e for e in entries if id(e) in keep]
 
-    if not existing.strip():
-        existing = "# OctoSlave Session Memory\n"
+    MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    body = "\n".join(_serialize_memory_entry(e) for e in ordered)
+    MEMORY_FILE.write_text(
+        "# OctoSlave Session Memory\n\n" + body + ("\n" if body else ""),
+        encoding="utf-8",
+    )
 
-    with open(MEMORY_FILE, "a", encoding="utf-8") as f:
-        f.write("\n" + entry)
+
+def save_session_memory(task: str, status: str = "completed", note: str = "") -> None:
+    """Record one task-outcome entry, trimming session history to its cap."""
+    try:
+        entries = _parse_memory_entries()
+        entries.append({
+            "kind": "session",
+            "date": _date_cls.today().isoformat(),
+            "task": task[:200].replace(chr(10), " "),
+            "status": status,
+            "note": note[:300].replace(chr(10), " "),
+        })
+        _write_memory(entries)
+    except Exception:
+        pass
+
+
+def save_memory_insight(content: str, tags=None) -> bool:
+    """Persist an agent-authored insight (the `remember` tool). Returns True on
+    success. Multi-line content is allowed; a lone `---` line is defused so it
+    can't be mistaken for a block separator on the next read."""
+    content = (content or "").strip()
+    if not content:
+        return False
+    content = content.replace("\r", "")
+    content = re.sub(r"(?m)^---\s*$", "- - -", content)[:1000]
+    if isinstance(tags, str):
+        tag_str = tags.strip()
+    elif tags:
+        tag_str = ", ".join(str(t).strip() for t in tags if str(t).strip())
+    else:
+        tag_str = ""
+    try:
+        entries = _parse_memory_entries()
+        entries.append({
+            "kind": "insight",
+            "date": _date_cls.today().isoformat(),
+            "tags": tag_str[:120],
+            "text": content,
+        })
+        _write_memory(entries)
+        return True
+    except Exception:
+        return False
 
 
 def load_system_prompt(profile: str = "base", working_dir: str = None) -> str:
@@ -283,7 +617,122 @@ def load_system_prompt(profile: str = "base", working_dir: str = None) -> str:
     return content.format(working_dir=wd, date=date.today().isoformat())
 
 
-def _compact_and_trim(messages: list[dict], groups: int = 3) -> list[dict]:
+# Substrings that, when present in a provider error string, mean "you sent too
+# many tokens." Different providers phrase this very differently — Kimi via
+# e-INFRA, OpenAI, vLLM, NIM, and Ollama all use distinct wording. This list
+# is intentionally broad; false-positive trims are cheap, false-negative
+# break-the-loop errors are not.
+_CONTEXT_OVERFLOW_NEEDLES = (
+    "contextwindow",          # OpenAI: ContextWindowExceeded
+    "context window",         # human prose
+    "context length",         # vLLM / many OSS hosts
+    "context_length_exceeded",
+    "maximum context",        # OpenAI legacy
+    "max_tokens",             # some providers conflate
+    "max tokens",
+    "max_position_embeddings",
+    "max_seq_len",
+    "maximum_seq_length",
+    "prompt is too long",     # Anthropic-style
+    "input is too long",
+    "input too long",
+    "request too large",      # 413 prose
+    "payload too large",      # 413 prose
+    "too many tokens",
+    "token limit",
+    "exceeds the limit",
+    "exceeds the maximum",
+    "tokens in the messages",
+    "string too long",        # some proxies
+)
+
+
+def _is_context_window_error(err_str: str) -> bool:
+    """True if the error string looks like a context-window / too-many-tokens
+    rejection from any supported provider. Lowercased substring match —
+    intentionally broad."""
+    if not err_str:
+        return False
+    s = err_str.lower()
+    if any(needle in s for needle in _CONTEXT_OVERFLOW_NEEDLES):
+        return True
+    # HTTP 413 = payload too large; some hosts surface it bare.
+    if "413" in s and ("payload" in s or "request" in s or "too large" in s):
+        return True
+    return False
+
+
+def _estimated_tokens(messages: list[dict]) -> int:
+    """Fast char/4 token estimate over a message list. Good enough to decide
+    whether to compact proactively — actual tokenisation is provider-specific
+    and not worth importing tiktoken for a soft-budget decision."""
+    total = 0
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            # vision-style multimodal content blocks
+            for block in content:
+                if isinstance(block, dict):
+                    total += len(json.dumps(block, ensure_ascii=False))
+        tcs = m.get("tool_calls") or []
+        for tc in tcs:
+            try:
+                total += len(tc.get("function", {}).get("name", ""))
+                total += len(tc.get("function", {}).get("arguments", "") or "")
+            except Exception:
+                pass
+        # tiny per-message envelope overhead
+        total += 16
+    return total // 4
+
+
+def _proactive_trim(
+    messages: list[dict],
+    soft_budget: int | None = None,
+    label: str = "",
+) -> list[dict]:
+    """If estimated tokens > soft_budget, compact in a loop until under budget
+    or no more groups can be compacted. Returns the trimmed list (or original
+    if no trim was needed / possible). Logs each round it actually trimmed.
+
+    soft_budget defaults to the per-thread runtime budget (small for local
+    Ollama models, _SOFT_CONTEXT_BUDGET for everything else)."""
+    if soft_budget is None:
+        soft_budget = _rt("soft_budget", _SOFT_CONTEXT_BUDGET)
+    est = _estimated_tokens(messages)
+    if est <= soft_budget:
+        return messages
+    rounds = 0
+    while est > soft_budget:
+        trimmed = _compact_and_trim(messages, groups=6)
+        if len(trimmed) >= len(messages):
+            # Nothing left to compact — surrender to the API and let the
+            # reactive branch handle the hard failure.
+            break
+        messages = trimmed
+        rounds += 1
+        est = _estimated_tokens(messages)
+        if rounds >= 5:
+            # Safety: don't loop forever even if compaction keeps "working"
+            # with diminishing returns.
+            break
+    if rounds > 0:
+        tag = f"[{label}] " if label else ""
+        msg = (
+            f"{tag}Proactive context trim: {rounds} pass(es), "
+            f"~{est:,} tokens remaining (soft budget {soft_budget:,})."
+        )
+        display.print_info(msg)
+        try:
+            logger.log_info(msg, rounds=rounds, est_tokens=est, soft_budget=soft_budget)
+        except Exception:
+            pass
+    return messages
+
+
+def _compact_and_trim(messages: list[dict], groups: int = 6) -> list[dict]:
     """
     Replace the oldest N complete assistant-turn groups with a compact text
     summary instead of silently discarding them.  Preserves messages[:2]
@@ -317,12 +766,17 @@ def _compact_and_trim(messages: list[dict], groups: int = 3) -> list[dict]:
         return messages
 
     # Build a compact text log of the removed turns so information isn't lost.
+    # Keep enough content that the model can still recall what it learned —
+    # earlier versions of this summary lost too much (150 chars / 120 chars)
+    # and the model would re-run the same searches after a compaction.
     lines = [f"[COMPACTED HISTORY — {removed} earlier turn(s) summarised to save context]"]
     for msg in turns_to_compact:
         if msg.get("role") == "assistant":
             txt = (msg.get("content") or "").strip()
             if txt:
-                lines.append(f"  [note: {txt[:150]}]")
+                # 400 chars is enough to keep a short rationale / partial result
+                snippet = txt if len(txt) <= 400 else txt[:400] + "…"
+                lines.append(f"  [note: {snippet}]")
             for tc in msg.get("tool_calls") or []:
                 name = tc["function"]["name"]
                 try:
@@ -330,19 +784,32 @@ def _compact_and_trim(messages: list[dict], groups: int = 3) -> list[dict]:
                     label = (
                         args.get("path") or args.get("file_path") or
                         args.get("command") or args.get("query") or
-                        args.get("pattern") or json.dumps(args)[:50]
+                        args.get("pattern") or args.get("url") or
+                        json.dumps(args)[:60]
                     )
                     label = str(label)
-                    if len(label) > 70:
-                        label = label[:70] + "…"
+                    if len(label) > 90:
+                        label = label[:90] + "…"
                     lines.append(f"  called: {name}({label})")
                 except Exception:
                     lines.append(f"  called: {name}(...)")
         elif msg.get("role") == "tool":
             content = (msg.get("content") or "").strip()
-            if content:
-                first_line = content.splitlines()[0][:120]
-                lines.append(f"    → {first_line}")
+            if not content:
+                continue
+            # Keep the first ~3 lines (often the headline / summary) AND the
+            # last ~3 non-empty lines (often the error / exit code / final
+            # result) — same head-plus-tail strategy as the bash truncator,
+            # because errors and result keys tend to live at the end.
+            content_lines = [ln for ln in content.splitlines() if ln.strip()]
+            head_lines = content_lines[:3]
+            tail_lines = content_lines[-3:] if len(content_lines) > 6 else []
+            head = " | ".join(ln.strip()[:160] for ln in head_lines)
+            if head:
+                lines.append(f"    → {head[:480]}")
+            if tail_lines:
+                tail = " | ".join(ln.strip()[:160] for ln in tail_lines)
+                lines.append(f"    ⚠ {tail[:480]}")
 
     summary_msg = {"role": "user", "content": "\n".join(lines)}
     return system + [summary_msg] + remaining
@@ -360,11 +827,16 @@ def make_client(api_key: str, base_url: str) -> OpenAI:
 
 
 def _cap_result(result: str, tool_name: str) -> str:
-    """Truncate oversized tool results before they enter the message history."""
-    if len(result) <= MAX_TOOL_RESULT_CHARS:
+    """Truncate oversized tool results before they enter the message history.
+
+    The cap is the per-thread runtime value — much smaller for local Ollama
+    models (~1/3 of their real window) so a single big read can't overflow the
+    context; MAX_TOOL_RESULT_CHARS for everything else."""
+    cap = _rt("tool_result_chars", MAX_TOOL_RESULT_CHARS)
+    if len(result) <= cap:
         return result
-    kept = result[:MAX_TOOL_RESULT_CHARS]
-    omitted = len(result) - MAX_TOOL_RESULT_CHARS
+    kept = result[:cap]
+    omitted = len(result) - cap
     return (
         kept
         + f"\n\n[TRUNCATED — {omitted:,} more characters omitted. "
@@ -374,10 +846,12 @@ def _cap_result(result: str, tool_name: str) -> str:
 
 def _simple_completion(client: OpenAI, model: str, messages: list, max_tokens: int = 600) -> str:
     """Non-streaming completion without tools — used for planning and verification."""
+    extra = {"extra_body": _ollama_extra_body()} if _is_ollama_client(client) else {}
     try:
         resp = client.chat.completions.create(
             model=model,
             messages=messages,
+            **extra,
             max_tokens=max_tokens,
             timeout=120.0,
         )
@@ -454,13 +928,13 @@ def _stream_completion(client: OpenAI, model: str, messages: list, force_tool: b
 
     display.stream_start()
 
-    is_ollama = OLLAMA_BASE_URL.rstrip("/") in str(client.base_url).rstrip("/")
-    extra = {"extra_body": {"options": {"num_ctx": OLLAMA_NUM_CTX}}} if is_ollama else {}
+    is_ollama = _is_ollama_client(client)
+    extra = {"extra_body": _ollama_extra_body()} if is_ollama else {}
 
     with client.chat.completions.create(
         model=model,
         messages=messages,
-        tools=TOOL_DEFINITIONS,
+        tools=all_tool_definitions(profile=_rt("tool_profile", None)),
         tool_choice="required" if force_tool else "auto",
         stream=True,
         **extra,
@@ -470,6 +944,13 @@ def _stream_completion(client: OpenAI, model: str, messages: list, force_tool: b
                 continue
             choice = chunk.choices[0]
             delta = choice.delta
+
+            # Thinking models (Ollama) stream their reasoning in a separate delta
+            # field before any content/tool call. Surface it so a long thinking
+            # turn shows visible progress instead of a frozen "waiting" spinner.
+            reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+            if reasoning:
+                display.stream_reason(reasoning)
 
             if delta.content:
                 content_parts.append(delta.content)
@@ -528,11 +1009,30 @@ def run_agent(
         cfg = load_config()
         permission_mode = cfg.get("permission_mode", "autonomous")
 
+    # Connect any user-configured MCP servers (idempotent across calls).
+    from .tools import init_mcp
+    init_mcp()
+
+    # Adapt context/tool knobs to the backend (small-model accommodations for
+    # local Ollama; no-op for e-INFRA / NIM / custom).
+    is_local = configure_runtime(client, model, prompt_profile)
+    if is_local:
+        think_note = ""
+        if _rt("ollama_thinking", False):
+            think_env = (os.environ.get("OCTOSLAVE_OLLAMA_THINK") or "").lower()
+            think_off = think_env in ("0", "false", "no", "off")
+            think_note = f", thinking {'off' if think_off else 'on'}"
+        display.print_info(
+            f"Local model: context window {_rt('num_ctx', OLLAMA_NUM_CTX):,} tokens, "
+            f"{len(all_tool_definitions(profile=_rt('tool_profile', None)))} tools{think_note}."
+        )
+
     system_prompt = load_system_prompt(prompt_profile, working_dir)
 
-    # Inject session memory into system prompt when available
+    # Inject session memory into system prompt when available, ranked by
+    # relevance to the current task.
     if enable_memory:
-        memory_ctx = load_session_memory()
+        memory_ctx = load_session_memory(query=task)
         if memory_ctx:
             system_prompt = system_prompt + f"\n\n{memory_ctx}"
 
@@ -553,12 +1053,17 @@ def run_agent(
         {"role": "user", "content": task},
     ]
 
-    # Upfront planning pass
-    if enable_plan:
+    # Upfront planning pass. Skipped for local models: the dedicated non-streaming
+    # planning call adds a long blind stall (model load + up to 120s) and spends
+    # ~900 tokens of an already-tiny context window on a plan small models follow
+    # poorly. They plan inline in the main loop instead.
+    if enable_plan and not is_local:
         messages, plan_text = _planning_step(task, system_prompt, client, model, messages)
         if plan_text and plan_out is not None:
             plan_out.append(plan_text)
             logger.log_plan(plan_text)
+    elif enable_plan and is_local:
+        display.print_info("Local model: skipping separate planning step (plans inline).")
 
     # Main agent loop
     messages = _agent_loop(messages, model, working_dir, client, permission_mode)
@@ -587,7 +1092,15 @@ def continue_agent(
     if permission_mode is None:
         cfg = load_config()
         permission_mode = cfg.get("permission_mode", "autonomous")
-    
+
+    from .tools import init_mcp
+    init_mcp()
+
+    # Re-apply backend-adaptive knobs (per-thread state may be stale/unset on a
+    # fresh follow-up turn or a different thread).
+    prompt_profile = "local" if _is_ollama_client(client) else "base"
+    configure_runtime(client, model, prompt_profile)
+
     messages.append({"role": "user", "content": follow_up})
     return _agent_loop(messages, model, working_dir, client, permission_mode)
 
@@ -604,9 +1117,12 @@ def _agent_loop(
     iteration = 0
     _rate_limit_retries = 0
     _timeout_retries = 0
+    _conn_retries = 0  # transient connection-drop / gateway-5xx retries
+    _end_reason = "completed"  # how the loop terminated (for accurate session_end log)
     _tool_call_counts: Counter = Counter()  # (name, args_json) → call count
     _no_tool_nudges = 0  # consecutive text-only responses (resets on tool use)
     _text_only_total = 0  # total text-only responses across the whole run
+    _botched_attempts = 0  # consecutive unparseable text-format tool-call attempts
     _redundant_calls = 0  # total tool calls whose (name, args) had been seen before
     _consecutive_error_turns = 0  # turns in a row where at least one tool failed
 
@@ -617,20 +1133,29 @@ def _agent_loop(
         # so a model that has finished can naturally return a text-only "done"
         # response instead of being pushed into redundant verification calls.
         _force = iteration == 1
+        # Proactive: compact BEFORE sending if we're already over the soft
+        # budget. Catches provider error-string mismatches and saves a wasted
+        # round-trip on hosts that 400 without a parseable error message.
+        messages = _proactive_trim(messages)
         try:
             response = _stream_completion(client, model, messages, force_tool=_force)
             _rate_limit_retries = 0
             _timeout_retries = 0
+            _conn_retries = 0
         except BadRequestError as e:
             err_str = str(e)
             logger.log_error(f"BadRequestError on turn {iteration}", exc=e)
-            if "ContextWindowExceeded" in err_str or "context" in err_str.lower():
-                compacted = _compact_and_trim(messages)
+            if _is_context_window_error(err_str):
+                compacted = _compact_and_trim(messages, groups=10)
                 if len(compacted) < len(messages):
                     display.print_info(
-                        "Context window exceeded — compacting oldest turns and retrying."
+                        f"Context window exceeded — compacted oldest turns "
+                        f"(~{_estimated_tokens(compacted):,} tokens left) and retrying."
                     )
-                    logger.log_info("Context window exceeded — compacted and retrying.")
+                    logger.log_info(
+                        "Context window exceeded — compacted and retrying.",
+                        est_tokens=_estimated_tokens(compacted),
+                    )
                     messages = compacted
                     iteration -= 1  # compaction doesn't consume a turn
                     continue
@@ -660,6 +1185,7 @@ def _agent_loop(
                 continue
             else:
                 display.print_error(f"API error: {e}")
+            _end_reason = "error"
             break
         except KeyboardInterrupt:
             display.stream_end(False)
@@ -674,6 +1200,7 @@ def _agent_loop(
                 display.print_info(f"Rate limit — waiting {wait}s ({_rate_limit_retries}/5).")
                 if _rate_limit_retries > 5:
                     display.print_error("Rate limit persists after 5 retries.")
+                    _end_reason = "error"
                     break
                 _time.sleep(wait)
                 iteration -= 1  # don't count this as a used iteration
@@ -684,6 +1211,24 @@ def _agent_loop(
                 display.print_info(f"Request timeout — retrying in {wait}s ({_timeout_retries}/3).")
                 if _timeout_retries > 3:
                     display.print_error("Request keeps timing out after 3 retries.")
+                    _end_reason = "error"
+                    break
+                _time.sleep(wait)
+                iteration -= 1
+                continue
+            elif _is_retryable_error(e):
+                # Transient connection drop ("peer closed connection without sending
+                # complete message body" / "incomplete chunked read") or gateway 5xx.
+                # These hit long-TTFT models mid-stream; a fresh retry usually works.
+                _conn_retries += 1
+                wait = min(30, 5 * (2 ** (_conn_retries - 1)))
+                logger.log_error(f"Connection error on turn {iteration}", exc=e)
+                display.print_info(
+                    f"Connection dropped — retrying in {wait}s ({_conn_retries}/4)."
+                )
+                if _conn_retries > 4:
+                    display.print_error("Connection keeps dropping after 4 retries.")
+                    _end_reason = "error"
                     break
                 _time.sleep(wait)
                 iteration -= 1
@@ -694,6 +1239,7 @@ def _agent_loop(
                     "Switch to a different model with [bold]/model <name>[/bold]  "
                     "or run [bold]/model[/bold] to list available models."
                 )
+                _end_reason = "error"
                 break
             elif "404" in err_str:
                 if "not found for account" in err_str.lower():
@@ -710,8 +1256,11 @@ def _agent_loop(
                         "Switch to a different model with [bold]/model <name>[/bold]  "
                         "or run [bold]/model[/bold] to list available models."
                     )
+                _end_reason = "error"
                 break
+            logger.log_error(f"Unexpected error on turn {iteration}", exc=e)
             display.print_error(f"Unexpected error: {e}")
+            _end_reason = "error"
             break
 
         content = response["content"]
@@ -743,6 +1292,39 @@ def _agent_loop(
         messages.append(assistant_msg)
 
         if not tool_calls:
+            # Distinguish a genuine "I'm done" text reply from a model that TRIED
+            # to call a tool but emitted an unparseable text format (e.g. gemma4's
+            # <|tool_call>call:NAME{…}<tool_call|>). The latter must not count as a
+            # finished-signal, or repeated formatting failures fake a completion.
+            if content and _looks_like_tool_attempt(content, valid_tool_names()):
+                _botched_attempts += 1
+                logger.log_info(
+                    "Unparseable text-format tool call — nudging for correct format.",
+                    iteration=iteration,
+                )
+                if _botched_attempts >= 4:
+                    display.print_error(
+                        "Model keeps emitting tool calls in an unsupported text format "
+                        "and cannot use the function-calling interface. Stopping."
+                    )
+                    _end_reason = "error"
+                    break
+                display.print_info(
+                    "Model emitted a malformed text tool call — asking it to use the "
+                    "proper format."
+                )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your last message looked like an attempt to call a tool, but it "
+                        "was not in a valid format, so nothing ran. Do NOT wrap tool calls "
+                        "in <tool_call> markers or any custom syntax. Call the tool through "
+                        "the function-calling interface directly. Retry the action now."
+                    ),
+                })
+                continue
+            # Genuine text-only reply: a real "done" or chit-chat.
+            _botched_attempts = 0
             _no_tool_nudges += 1
             _text_only_total += 1
             # If the model has declared "done" multiple times across the run
@@ -871,7 +1453,7 @@ def _agent_loop(
                 "(task likely complete)."
             )
             display.print_done(iteration)
-            logger.log_session_end(iteration, reason="redundant_calls")
+            _end_reason = "redundant_calls"
             break
 
         display.print_separator()
@@ -881,5 +1463,5 @@ def _agent_loop(
         logger.log_session_end(iteration, reason="max_iterations")
         return messages
 
-    logger.log_session_end(iteration, reason="completed")
+    logger.log_session_end(iteration, reason=_end_reason)
     return messages

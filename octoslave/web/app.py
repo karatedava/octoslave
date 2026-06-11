@@ -25,7 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from .. import display
-from ..display import resolve_permission
+from ..display import resolve_permission, resolve_user_response
 from ..agent import continue_agent, make_client, run_agent, list_prompt_profiles
 from ..parallel import run_parallel_agents
 from ..config import (
@@ -35,6 +35,7 @@ from ..config import (
     resolve_backend, list_providers,
     get_custom_providers, get_custom_provider,
     add_custom_provider, update_custom_provider, remove_custom_provider,
+    get_mcp_servers, add_mcp_server, remove_mcp_server, set_mcp_server_enabled,
 )
 from ..research import PIPELINE, run_long_research
 
@@ -62,6 +63,38 @@ _ALLOWED_EXT = {
     ".html", ".htm", ".md", ".txt", ".json", ".csv",
     ".png", ".jpg", ".jpeg", ".svg", ".gif", ".py", ".sh",
 }
+
+# ---------------------------------------------------------------------------
+# MCP helpers (shared by the websocket handlers)
+# ---------------------------------------------------------------------------
+
+def _reconnect_mcp() -> None:
+    """Force-reconnect all configured MCP servers. Runs in a worker thread
+    (subprocess launch + handshake can block, and npx may download on first run)."""
+    from ..mcp_client import manager
+    manager.init_from_config(load_config(), force=True)
+
+
+def _mcp_snapshot() -> dict:
+    """Merge configured servers with live connection status for the UI."""
+    from ..mcp_client import manager
+    live = {s["name"]: s for s in manager.status()}
+    servers = []
+    for s in get_mcp_servers():
+        nm = s["name"]
+        st = live.get(nm)
+        servers.append({
+            "name": nm,
+            "enabled": s.get("enabled", True),
+            "transport": "http" if s.get("url") else "stdio",
+            "target": s.get("url") or " ".join([s.get("command", ""), *s.get("args", [])]).strip(),
+            "connected": bool(st and st["connected"]),
+            "error": (st or {}).get("error"),
+            "tool_count": (st or {}).get("tool_count", 0),
+            "tools": (st or {}).get("tools", []),
+        })
+    return {"type": "mcp_servers", "servers": servers}
+
 
 # ---------------------------------------------------------------------------
 # Static routes
@@ -319,31 +352,6 @@ async def pick_directory():
     return {"path": path}
 
 
-@app.get("/api/files/list")
-async def list_files(working_dir: str = "."):
-    """Recursive list of research output files under working_dir/research/."""
-    root = Path(working_dir) / "research"
-    if not root.exists():
-        return {"items": [], "root": str(root), "exists": False}
-    items = []
-    try:
-        for p in sorted(root.rglob("*")):
-            if p.is_file() and p.suffix in _ALLOWED_EXT:
-                rel = str(p.relative_to(working_dir))
-                items.append({
-                    "path": rel,
-                    "abs": str(p),
-                    "name": p.name,
-                    "dir": str(p.parent.relative_to(working_dir)),
-                    "size": p.stat().st_size,
-                    "ext": p.suffix,
-                    "mtime": p.stat().st_mtime,
-                })
-    except Exception:
-        pass
-    return {"items": items, "root": str(root), "exists": True}
-
-
 @app.get("/api/files/view/{file_path:path}")
 async def view_file(file_path: str):
     """Serve a file for inline viewing in the browser."""
@@ -412,6 +420,8 @@ async def ws_endpoint(websocket: WebSocket):
                     msg = json.loads(raw)
                     if msg.get("type") == "permission_response":
                         resolve_permission(bool(msg.get("allow", False)))
+                    elif msg.get("type") == "user_response":
+                        resolve_user_response(str(msg.get("answer", "")))
                 except Exception:
                     break
 
@@ -688,6 +698,103 @@ async def ws_endpoint(websocket: WebSocket):
                         })
                 except Exception as exc:
                     await send({"type": "provider_test", "ok": False, "error": str(exc)})
+
+            # ---- MCP servers (wire in external tools) ----
+            elif mtype == "mcp_registry":
+                try:
+                    from .. import mcp_registry as _reg
+                    configured = {s["name"] for s in get_mcp_servers()}
+                    entries = []
+                    for e in _reg.list_entries():
+                        entries.append({
+                            "id": e["id"],
+                            "name": e["name"],
+                            "category": e.get("category", "Other"),
+                            "summary": e.get("summary", ""),
+                            "transport": e.get("transport", "stdio"),
+                            "runtime": e.get("runtime", "stdio"),
+                            "runtime_available": _reg.runtime_available(e.get("runtime", "stdio")),
+                            "runtime_hint": _reg.runtime_hint(e.get("runtime", "stdio")),
+                            "homepage": e.get("homepage", ""),
+                            "installed": e["id"] in configured,
+                            "inputs": [
+                                {"key": i["key"],
+                                 "prompt": i.get("prompt", i["key"]),
+                                 "secret": bool(i.get("secret")),
+                                 "default_wd": bool(i.get("default_wd"))}
+                                for i in e.get("inputs", [])
+                            ],
+                        })
+                    await send({"type": "mcp_registry", "entries": entries})
+                except Exception as exc:
+                    await send({"type": "error", "text": f"MCP registry failed: {exc}"})
+
+            elif mtype == "list_mcp":
+                try:
+                    await send(_mcp_snapshot())
+                except Exception as exc:
+                    await send({"type": "error", "text": f"List MCP failed: {exc}"})
+
+            elif mtype == "install_mcp":
+                try:
+                    from .. import mcp_registry as _reg
+                    entry = _reg.get_entry(msg.get("id", ""))
+                    if entry is None:
+                        await send({"type": "error", "text": f"No catalog entry '{msg.get('id')}'."})
+                    elif not _reg.runtime_available(entry.get("runtime", "stdio")):
+                        rt = entry.get("runtime")
+                        await send({"type": "error",
+                                    "text": f"'{entry['id']}' needs the {rt} runtime. {_reg.runtime_hint(rt)}"})
+                    else:
+                        wd = state.get("working_dir") or "."
+                        cfg = _reg.build_config(entry, msg.get("values") or {}, wd)
+                        add_mcp_server(cfg)
+                        await send({"type": "info", "text": f"Installed '{cfg['name']}' — connecting…"})
+                        await asyncio.to_thread(_reconnect_mcp)
+                        await send(_mcp_snapshot())
+                except ValueError as exc:
+                    await send({"type": "error", "text": str(exc)})
+                except Exception as exc:
+                    await send({"type": "error", "text": f"Install failed: {exc}"})
+
+            elif mtype == "add_mcp":
+                try:
+                    add_mcp_server(msg.get("server") or {})
+                    await send({"type": "info", "text": "MCP server added — connecting…"})
+                    await asyncio.to_thread(_reconnect_mcp)
+                    await send(_mcp_snapshot())
+                except ValueError as exc:
+                    await send({"type": "error", "text": str(exc)})
+                except Exception as exc:
+                    await send({"type": "error", "text": f"Add MCP failed: {exc}"})
+
+            elif mtype == "remove_mcp":
+                try:
+                    if remove_mcp_server(msg.get("name", "")):
+                        await send({"type": "info", "text": f"Removed '{msg.get('name')}'."})
+                        await asyncio.to_thread(_reconnect_mcp)
+                    else:
+                        await send({"type": "error", "text": f"No MCP server '{msg.get('name')}'."})
+                    await send(_mcp_snapshot())
+                except Exception as exc:
+                    await send({"type": "error", "text": f"Remove MCP failed: {exc}"})
+
+            elif mtype == "toggle_mcp":
+                try:
+                    enabled = bool(msg.get("enabled", True))
+                    if set_mcp_server_enabled(msg.get("name", ""), enabled):
+                        await asyncio.to_thread(_reconnect_mcp)
+                    await send(_mcp_snapshot())
+                except Exception as exc:
+                    await send({"type": "error", "text": f"Toggle MCP failed: {exc}"})
+
+            elif mtype == "reconnect_mcp":
+                try:
+                    await send({"type": "info", "text": "Reconnecting MCP servers…"})
+                    await asyncio.to_thread(_reconnect_mcp)
+                    await send(_mcp_snapshot())
+                except Exception as exc:
+                    await send({"type": "error", "text": f"Reconnect MCP failed: {exc}"})
 
             elif mtype == "pull_model":
                 """Handle pulling a model from Ollama."""

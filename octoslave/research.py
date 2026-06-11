@@ -20,7 +20,13 @@ from pathlib import Path
 from openai import OpenAI, BadRequestError, APIStatusError, APITimeoutError, APIConnectionError
 
 from . import display
-from .agent import _cap_result, _compact_and_trim as _trim_messages
+from .agent import (
+    _cap_result,
+    _compact_and_trim as _trim_messages,
+    _is_context_window_error,
+    _proactive_trim,
+    _estimated_tokens,
+)
 from .tools import TOOL_DEFINITIONS, execute_tool
 
 # ---------------------------------------------------------------------------
@@ -65,7 +71,8 @@ ROLES: dict[str, dict] = {
         "color": "bold green",
         "default_model": "qwen3-coder-30b",         # large code model — fewer mistakes
         "max_iter": 80,                             # was 50 — 120b coder thrashes longer
-        "tools": ["read_file", "write_file", "edit_file", "bash",
+        "tools": ["read_file", "write_file", "edit_file", "apply_patch", "bash",
+                  "todo_write", "run_background", "check_process", "stop_process",
                   "glob", "grep", "list_dir",
                   "bio_inspect", "rdkit_describe", "pdb_fetch",
                   "alphafold_fetch", "uniprot_lookup", "pubchem_lookup",
@@ -77,7 +84,8 @@ ROLES: dict[str, dict] = {
         "color": "bold red",
         "default_model": "qwen3-coder-30b",         # same coder — knows the code
         "max_iter": 30,                             # was 20 — match coder cap proportions
-        "tools": ["read_file", "write_file", "edit_file", "bash",
+        "tools": ["read_file", "write_file", "edit_file", "apply_patch", "bash",
+                  "todo_write", "run_background", "check_process", "stop_process",
                   "glob", "grep", "list_dir",
                   "bio_inspect", "rdkit_describe"],
     },
@@ -793,6 +801,13 @@ LONG-RUNNING JOBS — training a model can take hours or days. This is expected 
   timeout as the tool parameter to the bash call itself (the tool enforces it at the OS level).
 - Do NOT kill a training job because it is slow. Let it run.
 - If a job genuinely fails (non-zero exit, OOM) document it and try alternatives.
+- LOG VOLUME — when a script will print > 500 lines of output (epoch logs, batch
+  losses, verbose installs), tee it to a file then read the summary via
+  `compress_log`. Example:
+      bash: `.venv/bin/python train.py 2>&1 | tee train.log`
+      compress_log: {"path": "train.log", "service": "train"}
+  compress_log typically returns 95–99% fewer tokens than raw log reads and
+  preserves rare errors/tracebacks verbatim. Never read_file a multi-megabyte log.
 
 ABSOLUTE RULES — READ CAREFULLY
 DATA INTEGRITY IS NON-NEGOTIABLE. These rules apply without exception:
@@ -981,6 +996,10 @@ STEPS — focus ONLY on {round_dir}. Do NOT read files from other rounds.
      `cd {round_dir}/03_code && uv run --with <pkgs> python <script>.py`
      or use the existing .venv: `.venv/bin/python <script>.py`
      Never run bare `python <script>.py` — it may not have the packages.
+     If the script will produce > 500 lines of output, use `compress_log` with
+     `command` instead of plain bash — keeps the tracebacks, drops the noise.
+     If a log file from the Coder's run already exists (e.g. `train.log`) and is
+     larger than ~50 KB, use `compress_log` with `path` instead of read_file.
 3. Check — each is a potential one-line report entry:
    - FAKE DATA (CRITICAL): grep the main script for any of these keywords:
        "simulated", "placeholder", "mock", "dummy", "fake", "random()", "np.random",
@@ -1373,11 +1392,25 @@ def _build_system_prompt(
 # Filtered tool list per role
 # ---------------------------------------------------------------------------
 
+# Roles that get access to user-wired MCP tools. The doer/reader roles benefit
+# most; review-only roles (skeptic, merger, orchestrator) stay lean.
+_MCP_ENABLED_ROLES: frozenset[str] = frozenset(
+    {"researcher", "coder", "debugger", "evaluator", "reporter"}
+)
+
+
 def _tools_for_role(role: str, scrape_mode: bool = False) -> list[dict]:
     allowed = set(ROLES[role]["tools"])
     if scrape_mode and role == "researcher":
         allowed.add("crawl_tree")
-    return [t for t in TOOL_DEFINITIONS if t["function"]["name"] in allowed]
+    defs = [t for t in TOOL_DEFINITIONS if t["function"]["name"] in allowed]
+    if role in _MCP_ENABLED_ROLES:
+        try:
+            from .mcp_client import manager
+            defs = defs + manager.tool_definitions()
+        except Exception:
+            pass
+    return defs
 
 
 # ---------------------------------------------------------------------------
@@ -1574,18 +1607,21 @@ def _run_specialist(
                     iteration -= 1
                     continue
 
+        # Proactive context trim BEFORE sending — broader provider coverage
+        # than waiting for a 400.
+        messages = _proactive_trim(messages, label=cfg["label"])
         try:
             response = _stream_completion_with_tools(client, model, messages, tools)
             _rate_limit_retries = 0
             _timeout_retries = 0
         except BadRequestError as e:
             err = str(e)
-            if "ContextWindow" in err or "context" in err.lower():
-                trimmed = _trim_messages(messages)
+            if _is_context_window_error(err):
+                trimmed = _trim_messages(messages, groups=10)
                 if len(trimmed) < len(messages):
                     display.print_info(
-                        f"[{cfg['label']}] Context window exceeded — "
-                        "trimming oldest tool results and retrying."
+                        f"[{cfg['label']}] Context window exceeded — compacted "
+                        f"(~{_estimated_tokens(trimmed):,} tokens left) and retrying."
                     )
                     messages = trimmed
                     iteration -= 1  # context trim doesn't consume a turn
@@ -1917,15 +1953,20 @@ def _run_merger(
 
     while iteration < cfg["max_iter"]:
         iteration += 1
+        messages = _proactive_trim(messages, label="Merger")
         try:
             response = _stream_completion_with_tools(client, _model, messages, tools)
             _rate_limit_retries = 0
             _timeout_retries = 0
         except BadRequestError as e:
             err = str(e)
-            if "ContextWindow" in err or "context" in err.lower():
-                trimmed = _trim_messages(messages)
+            if _is_context_window_error(err):
+                trimmed = _trim_messages(messages, groups=10)
                 if len(trimmed) < len(messages):
+                    display.print_info(
+                        f"[Merger] Context window exceeded — compacted "
+                        f"(~{_estimated_tokens(trimmed):,} tokens left) and retrying."
+                    )
                     messages = trimmed
                     iteration -= 1
                     continue
@@ -3109,15 +3150,20 @@ def _run_master_reporter(
 
     while iteration < cfg["max_iter"]:
         iteration += 1
+        messages = _proactive_trim(messages, label="Master Reporter")
         try:
             response = _stream_completion_with_tools(client, model, messages, tools)
             _rate_limit_retries = 0
             _timeout_retries = 0
         except BadRequestError as e:
             err = str(e)
-            if "ContextWindow" in err or "context" in err.lower():
-                trimmed = _trim_messages(messages)
+            if _is_context_window_error(err):
+                trimmed = _trim_messages(messages, groups=10)
                 if len(trimmed) < len(messages):
+                    display.print_info(
+                        f"[Master Reporter] Context window exceeded — compacted "
+                        f"(~{_estimated_tokens(trimmed):,} tokens left) and retrying."
+                    )
                     messages = trimmed
                     iteration -= 1
                     continue
@@ -3797,6 +3843,13 @@ def run_long_research(
                          researcher the crawl_tree tool and a scraping-focused prompt.
         min_rounds:      Never converge/complete before this round count.
     """
+    # Connect user-configured MCP servers so research roles can use them.
+    try:
+        from .tools import init_mcp
+        init_mcp()
+    except Exception:
+        pass
+
     # Auto-detect scrape intent from topic
     topic_lower = topic.lower()
     if not scrape_mode:

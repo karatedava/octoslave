@@ -1,6 +1,12 @@
+import atexit
 import json
 import os
+import shutil
+import signal
 import subprocess
+import tempfile
+import threading
+import time as _time
 import glob as glob_module
 from pathlib import Path
 
@@ -36,10 +42,11 @@ except ImportError:
     _HAS_PLAYWRIGHT = False
 
 # Tools that require permission in controlled mode
-MODIFYING_TOOLS = {"write_file", "edit_file", "bash"}
+MODIFYING_TOOLS = {"write_file", "edit_file", "apply_patch", "bash",
+                   "run_background", "stop_process"}
 
 # Tools that require permission only in controlled mode (not supervised)
-FILE_MODIFYING_TOOLS = {"write_file", "edit_file"}
+FILE_MODIFYING_TOOLS = {"write_file", "edit_file", "apply_patch"}
 
 # ---------------------------------------------------------------------------
 # Tool schemas (sent to the model)
@@ -239,7 +246,296 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "compress_log",
+            "description": (
+                "Compress a long log, training output, or noisy command output into a compact "
+                "templated summary using the `codag` CLI. Drastically reduces context cost "
+                "(typically 95–99% token reduction) while preserving rare events like errors "
+                "and tracebacks verbatim. "
+                "USE THIS instead of read_file or bash whenever you would otherwise read a log "
+                "longer than ~500 lines: ML training logs, kubectl/docker logs, CI output, "
+                "stack traces from a failed run, anything tee'd to disk. "
+                "Provide exactly ONE of `command` (codag runs and wraps it) or `path` "
+                "(codag reads a local file). Default mode `compact` is plain text, free, "
+                "no auth. Mode `capsule` returns structured JSON but requires `codag auth login`."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Shell command whose output should be wrapped and compressed (e.g. 'python train.py --epochs 10'). Mutually exclusive with `path`."},
+                    "path": {"type": "string", "description": "Path to an existing log file to compress (absolute or relative to working dir). Mutually exclusive with `command`."},
+                    "service": {"type": "string", "description": "Optional tag for these lines (e.g. 'train', 'api'). Helps codag's template inference."},
+                    "mode": {"type": "string", "description": "Output mode: 'compact' (default, plain text, no auth) or 'capsule' (JSON, requires auth)."},
+                    "timeout": {"type": "integer", "description": "Max seconds for the wrapped command. Default 600 for compress_log of a file, matches the inner command's needs otherwise."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "image_ocr",
+            "description": (
+                "Extract text from an image file (PNG, JPG/JPEG, TIFF, BMP, GIF, WEBP) "
+                "using tesseract OCR. Use for screenshots, scanned documents, photos of "
+                "text, figures with embedded labels, plots with axis ticks, etc. "
+                "For PDFs use pdf_ocr instead. "
+                "Requires pytesseract + the `tesseract` binary "
+                "(macOS: `brew install tesseract`, Debian: `apt install tesseract-ocr`)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to image file"},
+                    "lang": {"type": "string", "description": "Tesseract language code (default 'eng'). Use 'eng+deu' for multilingual."},
+                    "preprocess": {"type": "boolean", "description": "Apply grayscale + threshold for noisy/low-contrast images (default false)"},
+                    "psm": {"type": "integer", "description": "Tesseract page segmentation mode (default 3 = auto). Try 6 for a single block of text, 11 for sparse text."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_patch",
+            "description": (
+                "Apply MULTIPLE find-and-replace edits to a SINGLE file in one call. "
+                "Each edit replaces an exact old_string with a new_string; edits apply "
+                "in order and the file is written only if ALL edits succeed (atomic). "
+                "Much cheaper than several edit_file calls when changing several regions "
+                "of the same file. Each old_string must be unique in the file when its "
+                "edit runs, unless that edit sets replace_all=true. Preserve indentation "
+                "and surrounding context exactly."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File to patch"},
+                    "edits": {
+                        "type": "array",
+                        "description": "Edits applied in order",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_string": {"type": "string", "description": "Exact text to replace"},
+                                "new_string": {"type": "string", "description": "Replacement text"},
+                                "replace_all": {"type": "boolean", "description": "Replace every occurrence for this edit (default false)"},
+                            },
+                            "required": ["old_string", "new_string"],
+                        },
+                    },
+                },
+                "required": ["path", "edits"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "todo_write",
+            "description": (
+                "Create or update a task checklist for the current work. Pass the FULL "
+                "list every time — it REPLACES the previous list. Use it on any multi-step "
+                "task: keep exactly one item 'in_progress', mark items 'completed' as you "
+                "finish them, and add new items as they emerge. This keeps you and the user "
+                "oriented on long tasks and shows live progress in the UI. Skip it for "
+                "trivial single-step requests."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "description": "The complete, ordered task list",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string", "description": "Imperative description of the step"},
+                                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                            },
+                            "required": ["content", "status"],
+                        },
+                    },
+                },
+                "required": ["todos"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_background",
+            "description": (
+                "Start a long-running or blocking command in the BACKGROUND and return "
+                "immediately with a process id. Use this — not bash — for dev servers, "
+                "training jobs, file watchers, or anything that does not exit on its own "
+                "(the bash tool blocks until the command finishes). Output is captured to a "
+                "file; read it with check_process and stop the job with stop_process."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Shell command to run in the background"},
+                    "cwd": {"type": "string", "description": "Working directory (defaults to the session working dir)"},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_process",
+            "description": (
+                "Check a background process started with run_background: returns its "
+                "running/exited status, exit code, and recent output. Call with no id to "
+                "list all background processes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Process id from run_background (omit to list all)"},
+                    "tail_lines": {"type": "integer", "description": "Trailing output lines to return (default 50)"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stop_process",
+            "description": "Stop a background process started with run_background (SIGTERM, then SIGKILL).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Process id from run_background"},
+                },
+                "required": ["id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_user",
+            "description": (
+                "Ask the human a clarifying question and wait for their answer. Use ONLY "
+                "when genuinely blocked on a decision that is the user's to make and cannot "
+                "be resolved from the task, the code, or sensible defaults — not for routine "
+                "choices you can make yourself. In autonomous or non-interactive runs the "
+                "user may be unavailable; if no answer comes back, proceed with your best "
+                "judgement."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The question to ask"},
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional suggested answers the user can pick from",
+                    },
+                },
+                "required": ["question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": (
+                "Save a durable insight to cross-session memory — a fact, lesson, "
+                "preference, or gotcha that will help in FUTURE sessions, not just "
+                "this one. Use it sparingly and deliberately when you learn "
+                "something worth carrying forward: a non-obvious project quirk, a "
+                "fix that took effort to find, a stable user preference, an "
+                "environment constraint (e.g. a tool that isn't installed), or a "
+                "dead end worth avoiding next time. Write the insight so it makes "
+                "sense out of context, with specifics. Do NOT use it for routine "
+                "progress, transient state, or things already obvious from the code "
+                "or the task. These notes are recalled automatically when relevant."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "The insight to remember, self-contained and specific."},
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional short tags for retrieval (e.g. ['build', 'macos']).",
+                    },
+                },
+                "required": ["content"],
+            },
+        },
+    },
 ] + BIO_TOOL_DEFINITIONS
+
+
+# ---------------------------------------------------------------------------
+# MCP (Model Context Protocol) — user-wired external tools
+# ---------------------------------------------------------------------------
+
+def init_mcp(cfg: dict | None = None, force: bool = False) -> None:
+    """Connect to configured MCP servers (idempotent). Safe to call from every
+    entry point — single-agent REPL, research pipeline, web UI."""
+    try:
+        from .mcp_client import manager
+        manager.init_from_config(cfg, force=force)
+    except Exception:
+        # MCP is strictly additive — never let it break the core toolbox.
+        pass
+
+
+def _mcp_manager():
+    try:
+        from .mcp_client import manager
+        return manager
+    except Exception:
+        return None
+
+
+# Curated tool surface for small local models. Handing a 12B model all ~37
+# schemas (incl. bio lookups + MCP log-tailers) dilutes its attention and
+# induces wrong/malformed tool calls. Local runs see only the essentials for
+# file/data/web work. Big models (e-INFRA / NIM / custom) are unaffected — they
+# only ever pass profile=None and keep the full surface.
+LOCAL_TOOL_ALLOWLIST = frozenset({
+    "read_file", "write_file", "edit_file", "bash",
+    "glob", "grep", "list_dir",
+    "web_search", "web_fetch",
+})
+
+
+def all_tool_definitions(profile: str | None = None) -> list[dict]:
+    """Built-in tools plus any tools exposed by connected MCP servers.
+
+    When profile == "local" (small local/Ollama models), return only the
+    curated LOCAL_TOOL_ALLOWLIST and skip MCP tools entirely — a tight,
+    high-signal surface that small models can actually use reliably.
+    """
+    if profile == "local":
+        return [td for td in TOOL_DEFINITIONS
+                if td["function"]["name"] in LOCAL_TOOL_ALLOWLIST]
+    mgr = _mcp_manager()
+    if mgr is None:
+        return list(TOOL_DEFINITIONS)
+    return list(TOOL_DEFINITIONS) + mgr.tool_definitions()
+
+
+def valid_tool_names() -> set[str]:
+    """Names of all callable tools (built-in + MCP). Used by the text-format
+    tool-call fallback parser."""
+    names = {td["function"]["name"] for td in TOOL_DEFINITIONS}
+    mgr = _mcp_manager()
+    if mgr is not None:
+        names |= mgr.tool_names()
+    return names
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +547,10 @@ def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str =
     # Check permission for modifying tools
     # - controlled: ask for all modifying tools (file ops + bash)
     # - supervised: ask only for file operations (allow bash without asking)
-    if permission_mode == "controlled" and name in MODIFYING_TOOLS:
+    _is_mcp = name.startswith("mcp__")
+    # MCP tools call out to external servers (which may write files, hit APIs,
+    # mutate state) — gate them like modifying tools in controlled mode.
+    if permission_mode == "controlled" and (name in MODIFYING_TOOLS or _is_mcp):
         try:
             from . import display
             if not display.request_permission(name, args, working_dir, permission_mode):
@@ -283,8 +582,22 @@ def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str =
             return _write_file(working_dir=working_dir, **args)
         elif name == "edit_file":
             return _edit_file(working_dir=working_dir, **args)
+        elif name == "apply_patch":
+            return _apply_patch(working_dir=working_dir, **args)
+        elif name == "todo_write":
+            return _todo_write(working_dir=working_dir, **args)
         elif name == "bash":
             return _bash(working_dir=working_dir, **args)
+        elif name == "run_background":
+            return _run_background(working_dir=working_dir, **args)
+        elif name == "check_process":
+            return _check_process(working_dir=working_dir, **args)
+        elif name == "stop_process":
+            return _stop_process(working_dir=working_dir, **args)
+        elif name == "ask_user":
+            return _ask_user(working_dir=working_dir, **args)
+        elif name == "remember":
+            return _remember(**args)
         elif name == "glob":
             return _glob(working_dir=working_dir, **args)
         elif name == "grep":
@@ -297,8 +610,17 @@ def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str =
             return _web_fetch(**args)
         elif name == "crawl_tree":
             return _crawl_tree(**args)
+        elif name == "compress_log":
+            return _compress_log(working_dir=working_dir, **args)
+        elif name == "image_ocr":
+            return _image_ocr(working_dir=working_dir, **args)
         elif name in BIO_TOOL_NAMES:
             return execute_bio_tool(name, args, working_dir)
+        elif _is_mcp:
+            mgr = _mcp_manager()
+            if mgr is None:
+                return f"MCP is unavailable; cannot run {name}", False
+            return mgr.call(name, args)
         else:
             return f"Unknown tool: {name}", False
     except TypeError as e:
@@ -314,18 +636,25 @@ _REQUIRED_STR_ARGS: dict[str, tuple[str, ...]] = {
     "read_file": ("path",),
     "write_file": ("path", "content"),
     "edit_file": ("path", "old_string", "new_string"),
+    "apply_patch": ("path",),
     "bash": ("command",),
+    "run_background": ("command",),
+    "stop_process": ("id",),
+    "ask_user": ("question",),
+    "remember": ("content",),
     "glob": ("pattern",),
     "grep": ("pattern",),
     "web_search": ("query",),
     "web_fetch": ("url",),
     "crawl_tree": ("root_url",),
+    "image_ocr": ("path",),
     # bio tools that need a string input
     "bio_inspect": ("path",),
     "rdkit_describe": ("smiles",),
     "pdb_fetch": ("pdb_id",),
     "alphafold_fetch": ("uniprot_id",),
     "ena_fetch": ("accession",),
+    "pdf_ocr": ("path",),
 }
 
 
@@ -370,12 +699,19 @@ _ARG_HINTS: dict[str, str] = {
                  "(e.g. {\"path\": \"round_001/01_literature.md\"}).",
     "write_file": "Pass `path` and `content` (e.g. {\"path\": \"round_001/06_synthesis.md\", \"content\": \"...\"}).",
     "edit_file": "Pass `path`, `old_string`, `new_string`. Use replace_all=true for renames.",
+    "apply_patch": "Pass `path` and `edits` (a list of {old_string, new_string} objects).",
     "bash": "Pass `command` as a shell string (e.g. {\"command\": \"ls\"}).",
+    "run_background": "Pass `command` as a shell string (e.g. {\"command\": \"python app.py\"}).",
+    "stop_process": "Pass `id` as the process id returned by run_background (e.g. \"bg1\").",
+    "ask_user": "Pass `question` as a clear, specific question string.",
+    "remember": "Pass `content` as a self-contained insight string (e.g. {\"content\": \"This repo uses uv, not pip.\"}).",
     "glob": "Pass `pattern` (e.g. {\"pattern\": \"**/*.py\"}).",
     "grep": "Pass `pattern` as a regex (e.g. {\"pattern\": \"def \\\\w+\"}).",
     "web_search": "Pass `query`.",
     "web_fetch": "Pass `url` as a fully-qualified http(s) URL.",
     "crawl_tree": "Pass `root_url` as a fully-qualified http(s) URL.",
+    "image_ocr": "Pass `path` to an image file (PNG/JPG/TIFF/BMP/GIF/WEBP).",
+    "pdf_ocr": "Pass `path` to a PDF file. Use `pages` to limit page range.",
     "bio_inspect": "Pass `path` to a bio/chem data file.",
     "rdkit_describe": "Pass `smiles` (e.g. {\"smiles\": \"CC(=O)O\"}).",
     "pdb_fetch": "Pass `pdb_id` (4-char RCSB ID, e.g. \"1CRN\").",
@@ -611,6 +947,282 @@ def _edit_file(
     return f"Edited {path}", True
 
 
+def _apply_patch(path: str, edits: list, working_dir: str) -> tuple[str, bool]:
+    """Apply several old→new string replacements to one file, atomically.
+
+    The file is written only after every edit has matched, so a failure
+    mid-list leaves the file untouched.
+    """
+    resolved = _resolve(path, working_dir)
+    if not resolved.exists():
+        return f"File not found: {path}", False
+    if not resolved.is_file():
+        return f"Not a file: {path}", False
+    if not isinstance(edits, list) or not edits:
+        return "apply_patch requires a non-empty `edits` list of {old_string, new_string}.", False
+    if _is_binary(resolved):
+        return f"Cannot edit binary file: {resolved.name}", False
+
+    content = resolved.read_text(errors="replace")
+    applied = 0
+    notes: list[str] = []
+    for i, e in enumerate(edits, 1):
+        if not isinstance(e, dict):
+            return f"Edit #{i} is not an object — expected {{old_string, new_string}}.", False
+        old = e.get("old_string", "")
+        new = e.get("new_string", "")
+        replace_all = bool(e.get("replace_all", False))
+        if old == "":
+            return f"Edit #{i}: old_string must not be empty. (no changes written)", False
+        if old == new:
+            return f"Edit #{i}: old_string and new_string are identical. (no changes written)", False
+        count = content.count(old)
+        if count == 0:
+            return (
+                f"Edit #{i}: string not found:\n{old[:200]}\n"
+                f"(applied {applied}/{len(edits)} so far — file left UNCHANGED)",
+                False,
+            )
+        if count > 1 and not replace_all:
+            return (
+                f"Edit #{i}: old_string appears {count} times — make it unique or set "
+                f"replace_all=true for this edit. (file left UNCHANGED)",
+                False,
+            )
+        content = content.replace(old, new)
+        applied += 1
+        if replace_all and count > 1:
+            notes.append(f"#{i}×{count}")
+
+    resolved.write_text(content)
+    suffix = f" ({', '.join(notes)} replace_all)" if notes else ""
+    return f"Applied {applied} edit(s) to {path}{suffix}", True
+
+
+# ---------------------------------------------------------------------------
+# Task checklist (todo_write)
+# ---------------------------------------------------------------------------
+
+_TODO_STORE: dict[str, list[dict]] = {}
+_VALID_TODO_STATUS = {"pending", "in_progress", "completed"}
+
+
+def get_todos(working_dir: str) -> list[dict]:
+    """Return the current task list for a working dir (used by the web UI)."""
+    return list(_TODO_STORE.get(working_dir, []))
+
+
+def _todo_write(todos: list, working_dir: str) -> tuple[str, bool]:
+    if not isinstance(todos, list):
+        return "todo_write requires `todos` to be a list of {content, status} objects.", False
+    norm: list[dict] = []
+    for t in todos:
+        if not isinstance(t, dict):
+            continue
+        content = str(t.get("content", "")).strip()
+        if not content:
+            continue
+        status = t.get("status", "pending")
+        if status not in _VALID_TODO_STATUS:
+            status = "pending"
+        norm.append({"content": content, "status": status})
+
+    if not norm:
+        return "todo_write received no valid tasks (each needs `content` and `status`).", False
+
+    _TODO_STORE[working_dir] = norm
+    try:
+        from . import display
+        display.print_todos(norm)
+    except Exception:
+        pass
+
+    done = sum(1 for t in norm if t["status"] == "completed")
+    in_prog = [t["content"] for t in norm if t["status"] == "in_progress"]
+    summary = f"Task list updated — {done}/{len(norm)} completed."
+    if in_prog:
+        summary += f" Now working on: {in_prog[0]}"
+    return summary, True
+
+
+# ---------------------------------------------------------------------------
+# Background processes (run_background / check_process / stop_process)
+# ---------------------------------------------------------------------------
+
+_BG_PROCS: dict[str, dict] = {}
+_bg_counter = 0
+_bg_lock = threading.Lock()
+
+
+def _run_background(command: str, working_dir: str, cwd: str = None) -> tuple[str, bool]:
+    global _bg_counter
+    run_dir = cwd or working_dir
+    try:
+        log_fd, log_path = tempfile.mkstemp(prefix="ots_bg_", suffix=".log")
+        log_file = os.fdopen(log_fd, "w")
+    except OSError as e:
+        return f"Could not allocate a log file: {e}", False
+
+    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+    try:
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=run_dir,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            start_new_session=True,  # own process group → killable as a unit
+        )
+    except Exception as e:
+        try:
+            log_file.close()
+        except Exception:
+            pass
+        return f"Failed to start background process: {e}", False
+
+    with _bg_lock:
+        _bg_counter += 1
+        proc_id = f"bg{_bg_counter}"
+        _BG_PROCS[proc_id] = {
+            "proc": proc,
+            "command": command,
+            "log": log_path,
+            "file": log_file,
+            "started": _time.time(),
+            "cwd": run_dir,
+        }
+    return (
+        f"Started background process {proc_id} (pid {proc.pid}): {command}\n"
+        f"Use check_process(id=\"{proc_id}\") to read output, "
+        f"stop_process(id=\"{proc_id}\") to stop it.",
+        True,
+    )
+
+
+def _read_bg_log(info: dict, tail_lines: int) -> str:
+    try:
+        info["file"].flush()
+    except Exception:
+        pass
+    try:
+        with open(info["log"], errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return "(could not read output)"
+    if tail_lines and len(lines) > tail_lines:
+        return f"[last {tail_lines} of {len(lines)} lines]\n" + "\n".join(lines[-tail_lines:])
+    return "\n".join(lines) if lines else "(no output yet)"
+
+
+def _check_process(working_dir: str, id: str = None, tail_lines: int = 50) -> tuple[str, bool]:
+    if not id:
+        with _bg_lock:
+            items = list(_BG_PROCS.items())
+        if not items:
+            return "No background processes have been started.", True
+        lines = ["Background processes:"]
+        for pid_id, info in items:
+            rc = info["proc"].poll()
+            status = "running" if rc is None else f"exited ({rc})"
+            lines.append(f"  {pid_id}: {status} — {info['command'][:70]}")
+        return "\n".join(lines), True
+
+    info = _BG_PROCS.get(id)
+    if not info:
+        return f"No background process with id '{id}'. Use check_process() to list them.", False
+    rc = info["proc"].poll()
+    status = "running" if rc is None else f"exited with code {rc}"
+    elapsed = int(_time.time() - info["started"])
+    header = f"Process {id} — {status} (running {elapsed}s): {info['command'][:80]}\n"
+    return header + _read_bg_log(info, tail_lines), True
+
+
+def _stop_process(id: str, working_dir: str) -> tuple[str, bool]:
+    info = _BG_PROCS.get(id)
+    if not info:
+        return f"No background process with id '{id}'.", False
+    proc = info["proc"]
+    if proc.poll() is not None:
+        return f"Process {id} already exited (code {proc.poll()}).", True
+    _terminate_proc(proc)
+    try:
+        info["file"].close()
+    except Exception:
+        pass
+    return f"Stopped background process {id}.", True
+
+
+def _terminate_proc(proc: subprocess.Popen) -> None:
+    """SIGTERM the process group, escalate to SIGKILL if it doesn't exit."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            return
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+def _shutdown_bg_procs() -> None:
+    """Kill any still-running background processes on interpreter exit."""
+    for info in list(_BG_PROCS.values()):
+        try:
+            if info["proc"].poll() is None:
+                _terminate_proc(info["proc"])
+        except Exception:
+            pass
+
+
+atexit.register(_shutdown_bg_procs)
+
+
+# ---------------------------------------------------------------------------
+# ask_user
+# ---------------------------------------------------------------------------
+
+def _ask_user(question: str, working_dir: str, options: list = None) -> tuple[str, bool]:
+    opts = [str(o) for o in options] if isinstance(options, list) else None
+    try:
+        from . import display
+        answer, answered = display.ask_user_question(question, opts)
+    except Exception:
+        answered, answer = False, ""
+    if not answered:
+        return (
+            "No answer was received — the user is unavailable or this is a "
+            "non-interactive/autonomous run. Proceed with your best judgement "
+            "based on the task and sensible defaults; do not ask again.",
+            True,
+        )
+    return f"The user answered: {answer}", True
+
+
+def _remember(content: str, tags=None) -> tuple[str, bool]:
+    """Persist an agent-authored insight to cross-session memory."""
+    # Lazy import — agent.py imports tools.py at module load, so importing it
+    # at the top here would be a circular import.
+    from .agent import save_memory_insight
+    ok = save_memory_insight(content, tags)
+    if not ok:
+        return "Could not save the insight (empty content or write error).", False
+    preview = content.strip().replace("\n", " ")
+    if len(preview) > 80:
+        preview = preview[:77] + "…"
+    return f"Saved to memory: {preview}", True
+
+
 def _bash(command: str, working_dir: str, timeout: int = 300) -> tuple[str, bool]:
     # Unset VIRTUAL_ENV so uv doesn't emit a mismatch warning when the conda/system
     # venv doesn't match the project's .venv.
@@ -643,6 +1255,341 @@ def _bash(command: str, working_dir: str, timeout: int = 300) -> tuple[str, bool
         return output, result.returncode == 0
     except subprocess.TimeoutExpired:
         return f"Command timed out after {timeout}s", False
+
+
+def _find_codag() -> str | None:
+    """Locate the codag binary. Returns absolute path, or None if not installed."""
+    found = shutil.which("codag")
+    if found:
+        return found
+    # install.sh default location
+    fallback = Path.home() / ".local" / "bin" / "codag"
+    return str(fallback) if fallback.is_file() and os.access(fallback, os.X_OK) else None
+
+
+# Module-level flag so we only attempt auto-install once per process. Without
+# this a failing install (no network, locked-down system) would re-attempt on
+# every compress_log call.
+_codag_autoinstall_attempted = False
+
+
+def _attempt_codag_install() -> bool:
+    """One-shot best-effort install of the codag CLI for users who got
+    octoslave via the platform installer (DMG/EXE/AppImage) — they never ran
+    scripts/install.sh and so don't have codag yet. Returns True if codag is
+    found on PATH afterward.
+
+    Opt out via OCTOSLAVE_NO_CODAG_AUTOINSTALL=1. Requires curl + sh (Unix);
+    on Windows or stripped-down environments, this is a no-op and the caller
+    gets the standard "not installed" error.
+    """
+    global _codag_autoinstall_attempted
+    if _codag_autoinstall_attempted:
+        return _find_codag() is not None
+    _codag_autoinstall_attempted = True
+
+    if os.environ.get("OCTOSLAVE_NO_CODAG_AUTOINSTALL") == "1":
+        return False
+    if not shutil.which("curl") or not shutil.which("sh"):
+        return False
+
+    try:
+        from . import display
+        display.print_info(
+            "compress_log: codag CLI not installed — fetching it now (one-time, ~5s)…"
+        )
+    except Exception:
+        pass
+
+    try:
+        result = subprocess.run(
+            "curl -fsSL https://codag.ai/install.sh | sh",
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        try:
+            from . import display
+            display.print_info(
+                "compress_log: codag install timed out — falling back to raw output. "
+                "Re-run with OCTOSLAVE_NO_CODAG_AUTOINSTALL=1 to silence this on future calls."
+            )
+        except Exception:
+            pass
+        return False
+    except Exception:
+        return False
+
+    ok = result.returncode == 0 and _find_codag() is not None
+    try:
+        from . import display
+        if ok:
+            display.print_info("compress_log: codag installed.")
+        else:
+            tail = (result.stderr or result.stdout or "").strip().splitlines()
+            tail_line = tail[-1] if tail else "(no output)"
+            display.print_info(
+                f"compress_log: codag install failed ({tail_line}). "
+                "Install manually with `curl -fsSL https://codag.ai/install.sh | sh`."
+            )
+    except Exception:
+        pass
+    return ok
+
+
+# Codag's free `compact` mode has a server-side cap of 5,000 input lines per
+# request. To handle real ML/CI logs we chunk above that. Headroom of 500.
+_CODAG_MAX_LINES_PER_CHUNK = 4500
+# Hard ceiling on chunk count to avoid burning many API calls on truly huge
+# files. 10 chunks * 4500 lines = ~45K input lines covered with full fidelity.
+_CODAG_MAX_CHUNKS = 10
+
+
+def _run_codag(codag: str, argv_prefix: list[str], stdin_text: str, cwd: str, timeout: int) -> tuple[str, str, int]:
+    """Pipe stdin_text to `codag wrap ...` and return (stdout, stderr, returncode)."""
+    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+    try:
+        result = subprocess.run(
+            argv_prefix,
+            input=stdin_text,
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            timeout=timeout,
+            env=env,
+        )
+        return result.stdout or "", result.stderr or "", result.returncode
+    except subprocess.TimeoutExpired:
+        return "", f"codag timed out after {timeout}s", 124
+    except FileNotFoundError:
+        return "", "codag binary disappeared between lookup and exec. Reinstall codag.", 127
+
+
+def _collect_lines(
+    working_dir: str,
+    command: str | None,
+    path: str | None,
+    timeout: int,
+) -> tuple[list[str] | None, str | None]:
+    """Resolve input into a list of lines. Returns (lines, error_message)."""
+    if path:
+        resolved = _resolve(path, working_dir)
+        if not resolved.exists():
+            return None, f"compress_log: file not found: {resolved}"
+        if not resolved.is_file():
+            return None, f"compress_log: not a regular file: {resolved}"
+        try:
+            text = resolved.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            return None, f"compress_log: could not read {resolved}: {e}"
+        return text.splitlines(), None
+
+    # command mode — run it ourselves so we control the input shape sent to codag
+    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+    try:
+        result = subprocess.run(
+            ["sh", "-c", command],
+            capture_output=True,
+            text=True,
+            cwd=working_dir,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"compress_log: command timed out after {timeout}s"
+    raw = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+    return raw.splitlines(), None
+
+
+def _compress_log(
+    working_dir: str,
+    command: str = None,
+    path: str = None,
+    service: str = None,
+    mode: str = "compact",
+    timeout: int = 600,
+) -> tuple[str, str]:
+    """Compress a log/command-output via the `codag` CLI.
+
+    Free `compact` mode is capped at 5,000 input lines per request server-side;
+    larger inputs are split into ≤4,500-line chunks and compressed sequentially,
+    with each chunk's summary stitched together. Up to 10 chunks (~45K lines)
+    are processed; beyond that, the input is head+tail truncated to fit and a
+    notice is appended to the result.
+    """
+    if (command and path) or (not command and not path):
+        return (
+            "compress_log requires exactly one of `command` or `path` "
+            "(got both, or neither). Pass `path` to compress a file, or `command` "
+            "to wrap and compress a shell command's output.",
+            False,
+        )
+
+    codag = _find_codag()
+    if codag is None:
+        # First-call auto-install for platform-installer users who never ran
+        # scripts/install.sh. Best-effort; opt out via OCTOSLAVE_NO_CODAG_AUTOINSTALL=1.
+        if _attempt_codag_install():
+            codag = _find_codag()
+    if codag is None:
+        return (
+            "codag CLI not installed and auto-install failed. Install manually with: "
+            "`curl -fsSL https://codag.ai/install.sh | sh` "
+            "(installs to ~/.local/bin/codag — make sure that dir is on PATH). "
+            "Then retry compress_log.",
+            False,
+        )
+
+    # Also register codag's richer MCP server (tail_kubernetes, tail_docker,
+    # tail_aws_logs, tail_vercel, tail_gh_actions, wrap, compact, health) on
+    # first successful use, so future runs of any role can use them directly.
+    # Idempotent; opt out via OCTOSLAVE_NO_CODAG_MCP_REGISTER=1.
+    try:
+        from .config import ensure_codag_mcp_registered
+        if ensure_codag_mcp_registered():
+            from . import display
+            display.print_info(
+                "compress_log: registered the codag MCP server "
+                "(exposes tail_kubernetes / tail_docker / tail_aws_logs / "
+                "tail_vercel / tail_gh_actions / wrap / compact). "
+                "Restart octoslave to load it."
+            )
+    except Exception:
+        pass
+
+    if mode not in ("compact", "capsule", "parse"):
+        return f"Invalid mode '{mode}'. Use 'compact' (default, no auth) or 'capsule' (JSON, needs auth).", False
+
+    lines, err = _collect_lines(working_dir, command, path, timeout)
+    if err is not None:
+        return err, False
+    if not lines:
+        return "(input was empty — nothing to compress)", True
+
+    argv_prefix = [codag, "wrap", "--mode", mode]
+    if service:
+        argv_prefix += ["--service", service]
+    # codag reads from stdin when no `-- cmd` is provided.
+
+    # Single-shot path
+    if len(lines) <= _CODAG_MAX_LINES_PER_CHUNK:
+        stdout, stderr, rc = _run_codag(codag, argv_prefix, "\n".join(lines), working_dir, timeout)
+        if rc != 0:
+            return (
+                f"codag failed (exit {rc}):\n{(stderr or stdout).strip()}\n"
+                f"Tip: `capsule`/`parse` modes need `codag auth login`; "
+                f"`compact` is free.",
+                False,
+            )
+        summary_line = next((ln.strip() for ln in stderr.splitlines() if ln.startswith("[codag]")), "")
+        out = stdout.strip()
+        return (f"{summary_line}\n{out}" if summary_line else out) or "(empty output)", True
+
+    # Chunked path: decide whether all lines fit within MAX_CHUNKS,
+    # otherwise head+tail truncate so the most valuable lines survive.
+    note = ""
+    max_lines_total = _CODAG_MAX_LINES_PER_CHUNK * _CODAG_MAX_CHUNKS
+    if len(lines) > max_lines_total:
+        head_count = max_lines_total // 2
+        tail_count = max_lines_total - head_count
+        truncated_count = len(lines) - max_lines_total
+        lines = (
+            lines[:head_count]
+            + [f"... [{truncated_count:,} middle lines omitted by compress_log — exceeds chunk budget] ..."]
+            + lines[-tail_count:]
+        )
+        note = (
+            f"\n[compress_log: input was {len(lines) + truncated_count - 1:,} lines; "
+            f"head {head_count:,} + tail {tail_count:,} were compressed, middle dropped]"
+        )
+
+    # Split into chunks
+    chunks: list[list[str]] = [
+        lines[i : i + _CODAG_MAX_LINES_PER_CHUNK]
+        for i in range(0, len(lines), _CODAG_MAX_LINES_PER_CHUNK)
+    ]
+    total = len(chunks)
+    pieces: list[str] = []
+    for idx, chunk in enumerate(chunks, 1):
+        stdout, stderr, rc = _run_codag(codag, argv_prefix, "\n".join(chunk), working_dir, timeout)
+        if rc != 0:
+            return (
+                f"codag failed on chunk {idx}/{total} (exit {rc}):\n{(stderr or stdout).strip()}",
+                False,
+            )
+        summary_line = next((ln.strip() for ln in stderr.splitlines() if ln.startswith("[codag]")), "")
+        body = stdout.strip()
+        header = f"=== chunk {idx}/{total} ({len(chunk):,} lines)"
+        if summary_line:
+            header += f" — {summary_line[len('[codag]'):].strip()}"
+        header += " ==="
+        pieces.append(f"{header}\n{body}")
+
+    return ("\n\n".join(pieces) + note).strip() or "(empty output)", True
+
+
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".gif", ".webp"}
+
+
+def _image_ocr(
+    path: str,
+    working_dir: str,
+    lang: str = "eng",
+    preprocess: bool = False,
+    psm: int = 3,
+) -> tuple[str, bool]:
+    try:
+        from PIL import Image
+    except ImportError:
+        return "Pillow is not installed. Run: pip install pillow", False
+    try:
+        import pytesseract  # type: ignore
+    except ImportError:
+        return "pytesseract is not installed. Run: pip install pytesseract", False
+
+    resolved = _resolve(path, working_dir)
+    if not resolved.exists():
+        return f"File not found: {path}", False
+    if not resolved.is_file():
+        return f"Not a file: {path}", False
+    if resolved.suffix.lower() not in _IMAGE_EXTS:
+        return (
+            f"Unsupported image format: {resolved.suffix!r}. "
+            f"Supported: {sorted(_IMAGE_EXTS)}. For PDFs use pdf_ocr.",
+            False,
+        )
+
+    try:
+        img = Image.open(str(resolved))
+        img.load()
+    except Exception as e:
+        return f"Could not open image: {e}", False
+
+    width, height = img.size
+
+    if preprocess:
+        img = img.convert("L")
+        img = img.point(lambda x: 0 if x < 140 else 255, "1")
+
+    config = f"--psm {int(psm)}"
+    try:
+        text = pytesseract.image_to_string(img, lang=lang, config=config)
+    except pytesseract.TesseractNotFoundError:
+        return (
+            "tesseract binary not found on PATH. Install: "
+            "macOS `brew install tesseract`, Debian `apt install tesseract-ocr`.",
+            False,
+        )
+    except Exception as e:
+        return f"OCR error: {e}", False
+
+    header = f"OCR: {resolved.name} ({width}x{height}, lang={lang}, psm={psm})\n\n"
+    if not text.strip():
+        hint = "" if preprocess else " Try preprocess=true for noisy/low-contrast images."
+        return header + f"(no text extracted —{hint} image may contain no readable text)", True
+    return header + text, True
 
 
 def _glob(pattern: str, working_dir: str, path: str = None) -> tuple[str, bool]:

@@ -8,11 +8,29 @@
 # Output:  dist/OctoSlave.app
 # DMG:     run  installers/macos/build_dmg.sh  after PyInstaller
 
+import os
 import sys
 from pathlib import Path
 
 ROOT = Path(SPECPATH).parent.parent          # repo root
 OCTOSLAVE_PKG = ROOT / "octoslave"
+
+
+def _resolve_version() -> str:
+    """Single-source the bundle version: OTS_VERSION env (set by CI from the
+    git tag / pyproject) wins; otherwise read pyproject.toml directly."""
+    env = os.environ.get("OTS_VERSION", "").strip()
+    if env:
+        return env
+    try:
+        import tomllib
+        with open(ROOT / "pyproject.toml", "rb") as f:
+            return tomllib.load(f)["project"]["version"]
+    except Exception:
+        return "0.0.0"
+
+
+VERSION = _resolve_version()
 
 block_cipher = None
 
@@ -112,8 +130,8 @@ app = BUNDLE(
     icon=str(OCTOSLAVE_PKG / "web" / "static" / "logo.png"),
     bundle_identifier="cz.einfra.octoslave",
     info_plist={
-        "CFBundleShortVersionString": "0.2.0",
-        "CFBundleVersion":            "0.2.0",
+        "CFBundleShortVersionString": VERSION,
+        "CFBundleVersion":            VERSION,
         "NSHighResolutionCapable":    True,
         "NSRequiresAquaSystemAppearance": False,  # respect Dark Mode
         "LSMinimumSystemVersion":     "11.0",

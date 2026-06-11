@@ -10,17 +10,15 @@ import {
 } from './websocket.js?v=20260507';
 import { handleSlashCommand } from './slash-commands.js?v=20260429';
 import {
-  toggleHistory, browseDir, refreshHistory, refreshFileTree, viewFile,
+  toggleHistory, browseDir, refreshHistory,
   uploadFile, removeAttachment, clearChatMessages, appendChatInfo, appendChatError
-} from './components.js?v=20260429';
+} from './components.js?v=20260608c';
 import { scrollToBottom, autoResizeTextarea, renderMarkdown, esc } from './utils.js?v=20260429';
 
 // Export functions to global scope for inline handlers
 window.toggleHistory = toggleHistory;
 window.browseDir = browseDir;
 window.refreshHistory = refreshHistory;
-window.refreshFileTree = refreshFileTree;
-window.viewFile = viewFile;
 window.uploadFile = uploadFile;
 window.removeAttachment = removeAttachment;
 window.appendChatInfo = appendChatInfo;
@@ -47,6 +45,8 @@ function handleServerMessage(msg) {
   if (msg.type === 'role_models') { onRoleModels(msg); return; }
   if (msg.type === 'providers') { onProviders(msg); return; }
   if (msg.type === 'provider_test') { onProviderTest(msg); return; }
+  if (msg.type === 'mcp_servers') { onMcpServers(msg); return; }
+  if (msg.type === 'mcp_registry') { onMcpRegistry(msg); return; }
 
   switch (msg.type) {
     case 'config':        applyConfig(msg.data); break;
@@ -63,7 +63,14 @@ function handleServerMessage(msg) {
     case 'error':         onServerError(msg.text); break;
     case 'cleared':       break;
     case 'chat_saved':
-      if (msg.id) window.appState.currentChatId = msg.id;
+      // When this save was the "flush" half of starting a new chat, the
+      // conversation has already been cleared (currentChatId reset to null).
+      // Adopting the saved id here would make the fresh chat overwrite the
+      // one we just archived on its next save — so skip it in that case.
+      if (msg.id && !window.appState.suppressNextChatSavedId) {
+        window.appState.currentChatId = msg.id;
+      }
+      window.appState.suppressNextChatSavedId = false;
       refreshHistory();
       break;
     case 'chat_loaded': onChatLoaded(msg); break;
@@ -74,6 +81,8 @@ function handleServerMessage(msg) {
     case 'agent_done':        onAgentDone(msg); break;
     case 'research_complete':    onResearchComplete(msg); break;
     case 'permission_request':  onPermissionRequest(msg); break;
+    case 'user_question':       onUserQuestion(msg); break;
+    case 'todos':               onTodos(msg); break;
     case 'parallel_result':     onParallelResult(msg); break;
     default: break;
   }
@@ -305,6 +314,8 @@ function sendChat() {
   autoResizeTextarea(textarea);
   document.getElementById('chat-attachments').innerHTML = '';
   window.appState.attachedFiles = [];
+  // New user turn → start a fresh task checklist card if one appears.
+  window._lastTodoCard = null;
   setChatRunning(true);
 
   const model = document.getElementById('chat-model-select').value.trim();
@@ -596,6 +607,12 @@ function onPlan(text) {
 function onDone(iterations) {
   setChatRunning(false);
   appendChatInfo(`✓ Done (${iterations} iteration${iterations !== 1 ? 's' : ''})`);
+  // Auto-persist after every completed turn so the conversation shows up in
+  // history (and survives a reload) without requiring a "New Chat" click.
+  // Reuses currentChatId when set, so the same chat is updated in place.
+  if (window.appState.messages.length > 0) {
+    sendMsg({ type: 'save_chat', chat_id: window.appState.currentChatId || '' });
+  }
 }
 
 function onServerError(text) {
@@ -770,6 +787,84 @@ window.resolvePermission = function(btn, allow) {
 };
 
 // ──────────────────────────────────────────────────────────────
+// Task checklist (todo_write) — a single live card, updated in place
+// ──────────────────────────────────────────────────────────────
+function onTodos(msg) {
+  const todos = msg.todos || [];
+  const container = document.getElementById('chat-messages');
+  if (!container) return;
+  const done = todos.filter(t => t.status === 'completed').length;
+  const glyph = (s) => s === 'completed' ? '✓' : (s === 'in_progress' ? '▸' : '○');
+  const rows = todos.map(t =>
+    `<li class="todo-item todo-${esc(t.status)}"><span class="todo-glyph">${glyph(t.status)}</span>${esc(t.content)}</li>`
+  ).join('');
+  const inner = `
+    <div class="todo-header">
+      <span class="todo-title">Tasks</span>
+      <span class="todo-count">${done}/${todos.length}</span>
+    </div>
+    <ul class="todo-list">${rows}</ul>`;
+
+  // Reuse the most recent todo card if it's still the last meaningful block,
+  // otherwise append a fresh one so progress reads top-to-bottom.
+  let card = window._lastTodoCard;
+  if (!card || !card.parentElement) {
+    card = document.createElement('div');
+    card.className = 'msg msg-todos';
+    container.appendChild(card);
+    window._lastTodoCard = card;
+  }
+  card.innerHTML = `<div class="todo-card">${inner}</div>`;
+  scrollToBottom(container);
+}
+
+// ──────────────────────────────────────────────────────────────
+// ask_user — question card with optional quick-pick options
+// ──────────────────────────────────────────────────────────────
+function onUserQuestion(msg) {
+  const container = document.getElementById('chat-messages');
+  if (!container) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'msg msg-question';
+  const opts = (msg.options || []).map(o =>
+    `<button class="uq-opt" onclick="window.resolveUserQuestion(this, ${JSON.stringify(esc(o)).replace(/"/g, '&quot;')})">${esc(o)}</button>`
+  ).join('');
+  wrap.innerHTML = `
+    <div class="uq-card">
+      <div class="uq-header"><span class="uq-icon">?</span><span>The agent needs your input</span></div>
+      <div class="uq-body">${esc(msg.question)}</div>
+      ${opts ? `<div class="uq-options">${opts}</div>` : ''}
+      <div class="uq-input-row">
+        <input type="text" class="uq-input" placeholder="Type your answer…"
+               onkeydown="if(event.key==='Enter'){window.resolveUserQuestionInput(this);}">
+        <button class="uq-send" onclick="window.resolveUserQuestionInput(this.previousElementSibling)">Send</button>
+      </div>
+    </div>`;
+  container.appendChild(wrap);
+  scrollToBottom(container);
+  const inp = wrap.querySelector('.uq-input');
+  if (inp) inp.focus();
+}
+
+function _finishQuestion(node, answer) {
+  const card = node.closest('.uq-card');
+  if (card) {
+    card.innerHTML = `<div class="uq-header"><span class="uq-icon">✓</span><span>Answered</span></div>
+      <div class="uq-answered">${esc(answer)}</div>`;
+  }
+}
+window.resolveUserQuestion = function(btn, answer) {
+  sendMsg({ type: 'user_response', answer });
+  _finishQuestion(btn, answer);
+};
+window.resolveUserQuestionInput = function(input) {
+  const answer = (input.value || '').trim();
+  if (!answer) return;
+  sendMsg({ type: 'user_response', answer });
+  _finishQuestion(input, answer);
+};
+
+// ──────────────────────────────────────────────────────────────
 // Initialization
 // ──────────────────────────────────────────────────────────────
 
@@ -823,12 +918,16 @@ function populatePromptProfiles(profiles) {
     console.log('[app] Populated profiles from server:', profiles);
   }
 
-  // Restore previous selection if still valid, otherwise fall back to config or first item
+  // Restore previous selection if still valid, otherwise fall back to config,
+  // then to the 'base' default profile, then to the first available item.
   const pref = prev || window.appState?.config?.prompt_profile || '';
   const allValues = Array.from(sel.options).map(o => o.value);
   if (pref && allValues.includes(pref)) {
     sel.value = pref;
     console.log('[app] Restored profile selection:', pref);
+  } else if (allValues.includes('base')) {
+    sel.value = 'base';
+    console.log('[app] Defaulted to base profile');
   } else if (allValues.length > 0) {
     sel.value = allValues[0];
     console.log('[app] Defaulted to first profile:', allValues[0]);
@@ -844,7 +943,6 @@ function initApp() {
       const tab = btn.dataset.tab;
       document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
       document.getElementById('tab-' + tab).classList.add('active');
-      if (tab === 'files') refreshFileTree();
     });
   });
 
@@ -893,6 +991,9 @@ function initApp() {
 
   document.getElementById('chat-new-btn')?.addEventListener('click', () => {
     if (window.appState.messages.length > 0) {
+      // Archive the current conversation, but don't let the async chat_saved
+      // reply re-adopt its id onto the now-empty chat (see chat_saved handler).
+      window.appState.suppressNextChatSavedId = true;
       sendMsg({ type: 'save_chat', chat_id: window.appState.currentChatId || '' });
     }
     sendMsg({ type: 'chat_clear' });
@@ -933,17 +1034,19 @@ function initApp() {
     appendChatInfo(`🛡️ Permission mode set to [bold]${modeNames[e.target.value]}[/bold]. Will apply to next tool execution.`);
   });
 
-  // File refresh button
-  document.getElementById('files-refresh-btn')?.addEventListener('click', refreshFileTree);
-
   // Settings refresh button
   document.getElementById('settings-refresh-btn')?.addEventListener('click', () => {
     sendMsg({ type: 'get_config' });
     sendMsg({ type: 'list_providers' });
+    sendMsg({ type: 'list_mcp' });
+    sendMsg({ type: 'mcp_registry' });
   });
 
   // Custom-provider management
   initProviderForm();
+
+  // MCP server management
+  initMcpPanel();
 
   // Research start button
   document.getElementById('research-start-btn')?.addEventListener('click', () => {
@@ -970,11 +1073,6 @@ function initApp() {
       resume,
       working_dir: workingDir
     });
-  });
-
-  // Completion card buttons
-  document.getElementById('comp-files-btn')?.addEventListener('click', () => {
-    document.querySelector('[data-tab="files"]').click();
   });
 
   // Fetch available prompt profiles dynamically
@@ -1006,6 +1104,8 @@ function initApp() {
       sendMsg({ type: 'get_config' });
       sendMsg({ type: 'list_providers' });
       sendMsg({ type: 'list_models' });
+      sendMsg({ type: 'list_mcp' });
+      sendMsg({ type: 'mcp_registry' });
       if (window.appState.running) {
         window.appState.running = false;
         setChatRunning(false);
@@ -1246,6 +1346,184 @@ function initProviderForm() {
       const form = document.getElementById('provider-add-form');
       if (form) form.open = false;
     }, 300);
+  });
+}
+
+// ──────────────────────────────────────────────────────────────
+// MCP servers (Settings tab) — wire in external tools
+// ──────────────────────────────────────────────────────────────
+
+let _mcpRegistry = [];
+
+function onMcpRegistry(msg) {
+  _mcpRegistry = msg.entries || [];
+  renderMcpRegistry();
+}
+
+function renderMcpRegistry() {
+  const host = document.getElementById('mcp-registry-list');
+  if (!host) return;
+  if (!_mcpRegistry.length) { host.innerHTML = ''; return; }
+  // Group by category
+  const cats = {};
+  _mcpRegistry.forEach(e => { (cats[e.category] = cats[e.category] || []).push(e); });
+  host.innerHTML = Object.entries(cats).map(([cat, items]) => `
+    <div class="mcp-cat">${esc(cat)}</div>
+    ${items.map(e => {
+      const key = e.inputs.some(i => i.secret) ? ' <span class="mcp-key" title="Needs an API key/token">🔑</span>' : '';
+      let badge;
+      if (e.installed) badge = '<span class="mcp-badge mcp-badge-on">installed</span>';
+      else if (e.runtime === 'http') badge = '<span class="mcp-badge">remote</span>';
+      else if (e.runtime_available) badge = `<span class="mcp-badge">${esc(e.runtime)}</span>`;
+      else badge = `<span class="mcp-badge mcp-badge-warn">needs ${esc(e.runtime)}</span>`;
+      const btn = e.installed
+        ? `<button class="btn-link" disabled>installed</button>`
+        : (e.runtime_available
+            ? `<button class="btn-link" data-mcp-install="${esc(e.id)}">install</button>`
+            : `<button class="btn-link" disabled title="${esc(e.runtime_hint)}">unavailable</button>`);
+      return `
+        <div class="mcp-reg-row">
+          <div class="mcp-reg-main">
+            <span class="mcp-reg-name">${esc(e.name)}</span>
+            <span class="mcp-reg-id">${esc(e.id)}</span>${key} ${badge}
+          </div>
+          <div class="mcp-reg-summary">${esc(e.summary)}</div>
+          <div class="mcp-reg-actions">${btn}</div>
+        </div>`;
+    }).join('')}
+  `).join('');
+
+  host.querySelectorAll('button[data-mcp-install]').forEach(btn => {
+    btn.addEventListener('click', () => mcpInstallFlow(btn.dataset.mcpInstall));
+  });
+}
+
+function mcpInstallFlow(id) {
+  const entry = _mcpRegistry.find(e => e.id === id);
+  if (!entry) return;
+  const values = {};
+  for (const inp of entry.inputs) {
+    let def = '';
+    if (inp.default_wd) {
+      def = document.getElementById('settings-working-dir')?.value || '.';
+    }
+    const label = inp.secret ? `${inp.prompt} (kept private)` : inp.prompt;
+    const v = window.prompt(`${entry.name}: ${label}`, def);
+    if (v === null) return;  // cancelled
+    values[inp.key] = v.trim();
+  }
+  sendMsg({ type: 'install_mcp', id, values });
+}
+
+function onMcpServers(msg) {
+  const host = document.getElementById('mcp-servers-list');
+  if (!host) return;
+  const servers = msg.servers || [];
+  if (!servers.length) {
+    host.innerHTML = '<div class="mcp-empty">No MCP servers configured yet. Install one from the catalog below, or add a custom server.</div>';
+    return;
+  }
+  host.innerHTML = servers.map(s => {
+    let dot;
+    if (!s.enabled) dot = '<span class="mcp-dot mcp-dot-off"></span>disabled';
+    else if (s.connected) dot = `<span class="mcp-dot mcp-dot-on"></span>connected · ${s.tool_count} tools`;
+    else if (s.error) dot = `<span class="mcp-dot mcp-dot-err"></span>error`;
+    else dot = '<span class="mcp-dot"></span>not connected';
+    const toolList = (s.tools && s.tools.length)
+      ? `<div class="mcp-tools" title="${esc(s.tools.join(', '))}">${esc(s.tools.slice(0, 8).join(', '))}${s.tools.length > 8 ? ` +${s.tools.length - 8}` : ''}</div>`
+      : '';
+    const errLine = (!s.connected && s.enabled && s.error) ? `<div class="mcp-err">${esc(s.error)}</div>` : '';
+    return `
+      <div class="mcp-row">
+        <div class="mcp-row-head">
+          <span class="mcp-name">${esc(s.name)}</span>
+          <span class="mcp-transport">${esc(s.transport)}</span>
+          <span class="mcp-status">${dot}</span>
+          <div class="mcp-actions">
+            <button class="btn-link" data-mcp-act="${s.enabled ? 'disable' : 'enable'}" data-name="${esc(s.name)}">${s.enabled ? 'disable' : 'enable'}</button>
+            <button class="btn-link btn-link-danger" data-mcp-act="remove" data-name="${esc(s.name)}">remove</button>
+          </div>
+        </div>
+        <div class="mcp-target">${esc(s.target)}</div>
+        ${errLine}
+        ${toolList}
+      </div>`;
+  }).join('');
+
+  host.querySelectorAll('button[data-mcp-act]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const name = btn.dataset.name;
+      const act = btn.dataset.mcpAct;
+      if (act === 'remove') {
+        if (!confirm(`Remove MCP server "${name}"?`)) return;
+        sendMsg({ type: 'remove_mcp', name });
+      } else {
+        sendMsg({ type: 'toggle_mcp', name, enabled: act === 'enable' });
+      }
+    });
+  });
+}
+
+function initMcpPanel() {
+  document.getElementById('mcp-reconnect-btn')?.addEventListener('click', () => {
+    sendMsg({ type: 'reconnect_mcp' });
+  });
+
+  // Custom MCP add form
+  document.getElementById('mcp-add-btn')?.addEventListener('click', () => {
+    const name = (document.getElementById('mcp-name')?.value || '').trim();
+    const transport = document.getElementById('mcp-transport')?.value || 'stdio';
+    const statusEl = document.getElementById('mcp-form-status');
+    const setStatus = (t, k) => {
+      if (!statusEl) return;
+      statusEl.textContent = t || '';
+      statusEl.classList.remove('status-ok', 'status-fail');
+      if (k) statusEl.classList.add(k === 'ok' ? 'status-ok' : 'status-fail');
+    };
+    if (!name) { setStatus('Name is required.', 'fail'); return; }
+    let server;
+    if (transport === 'http') {
+      const url = (document.getElementById('mcp-url')?.value || '').trim();
+      if (!url) { setStatus('URL is required for http.', 'fail'); return; }
+      const headersRaw = (document.getElementById('mcp-headers')?.value || '').trim();
+      const headers = {};
+      headersRaw.split(',').forEach(p => {
+        const i = p.indexOf('=');
+        if (i > 0) headers[p.slice(0, i).trim()] = p.slice(i + 1).trim();
+      });
+      server = { name, url, headers, enabled: true };
+    } else {
+      const command = (document.getElementById('mcp-command')?.value || '').trim();
+      if (!command) { setStatus('Command is required for stdio.', 'fail'); return; }
+      const argsRaw = (document.getElementById('mcp-args')?.value || '').trim();
+      const args = argsRaw ? argsRaw.split(/\s+/) : [];
+      const envRaw = (document.getElementById('mcp-env')?.value || '').trim();
+      const env = {};
+      envRaw.split(',').forEach(p => {
+        const i = p.indexOf('=');
+        if (i > 0) env[p.slice(0, i).trim()] = p.slice(i + 1).trim();
+      });
+      server = { name, command, args, env, enabled: true };
+    }
+    setStatus('Adding…');
+    sendMsg({ type: 'add_mcp', server });
+    setTimeout(() => {
+      ['mcp-name', 'mcp-url', 'mcp-headers', 'mcp-command', 'mcp-args', 'mcp-env'].forEach(id => {
+        const el = document.getElementById(id); if (el) el.value = '';
+      });
+      setStatus('');
+      const form = document.getElementById('mcp-add-form');
+      if (form) form.open = false;
+    }, 300);
+  });
+
+  // Toggle stdio/http fields
+  document.getElementById('mcp-transport')?.addEventListener('change', (e) => {
+    const isHttp = e.target.value === 'http';
+    const stdioFields = document.getElementById('mcp-stdio-fields');
+    const httpFields = document.getElementById('mcp-http-fields');
+    if (stdioFields) stdioFields.style.display = isHttp ? 'none' : 'block';
+    if (httpFields) httpFields.style.display = isHttp ? 'block' : 'none';
   });
 }
 

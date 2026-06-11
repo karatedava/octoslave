@@ -51,12 +51,6 @@
       </svg>
       <span>Research</span>
     </button>
-    <button class="nav-btn" data-tab="files" title="Files">
-      <svg class="nav-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-      </svg>
-      <span>Files</span>
-    </button>
     <button class="nav-btn" data-tab="settings" title="Settings">
       <svg class="nav-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="12" cy="12" r="3"/>
@@ -363,44 +357,7 @@
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
               Open Report
             </a>
-            <button class="btn-secondary btn-sm" id="comp-files-btn">Browse Files</button>
           </span>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- ── TAB: FILES ─────────────────────────────────────────── -->
-  <div class="tab-pane" id="tab-files">
-    <div class="files-toolbar">
-      <div class="dir-field" style="flex:1;max-width:420px">
-        <svg class="dir-field-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-        </svg>
-        <input type="text" id="files-dir-input" placeholder="Working directory">
-        <button class="btn-browse" onclick="browseDir('files-dir-input')" title="Browse for folder">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="6 9 12 15 18 9"/>
-          </svg>
-        </button>
-      </div>
-      <button class="btn-secondary btn-sm" id="files-refresh-btn">Refresh</button>
-    </div>
-
-    <div class="files-container">
-      <div class="files-tree" id="files-tree">
-        <div class="file-tree-empty">Enter a directory and click Refresh.</div>
-      </div>
-      <div class="files-preview" id="files-preview">
-        <div class="preview-placeholder">
-          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-            <polyline points="14 2 14 8 20 8"/>
-            <line x1="16" y1="13" x2="8" y2="13"/>
-            <line x1="16" y1="17" x2="8" y2="17"/>
-            <polyline points="10 9 9 9 8 9"/>
-          </svg>
-          <p>Select a file to preview</p>
         </div>
       </div>
     </div>
@@ -505,11 +462,83 @@
         </div>
       </details>
     </div>
+
+    <!-- ── MCP servers card (wire in external tools) ─────────────── -->
+    <div class="settings-card settings-card-wide">
+      <div class="settings-card-header">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2" y="3" width="20" height="14" rx="2"/>
+          <line x1="8" y1="21" x2="16" y2="21"/>
+          <line x1="12" y1="17" x2="12" y2="21"/>
+          <circle cx="8" cy="10" r="1.4"/><circle cx="16" cy="10" r="1.4"/>
+          <line x1="9.4" y1="10" x2="14.6" y2="10"/>
+        </svg>
+        <h2>MCP Tools</h2>
+        <button class="btn-secondary btn-sm" id="mcp-reconnect-btn" type="button" style="margin-left:auto;">Reconnect all</button>
+      </div>
+
+      <div class="settings-note">
+        Wire in external tools via <strong>Model Context Protocol</strong> servers — git, GitHub,
+        a browser, databases, live docs, and more. Installed tools become available to the agent
+        in chat and research, namespaced <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>.
+      </div>
+
+      <h3 class="settings-subhead">Your servers</h3>
+      <div id="mcp-servers-list" class="mcp-servers-list"></div>
+
+      <h3 class="settings-subhead">Catalog <span class="provider-hint">— recommended servers, one-click install</span></h3>
+      <div id="mcp-registry-list" class="mcp-registry-list"></div>
+
+      <details class="provider-add-form" id="mcp-add-form">
+        <summary class="provider-add-summary">+ Add a custom server</summary>
+        <div class="provider-add-body">
+          <div class="settings-field">
+            <label>Name <span class="provider-hint">(unique, e.g. <code>my-tool</code>)</span></label>
+            <input type="text" id="mcp-name" placeholder="my-tool" autocomplete="off">
+          </div>
+          <div class="settings-field">
+            <label>Transport</label>
+            <select id="mcp-transport">
+              <option value="stdio">stdio (local subprocess)</option>
+              <option value="http">http (remote URL)</option>
+            </select>
+          </div>
+          <div id="mcp-stdio-fields">
+            <div class="settings-field">
+              <label>Command <span class="provider-hint">(e.g. <code>npx</code> or <code>uvx</code>)</span></label>
+              <input type="text" id="mcp-command" placeholder="npx" autocomplete="off">
+            </div>
+            <div class="settings-field">
+              <label>Arguments <span class="provider-hint">(space-separated)</span></label>
+              <input type="text" id="mcp-args" placeholder="-y @scope/some-mcp-server" autocomplete="off">
+            </div>
+            <div class="settings-field">
+              <label>Env <span class="provider-hint">(KEY=VALUE, comma-separated, optional)</span></label>
+              <input type="text" id="mcp-env" placeholder="API_KEY=xxx" autocomplete="off">
+            </div>
+          </div>
+          <div id="mcp-http-fields" style="display:none;">
+            <div class="settings-field">
+              <label>URL</label>
+              <input type="text" id="mcp-url" placeholder="https://host/mcp" autocomplete="off">
+            </div>
+            <div class="settings-field">
+              <label>Headers <span class="provider-hint">(KEY=VALUE, comma-separated, optional)</span></label>
+              <input type="text" id="mcp-headers" placeholder="Authorization=Bearer xxx" autocomplete="off">
+            </div>
+          </div>
+          <div class="provider-form-actions">
+            <button class="btn-primary btn-sm" id="mcp-add-btn" type="button">Add server</button>
+            <span id="mcp-form-status" class="provider-form-status"></span>
+          </div>
+        </div>
+      </details>
+    </div>
   </div>
 
 </main>
 
-<script type="module" src="/static/js/app.js?v=20260507a"></script>
+<script type="module" src="/static/js/app.js?v=20260608c"></script>
 
 </body>
 </html>

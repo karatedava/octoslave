@@ -225,7 +225,6 @@ export function applyConfig(data) {
   }
   document.getElementById('chat-dir-input').value     = dir;
   document.getElementById('research-dir-input').value = dir;
-  document.getElementById('files-dir-input').value    = dir;
 
   document.getElementById('settings-api-key').value     = data?.has_api_key ? '••••••••' : '';
   document.getElementById('settings-nim-api-key').value = data?.has_nim_key  ? '••••••••' : '';

@@ -121,16 +121,30 @@ gh workflow run build-installers.yml
 
 ## Version Bumping
 
-1. Update version strings in:
-   - `pyproject.toml`
-   - `installers/macos/octoslave.spec` (`CFBundleShortVersionString`)
-   - `installers/windows/installer.iss` (`#define AppVersion`)
-2. Commit and tag:
+The version has a **single source of truth: `[project] version` in `pyproject.toml`.**
+Everything else derives from it automatically — `ots --version`,
+`octoslave.__version__`, the macOS `.app` bundle version, the Windows installer
+version, and every artifact filename (all resolved via `scripts/version.py`).
+
+To cut a release:
+
+1. Bump the one number in `pyproject.toml`, e.g. `version = "0.3.0"`.
+2. Commit, then tag with a **matching** `vX.Y.Z` and push the tag:
    ```bash
+   git commit -am "Release 0.3.0"
    git tag -a v0.3.0 -m "Release 0.3.0"
-   git push origin v0.3.0
+   git push origin main --tags
    ```
-3. Actions will draft a release with all three installers attached.
+3. CI verifies the tag matches `pyproject.toml` (the `verify-version` job fails
+   the build if they differ), then drafts a release with all three installers
+   attached — named `OctoSlave-macOS-0.3.0.dmg`,
+   `OctoSlave-Windows-Installer-0.3.0.exe`, `OctoSlave-0.3.0-x86_64.AppImage`.
+4. The release is created as a **draft** — review it and click Publish. Older
+   releases remain available on the Releases page; nothing is overwritten.
+
+> Follow [semantic versioning](https://semver.org): MAJOR.MINOR.PATCH —
+> bump PATCH for fixes, MINOR for backward-compatible features, MAJOR for
+> breaking changes.
 
 ---
 
