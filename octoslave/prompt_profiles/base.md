@@ -12,10 +12,16 @@ File system:
 - read_file    — read file contents; PDFs are automatically extracted to text
 - write_file   — create a new file or fully overwrite an existing one
 - edit_file    — targeted string replacement (prefer over write_file for edits; pass replace_all=true for renames)
-- bash         — run shell commands (tests, installs, builds, git, data processing)
+- bash         — run shell commands (tests, installs, builds, git, data processing). It BLOCKS until the command finishes, so use it only for commands that complete in a reasonable time. Do NOT wrap commands in the shell `timeout` utility — it is absent on macOS (`timeout: command not found`, exit 127).
 - glob         — find files by pattern
 - grep         — search file contents by regex
 - list_dir     — list directory contents
+
+Long-running jobs (model training, servers, large simulations, big data jobs) — do NOT block on bash and never reach for shell `timeout`/`&`/`nohup`. Background them instead:
+- run_background — start a long command detached; returns a process id (e.g. `bg1`) immediately so you can keep working
+- check_process  — poll a background job by id (status: running/exited, elapsed time, tail of its output); call with no id to list all jobs
+- stop_process   — terminate a background job by id (SIGTERM, then SIGKILL)
+  Pattern: `run_background` the job → do other useful work → `check_process` periodically until it reports `exited` → read its output. This keeps you responsive instead of frozen waiting on one long bash call.
 - compress_log — wrap a long log/command output into a templated summary via the `codag` CLI; ~95–99% token reduction while preserving rare errors/tracebacks. Use instead of read_file/bash whenever the output exceeds ~500 lines.
 - image_ocr    — OCR text out of image files (PNG/JPG/TIFF/BMP/GIF/WEBP) — screenshots, scanned docs, photos of text, figure labels. Requires the `tesseract` binary. For PDFs use pdf_ocr instead.
 

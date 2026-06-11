@@ -3,9 +3,16 @@
 import json
 import os
 import re
+import threading
 from datetime import date, date as _date_cls
 from pathlib import Path
-from openai import OpenAI, BadRequestError
+from openai import (
+    OpenAI,
+    BadRequestError,
+    APIConnectionError,
+    APITimeoutError,
+    APIStatusError,
+)
 
 from . import display
 from . import logger
@@ -137,7 +144,58 @@ def _extract_text_tool_calls(content: str) -> tuple[list[dict], str]:
 
     return calls, truncated
 
+
+def _looks_like_tool_attempt(content: str, valid_names) -> bool:
+    """True if a text-only response looks like a *failed* attempt to call a tool
+    rather than a genuine "I'm done" message.
+
+    Some endpoints (e.g. e-INFRA's gemma4) emit tool calls as broken custom text
+    like ``<|tool_call>call:list_dir{path:<|"|>results/<|"|>}<tool_call|>`` that is
+    neither the structured function-calling protocol nor valid JSON, so
+    ``_extract_text_tool_calls`` cannot parse it. Such a turn must NOT be counted
+    toward the "model declared done" text-only total — the model is trying to act,
+    not finishing — otherwise three of them trigger a false completion."""
+    if not content:
+        return False
+    low = content.lower()
+    # Generic tool-call framing markers various templates emit.
+    if "tool_call" in low or "tool▁call" in low or "<tool" in low:
+        return True
+    if '"name"' in low and ('"arguments"' in low or '"parameters"' in low):
+        return True
+    # A real tool name used in a call-ish position: call:NAME / NAME( / NAME{ .
+    for n in valid_names:
+        nl = n.lower()
+        if f"call:{nl}" in low or f"{nl}(" in low or f"{nl}{{" in low:
+            return True
+    return False
+
+
 MAX_ITERATIONS = 100
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    """True if the exception looks like a transient upstream gateway hiccup that
+    we should retry rather than abort on.
+
+    Covers connection drops mid-stream (``APIConnectionError`` →
+    "peer closed connection without sending complete message body",
+    "incomplete chunked read", "connection reset"), request timeouts, and
+    gateway 502/503/504s. e-INFRA / NIM endpoints throw these on long-TTFT
+    calls when a model "thinks" for tens of seconds before the first token."""
+    if isinstance(exc, (APIConnectionError, APITimeoutError)):
+        return True
+    if isinstance(exc, APIStatusError):
+        return exc.status_code in (502, 503, 504)
+    s = str(exc).lower()
+    return (
+        "peer closed connection" in s
+        or "incomplete chunked read" in s
+        or "connection reset" in s
+        or "connection error" in s
+        or "server disconnected" in s
+    )
+
 
 # Hard cap on characters in a single tool result that goes into the message history.
 # Prevents a single large file/page from blowing up the context window.
@@ -145,17 +203,128 @@ MAX_TOOL_RESULT_CHARS = 50_000
 
 # Ollama allocates a KV cache sized to num_ctx at load time. Without this hint it
 # uses the model's full trained context length, which drains GPU memory even for
-# short conversations. 8192 is a generous interactive budget; raise if you need more.
+# short conversations. This is only a *fallback* — at run time we auto-size from
+# the model's advertised context_length (see _resolve_ollama_num_ctx), capped to
+# keep the KV cache RAM-reasonable. Override the cap with
+# OCTOSLAVE_OLLAMA_NUM_CTX_MAX, or force an exact value with OCTOSLAVE_OLLAMA_NUM_CTX.
 OLLAMA_NUM_CTX = 8192
+# Upper bound on auto-sized local context (KV-cache RAM guard). gemma4:12b et al.
+# advertise 131072 — we don't want to allocate that much KV cache by default.
+_OLLAMA_NUM_CTX_MAX = int(os.environ.get("OCTOSLAVE_OLLAMA_NUM_CTX_MAX", "32768"))
 
 # Proactive context-budget. The agent estimates total tokens via chars/4 and
 # compacts message history BEFORE sending when this threshold is exceeded —
 # instead of waiting for the API to return a 400. Default ~96K tokens fits a
 # Kimi K2 / 128K-window safely. Override with OCTOSLAVE_SOFT_CONTEXT_TOKENS.
+# For local Ollama models this is overridden at run time to track the (much
+# smaller) real window — see configure_runtime / _RT.
 _SOFT_CONTEXT_BUDGET = int(os.environ.get("OCTOSLAVE_SOFT_CONTEXT_TOKENS", "96000"))
 
 # Path to prompt profiles directory
 PROMPT_PROFILES_DIR = Path(__file__).parent / "prompt_profiles"
+
+# Per-thread runtime knobs, set once per run by configure_runtime() based on the
+# backend. Lets the context/tool helpers adapt to small local models WITHOUT
+# threading params through every call site, and WITHOUT touching the big-model
+# (e-INFRA / NIM / custom) path. threading.local() keeps parallel runs isolated
+# (mirrors display.py's _streaming_started pattern).
+_RT = threading.local()
+
+
+def _rt(attr: str, default):
+    return getattr(_RT, attr, default)
+
+
+# model → {"num_ctx": int, "thinking": bool}, populated from /api/show
+_OLLAMA_INFO_CACHE: dict[str, dict] = {}
+
+
+def _is_ollama_client(client) -> bool:
+    try:
+        return OLLAMA_BASE_URL.rstrip("/").rsplit("/v1", 1)[0] in str(client.base_url)
+    except Exception:
+        return False
+
+
+def _ollama_model_info(client, model: str) -> dict:
+    """Probe /api/show once per model: advertised context_length (capped to
+    _OLLAMA_NUM_CTX_MAX; OCTOSLAVE_OLLAMA_NUM_CTX forces an exact value) and
+    whether the model has the 'thinking' capability. Cached; safe on any error."""
+    if model in _OLLAMA_INFO_CACHE:
+        return _OLLAMA_INFO_CACHE[model]
+    info = {"num_ctx": OLLAMA_NUM_CTX, "thinking": False}
+    try:
+        import urllib.request
+        base = str(client.base_url).rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        req = urllib.request.Request(
+            f"{base}/api/show",
+            data=json.dumps({"name": model}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.load(resp)
+        mi = data.get("model_info", {})
+        ctx = next((v for k, v in mi.items()
+                    if k.endswith("context_length") and isinstance(v, int)), None)
+        if ctx and ctx > 0:
+            info["num_ctx"] = min(ctx, _OLLAMA_NUM_CTX_MAX)
+        info["thinking"] = "thinking" in (data.get("capabilities") or [])
+    except Exception:
+        pass
+    forced = os.environ.get("OCTOSLAVE_OLLAMA_NUM_CTX")
+    if forced and forced.isdigit():
+        info["num_ctx"] = int(forced)
+    _OLLAMA_INFO_CACHE[model] = info
+    return info
+
+
+def _ollama_extra_body() -> dict:
+    """Ollama-specific request knobs (passed via the SDK's extra_body).
+
+    - num_ctx: KV-cache size hint (honored by GGUF/llama.cpp models; ignored by
+      the MLX runner, which always uses the model's full window — harmless).
+    - think: thinking models (e.g. gemma3/gemma4, nemotron) reason internally
+      before each turn. Kept ON by default so local models run at full power; the
+      reasoning is streamed to the display (see stream_reason) so a long thinking
+      turn shows visible progress instead of looking hung. Set
+      OCTOSLAVE_OLLAMA_THINK=0 to disable thinking for much faster tool calls."""
+    body: dict = {"options": {"num_ctx": _rt("num_ctx", None) or OLLAMA_NUM_CTX}}
+    # Only touch `think` for models that actually support it (passing it to a
+    # non-thinking model can be rejected by Ollama). Default: leave thinking on;
+    # only send think:false when the user explicitly opts out for speed.
+    think_env = os.environ.get("OCTOSLAVE_OLLAMA_THINK")
+    if _rt("ollama_thinking", False) and think_env is not None \
+            and think_env.lower() in ("0", "false", "no", "off"):
+        body["think"] = False
+    return body
+
+
+def configure_runtime(client, model: str, prompt_profile: str) -> bool:
+    """Set per-thread runtime knobs based on the backend. Returns True for local
+    (Ollama) runs. For local: auto-size num_ctx, then derive a soft trim budget
+    (75% of the real window, so the proactive trimmer fires BEFORE Ollama
+    silently truncates) and a per-tool-result cap (~1/3 of the window, so one
+    big read can't overflow). For everything else: keep the defaults verbatim."""
+    if _is_ollama_client(client):
+        meta = _ollama_model_info(client, model)
+        num_ctx = meta["num_ctx"]
+        _RT.num_ctx = num_ctx
+        _RT.soft_budget = max(2048, int(num_ctx * 0.75))
+        _RT.tool_result_chars = max(4000, num_ctx * 4 // 3)  # ~1/3 window, tokens→chars
+        _RT.ollama_thinking = meta["thinking"]
+        # Curate the tool surface for ANY local run, regardless of the prompt
+        # profile name — the auto-"local" switch lives in a config dict that may
+        # not reach this function, so we key off the backend, not the name.
+        _RT.tool_profile = "local"
+        return True
+    _RT.num_ctx = None
+    _RT.soft_budget = _SOFT_CONTEXT_BUDGET
+    _RT.tool_result_chars = MAX_TOOL_RESULT_CHARS
+    _RT.ollama_thinking = False
+    _RT.tool_profile = None
+    return False
 
 
 def list_prompt_profiles() -> list[str]:
@@ -521,12 +690,17 @@ def _estimated_tokens(messages: list[dict]) -> int:
 
 def _proactive_trim(
     messages: list[dict],
-    soft_budget: int = _SOFT_CONTEXT_BUDGET,
+    soft_budget: int | None = None,
     label: str = "",
 ) -> list[dict]:
     """If estimated tokens > soft_budget, compact in a loop until under budget
     or no more groups can be compacted. Returns the trimmed list (or original
-    if no trim was needed / possible). Logs each round it actually trimmed."""
+    if no trim was needed / possible). Logs each round it actually trimmed.
+
+    soft_budget defaults to the per-thread runtime budget (small for local
+    Ollama models, _SOFT_CONTEXT_BUDGET for everything else)."""
+    if soft_budget is None:
+        soft_budget = _rt("soft_budget", _SOFT_CONTEXT_BUDGET)
     est = _estimated_tokens(messages)
     if est <= soft_budget:
         return messages
@@ -653,11 +827,16 @@ def make_client(api_key: str, base_url: str) -> OpenAI:
 
 
 def _cap_result(result: str, tool_name: str) -> str:
-    """Truncate oversized tool results before they enter the message history."""
-    if len(result) <= MAX_TOOL_RESULT_CHARS:
+    """Truncate oversized tool results before they enter the message history.
+
+    The cap is the per-thread runtime value — much smaller for local Ollama
+    models (~1/3 of their real window) so a single big read can't overflow the
+    context; MAX_TOOL_RESULT_CHARS for everything else."""
+    cap = _rt("tool_result_chars", MAX_TOOL_RESULT_CHARS)
+    if len(result) <= cap:
         return result
-    kept = result[:MAX_TOOL_RESULT_CHARS]
-    omitted = len(result) - MAX_TOOL_RESULT_CHARS
+    kept = result[:cap]
+    omitted = len(result) - cap
     return (
         kept
         + f"\n\n[TRUNCATED — {omitted:,} more characters omitted. "
@@ -667,10 +846,12 @@ def _cap_result(result: str, tool_name: str) -> str:
 
 def _simple_completion(client: OpenAI, model: str, messages: list, max_tokens: int = 600) -> str:
     """Non-streaming completion without tools — used for planning and verification."""
+    extra = {"extra_body": _ollama_extra_body()} if _is_ollama_client(client) else {}
     try:
         resp = client.chat.completions.create(
             model=model,
             messages=messages,
+            **extra,
             max_tokens=max_tokens,
             timeout=120.0,
         )
@@ -747,13 +928,13 @@ def _stream_completion(client: OpenAI, model: str, messages: list, force_tool: b
 
     display.stream_start()
 
-    is_ollama = OLLAMA_BASE_URL.rstrip("/") in str(client.base_url).rstrip("/")
-    extra = {"extra_body": {"options": {"num_ctx": OLLAMA_NUM_CTX}}} if is_ollama else {}
+    is_ollama = _is_ollama_client(client)
+    extra = {"extra_body": _ollama_extra_body()} if is_ollama else {}
 
     with client.chat.completions.create(
         model=model,
         messages=messages,
-        tools=all_tool_definitions(),
+        tools=all_tool_definitions(profile=_rt("tool_profile", None)),
         tool_choice="required" if force_tool else "auto",
         stream=True,
         **extra,
@@ -763,6 +944,13 @@ def _stream_completion(client: OpenAI, model: str, messages: list, force_tool: b
                 continue
             choice = chunk.choices[0]
             delta = choice.delta
+
+            # Thinking models (Ollama) stream their reasoning in a separate delta
+            # field before any content/tool call. Surface it so a long thinking
+            # turn shows visible progress instead of a frozen "waiting" spinner.
+            reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+            if reasoning:
+                display.stream_reason(reasoning)
 
             if delta.content:
                 content_parts.append(delta.content)
@@ -825,6 +1013,20 @@ def run_agent(
     from .tools import init_mcp
     init_mcp()
 
+    # Adapt context/tool knobs to the backend (small-model accommodations for
+    # local Ollama; no-op for e-INFRA / NIM / custom).
+    is_local = configure_runtime(client, model, prompt_profile)
+    if is_local:
+        think_note = ""
+        if _rt("ollama_thinking", False):
+            think_env = (os.environ.get("OCTOSLAVE_OLLAMA_THINK") or "").lower()
+            think_off = think_env in ("0", "false", "no", "off")
+            think_note = f", thinking {'off' if think_off else 'on'}"
+        display.print_info(
+            f"Local model: context window {_rt('num_ctx', OLLAMA_NUM_CTX):,} tokens, "
+            f"{len(all_tool_definitions(profile=_rt('tool_profile', None)))} tools{think_note}."
+        )
+
     system_prompt = load_system_prompt(prompt_profile, working_dir)
 
     # Inject session memory into system prompt when available, ranked by
@@ -851,12 +1053,17 @@ def run_agent(
         {"role": "user", "content": task},
     ]
 
-    # Upfront planning pass
-    if enable_plan:
+    # Upfront planning pass. Skipped for local models: the dedicated non-streaming
+    # planning call adds a long blind stall (model load + up to 120s) and spends
+    # ~900 tokens of an already-tiny context window on a plan small models follow
+    # poorly. They plan inline in the main loop instead.
+    if enable_plan and not is_local:
         messages, plan_text = _planning_step(task, system_prompt, client, model, messages)
         if plan_text and plan_out is not None:
             plan_out.append(plan_text)
             logger.log_plan(plan_text)
+    elif enable_plan and is_local:
+        display.print_info("Local model: skipping separate planning step (plans inline).")
 
     # Main agent loop
     messages = _agent_loop(messages, model, working_dir, client, permission_mode)
@@ -889,6 +1096,11 @@ def continue_agent(
     from .tools import init_mcp
     init_mcp()
 
+    # Re-apply backend-adaptive knobs (per-thread state may be stale/unset on a
+    # fresh follow-up turn or a different thread).
+    prompt_profile = "local" if _is_ollama_client(client) else "base"
+    configure_runtime(client, model, prompt_profile)
+
     messages.append({"role": "user", "content": follow_up})
     return _agent_loop(messages, model, working_dir, client, permission_mode)
 
@@ -905,9 +1117,12 @@ def _agent_loop(
     iteration = 0
     _rate_limit_retries = 0
     _timeout_retries = 0
+    _conn_retries = 0  # transient connection-drop / gateway-5xx retries
+    _end_reason = "completed"  # how the loop terminated (for accurate session_end log)
     _tool_call_counts: Counter = Counter()  # (name, args_json) → call count
     _no_tool_nudges = 0  # consecutive text-only responses (resets on tool use)
     _text_only_total = 0  # total text-only responses across the whole run
+    _botched_attempts = 0  # consecutive unparseable text-format tool-call attempts
     _redundant_calls = 0  # total tool calls whose (name, args) had been seen before
     _consecutive_error_turns = 0  # turns in a row where at least one tool failed
 
@@ -926,6 +1141,7 @@ def _agent_loop(
             response = _stream_completion(client, model, messages, force_tool=_force)
             _rate_limit_retries = 0
             _timeout_retries = 0
+            _conn_retries = 0
         except BadRequestError as e:
             err_str = str(e)
             logger.log_error(f"BadRequestError on turn {iteration}", exc=e)
@@ -969,6 +1185,7 @@ def _agent_loop(
                 continue
             else:
                 display.print_error(f"API error: {e}")
+            _end_reason = "error"
             break
         except KeyboardInterrupt:
             display.stream_end(False)
@@ -983,6 +1200,7 @@ def _agent_loop(
                 display.print_info(f"Rate limit — waiting {wait}s ({_rate_limit_retries}/5).")
                 if _rate_limit_retries > 5:
                     display.print_error("Rate limit persists after 5 retries.")
+                    _end_reason = "error"
                     break
                 _time.sleep(wait)
                 iteration -= 1  # don't count this as a used iteration
@@ -993,6 +1211,24 @@ def _agent_loop(
                 display.print_info(f"Request timeout — retrying in {wait}s ({_timeout_retries}/3).")
                 if _timeout_retries > 3:
                     display.print_error("Request keeps timing out after 3 retries.")
+                    _end_reason = "error"
+                    break
+                _time.sleep(wait)
+                iteration -= 1
+                continue
+            elif _is_retryable_error(e):
+                # Transient connection drop ("peer closed connection without sending
+                # complete message body" / "incomplete chunked read") or gateway 5xx.
+                # These hit long-TTFT models mid-stream; a fresh retry usually works.
+                _conn_retries += 1
+                wait = min(30, 5 * (2 ** (_conn_retries - 1)))
+                logger.log_error(f"Connection error on turn {iteration}", exc=e)
+                display.print_info(
+                    f"Connection dropped — retrying in {wait}s ({_conn_retries}/4)."
+                )
+                if _conn_retries > 4:
+                    display.print_error("Connection keeps dropping after 4 retries.")
+                    _end_reason = "error"
                     break
                 _time.sleep(wait)
                 iteration -= 1
@@ -1003,6 +1239,7 @@ def _agent_loop(
                     "Switch to a different model with [bold]/model <name>[/bold]  "
                     "or run [bold]/model[/bold] to list available models."
                 )
+                _end_reason = "error"
                 break
             elif "404" in err_str:
                 if "not found for account" in err_str.lower():
@@ -1019,8 +1256,11 @@ def _agent_loop(
                         "Switch to a different model with [bold]/model <name>[/bold]  "
                         "or run [bold]/model[/bold] to list available models."
                     )
+                _end_reason = "error"
                 break
+            logger.log_error(f"Unexpected error on turn {iteration}", exc=e)
             display.print_error(f"Unexpected error: {e}")
+            _end_reason = "error"
             break
 
         content = response["content"]
@@ -1052,6 +1292,39 @@ def _agent_loop(
         messages.append(assistant_msg)
 
         if not tool_calls:
+            # Distinguish a genuine "I'm done" text reply from a model that TRIED
+            # to call a tool but emitted an unparseable text format (e.g. gemma4's
+            # <|tool_call>call:NAME{…}<tool_call|>). The latter must not count as a
+            # finished-signal, or repeated formatting failures fake a completion.
+            if content and _looks_like_tool_attempt(content, valid_tool_names()):
+                _botched_attempts += 1
+                logger.log_info(
+                    "Unparseable text-format tool call — nudging for correct format.",
+                    iteration=iteration,
+                )
+                if _botched_attempts >= 4:
+                    display.print_error(
+                        "Model keeps emitting tool calls in an unsupported text format "
+                        "and cannot use the function-calling interface. Stopping."
+                    )
+                    _end_reason = "error"
+                    break
+                display.print_info(
+                    "Model emitted a malformed text tool call — asking it to use the "
+                    "proper format."
+                )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your last message looked like an attempt to call a tool, but it "
+                        "was not in a valid format, so nothing ran. Do NOT wrap tool calls "
+                        "in <tool_call> markers or any custom syntax. Call the tool through "
+                        "the function-calling interface directly. Retry the action now."
+                    ),
+                })
+                continue
+            # Genuine text-only reply: a real "done" or chit-chat.
+            _botched_attempts = 0
             _no_tool_nudges += 1
             _text_only_total += 1
             # If the model has declared "done" multiple times across the run
@@ -1180,7 +1453,7 @@ def _agent_loop(
                 "(task likely complete)."
             )
             display.print_done(iteration)
-            logger.log_session_end(iteration, reason="redundant_calls")
+            _end_reason = "redundant_calls"
             break
 
         display.print_separator()
@@ -1190,5 +1463,5 @@ def _agent_loop(
         logger.log_session_end(iteration, reason="max_iterations")
         return messages
 
-    logger.log_session_end(iteration, reason="completed")
+    logger.log_session_end(iteration, reason=_end_reason)
     return messages

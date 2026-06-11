@@ -211,13 +211,23 @@ _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _SPINNER_CLEAR  = "\r\x1b[2K"
 
 
-def _spinning(stop_event: _threading.Event) -> None:
-    """Background thread: animate a waiting indicator until stop_event is set."""
+def _spinning(stop_event: _threading.Event, spin: dict) -> None:
+    """Background thread: animate a waiting indicator until stop_event is set.
+
+    `spin` is a plain dict shared with the producer thread (stream_reason
+    updates it) — it can't be threading.local since this runs in its own thread.
+    Once reasoning tokens start arriving the label switches to "thinking…" with a
+    live character count, so a long thinking turn shows real progress."""
     i = 0
     while not stop_event.wait(timeout=0.1):
         frame = _SPINNER_FRAMES[i % len(_SPINNER_FRAMES)]
         elapsed = int(i * 0.1)
-        sys.stdout.write(f"\r  {frame} waiting for model… {elapsed}s")
+        if spin.get("reasoning"):
+            sys.stdout.write(
+                f"\r\x1b[2K  {frame} 💭 thinking… {elapsed}s ({spin.get('chars', 0):,} chars)"
+            )
+        else:
+            sys.stdout.write(f"\r  {frame} waiting for model… {elapsed}s")
         sys.stdout.flush()
         i += 1
     sys.stdout.write(_SPINNER_CLEAR)
@@ -239,7 +249,11 @@ def stream_start():
         return
     stop = _threading.Event()
     _stream_state.stop_event = stop
-    t = _threading.Thread(target=_spinning, args=(stop,), daemon=True)
+    # Shared (non-thread-local) state so the spinner thread can see reasoning
+    # progress reported by stream_reason on the producer thread.
+    spin = {"reasoning": False, "chars": 0}
+    _stream_state.spin_state = spin
+    t = _threading.Thread(target=_spinning, args=(stop, spin), daemon=True)
     _stream_state.spinner_thread = t
     t.start()
 
@@ -252,6 +266,19 @@ def stream_chunk(text: str):
         _stream_state.started = True
         _stream_state.buffer = ""
     _stream_state.buffer = getattr(_stream_state, "buffer", "") + text
+
+
+def stream_reason(text: str):
+    """Surface a chunk of a thinking model's reasoning trace. Emits a web event
+    and updates the shared spinner state so the CLI shows live "thinking…"
+    progress (char count) instead of a frozen "waiting for model" spinner."""
+    _emit({"type": "reasoning", "text": text})
+    if _silent():
+        return
+    spin = getattr(_stream_state, "spin_state", None)
+    if spin is not None:
+        spin["reasoning"] = True
+        spin["chars"] = spin.get("chars", 0) + len(text)
 
 
 def stream_end(had_content: bool):

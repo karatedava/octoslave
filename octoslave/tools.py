@@ -500,8 +500,28 @@ def _mcp_manager():
         return None
 
 
-def all_tool_definitions() -> list[dict]:
-    """Built-in tools plus any tools exposed by connected MCP servers."""
+# Curated tool surface for small local models. Handing a 12B model all ~37
+# schemas (incl. bio lookups + MCP log-tailers) dilutes its attention and
+# induces wrong/malformed tool calls. Local runs see only the essentials for
+# file/data/web work. Big models (e-INFRA / NIM / custom) are unaffected — they
+# only ever pass profile=None and keep the full surface.
+LOCAL_TOOL_ALLOWLIST = frozenset({
+    "read_file", "write_file", "edit_file", "bash",
+    "glob", "grep", "list_dir",
+    "web_search", "web_fetch",
+})
+
+
+def all_tool_definitions(profile: str | None = None) -> list[dict]:
+    """Built-in tools plus any tools exposed by connected MCP servers.
+
+    When profile == "local" (small local/Ollama models), return only the
+    curated LOCAL_TOOL_ALLOWLIST and skip MCP tools entirely — a tight,
+    high-signal surface that small models can actually use reliably.
+    """
+    if profile == "local":
+        return [td for td in TOOL_DEFINITIONS
+                if td["function"]["name"] in LOCAL_TOOL_ALLOWLIST]
     mgr = _mcp_manager()
     if mgr is None:
         return list(TOOL_DEFINITIONS)

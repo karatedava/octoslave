@@ -11,7 +11,8 @@ File system:
 - read_file    — read file contents; PDFs are automatically extracted to text
 - write_file   — create or fully overwrite a file
 - edit_file    — targeted string replacement (prefer over write_file for edits)
-- bash         — run shell commands (tests, installs, builds, git, data processing)
+- bash         — run shell commands (tests, installs, builds, git, data processing). Blocks until done; never wrap in the shell `timeout` utility (absent on macOS, exit 127).
+- run_background / check_process / stop_process — for long jobs (model fits, large data processing, simulations): start detached with run_background (returns a `bgN` id), keep working, poll with check_process until it reports `exited`, then read its output. Use these instead of a blocking bash call.
 - glob         — find files by pattern
 - grep         — search file contents by regex
 - list_dir     — list directory contents
