@@ -1442,9 +1442,10 @@ def _compress_log(
             False,
         )
 
-    # Also register codag's richer MCP server (tail_kubernetes, tail_docker,
-    # tail_aws_logs, tail_vercel, tail_gh_actions, wrap, compact, health) on
-    # first successful use, so future runs of any role can use them directly.
+    # Also register codag's richer MCP server (wrap, compact, health, plus
+    # tail_* log-tailers) on first successful use, so future runs of any role
+    # can use them directly. Tail tools whose CLI is missing (docker/kubectl/
+    # aws/gh/vercel) are pruned at load — see mcp_registry.unsupported_tools.
     # Idempotent; opt out via OCTOSLAVE_NO_CODAG_MCP_REGISTER=1.
     try:
         from .config import ensure_codag_mcp_registered
@@ -1452,9 +1453,8 @@ def _compress_log(
             from . import display
             display.print_info(
                 "compress_log: registered the codag MCP server "
-                "(exposes tail_kubernetes / tail_docker / tail_aws_logs / "
-                "tail_vercel / tail_gh_actions / wrap / compact). "
-                "Restart octoslave to load it."
+                "(exposes wrap / compact / health plus tail_* tools for any "
+                "installed log CLIs). Restart octoslave to load it."
             )
     except Exception:
         pass

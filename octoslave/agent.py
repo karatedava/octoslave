@@ -860,23 +860,121 @@ def _simple_completion(client: OpenAI, model: str, messages: list, max_tokens: i
         return ""
 
 
+# Read-only tools the model may use while orienting itself before it plans.
+# Deliberately excludes everything that writes, runs commands, or hits the
+# network so the orientation pass can never mutate state or stall on a slow
+# command — it just looks at the local workdir, code, and data.
+_ORIENT_TOOLS = frozenset({"read_file", "list_dir", "glob", "grep", "bio_inspect"})
+
+_ORIENT_PROMPT = (
+    "Before you plan, ORIENT yourself in the working directory. Using ONLY "
+    "read-only tools (list_dir, glob, grep, read_file, bio_inspect): explore the "
+    "directory layout, read the task and any files it references, and inspect the "
+    "specific code and data you will need to change. Do NOT write, edit, or run "
+    "anything yet. When you have seen enough to write a concrete, file-specific "
+    "plan, stop calling tools and reply with just the word READY."
+)
+
+
+def _orientation_phase(
+    client: OpenAI,
+    model: str,
+    messages: list[dict],
+    working_dir: str,
+    permission_mode: str,
+    max_rounds: int = 5,
+) -> list[dict]:
+    """Let the model look around with read-only tools before it plans.
+
+    Runs a short, bounded loop that offers ONLY ``_ORIENT_TOOLS`` and executes
+    any read-only calls the model makes, so the subsequent plan is grounded in
+    files it has actually read. All messages are appended, so the main loop
+    inherits the gathered context and need not re-read. Best-effort: any error
+    just ends orientation early and falls through to planning.
+    """
+    orient_tools = [td for td in all_tool_definitions(profile=_rt("tool_profile", None))
+                    if td["function"]["name"] in _ORIENT_TOOLS]
+    if not orient_tools:
+        return messages
+
+    display.print_info("Orienting…")
+    messages = list(messages) + [{"role": "user", "content": _ORIENT_PROMPT}]
+
+    for rnd in range(max_rounds):
+        try:
+            response = _stream_completion(
+                client, model, messages,
+                force_tool=(rnd == 0),  # ensure it actually starts looking
+                tools=orient_tools,
+            )
+        except Exception as e:  # noqa: BLE001 — orientation is best-effort
+            display.print_info(f"Orientation ended early ({type(e).__name__}).")
+            break
+
+        content = response.get("content") or ""
+        tool_calls = response.get("tool_calls") or []
+        if not tool_calls and content:
+            tool_calls, content = _extract_text_tool_calls(content)
+
+        assistant_msg: dict = {"role": "assistant", "content": content}
+        if tool_calls:
+            assistant_msg["tool_calls"] = tool_calls
+        messages.append(assistant_msg)
+
+        if not tool_calls:
+            break  # model signalled READY — done looking
+
+        for tc in tool_calls:
+            name = tc["function"]["name"]
+            raw_args = tc["function"]["arguments"]
+            try:
+                args = json.loads(raw_args) if raw_args else {}
+            except json.JSONDecodeError:
+                tc["function"]["arguments"] = "{}"
+                messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                 "content": "Malformed JSON arguments — retry."})
+                continue
+            # Hard guard: never let a write/exec tool through during orientation.
+            if name not in _ORIENT_TOOLS:
+                messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                 "content": f"'{name}' is not available while orienting — "
+                                            "use only read-only tools. Save it for after the plan."})
+                continue
+            display.print_tool_call(name, args)
+            result, success = execute_tool(name, args, working_dir, permission_mode)
+            result = _cap_result(result, name)
+            display.print_tool_result(name, result, success)
+            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+
+    return messages
+
+
 def _planning_step(
     task: str,
     system_prompt: str,
     client: OpenAI,
     model: str,
     messages: list[dict],
+    working_dir: str,
+    permission_mode: str,
 ) -> tuple[list[dict], str]:
     """
-    Run a planning-only pass before the main loop.
-    Appends the plan request + plan response to messages so the main loop
-    has the plan as context.  Returns (updated_messages, plan_text).
+    Run an orient-then-plan pass before the main loop.
+
+    First the model orients itself with read-only tools (``_orientation_phase``),
+    then it writes the plan grounded in what it actually saw. Appends the
+    orientation, the plan request, and the plan response to messages, so the
+    main loop inherits all of it. Returns (updated_messages, plan_text).
     """
+    messages = _orientation_phase(client, model, messages, working_dir, permission_mode)
+
     display.print_info("Planning…")
     plan_request = (
-        "Before you begin, write a concise numbered plan (3–8 steps) of exactly what "
-        "you will do to complete this task. Be specific: which tools, what order, "
-        "what you will verify when done. Do NOT call any tools — reply with the plan only."
+        "Now that you have looked around, write a concise numbered plan (3–8 "
+        "steps) of exactly what you will do to complete this task. Ground it in "
+        "what you just saw — name the specific files/functions you will change "
+        "and what you will verify when done. Do NOT call any tools — reply with "
+        "the plan only."
     )
     plan_messages = list(messages) + [{"role": "user", "content": plan_request}]
     plan_text = _simple_completion(client, model, plan_messages, max_tokens=700)
@@ -916,11 +1014,16 @@ def _verify_completion(
     return _simple_completion(client, model, verify_messages, max_tokens=100)
 
 
-def _stream_completion(client: OpenAI, model: str, messages: list, force_tool: bool = False) -> dict:
+def _stream_completion(client: OpenAI, model: str, messages: list, force_tool: bool = False,
+                       tools: list | None = None) -> dict:
     """
     Stream one completion turn. Returns:
       {"content": str, "tool_calls": list[dict], "finish_reason": str}
     Raises BadRequestError on API errors (including context-window exceeded).
+
+    ``tools`` overrides the tool surface offered for this turn (e.g. the
+    read-only subset used during the orientation phase); defaults to the full
+    profile-appropriate set.
     """
     content_parts: list[str] = []
     tool_call_map: dict[int, dict] = {}
@@ -931,10 +1034,13 @@ def _stream_completion(client: OpenAI, model: str, messages: list, force_tool: b
     is_ollama = _is_ollama_client(client)
     extra = {"extra_body": _ollama_extra_body()} if is_ollama else {}
 
+    if tools is None:
+        tools = all_tool_definitions(profile=_rt("tool_profile", None))
+
     with client.chat.completions.create(
         model=model,
         messages=messages,
-        tools=all_tool_definitions(profile=_rt("tool_profile", None)),
+        tools=tools,
         tool_choice="required" if force_tool else "auto",
         stream=True,
         **extra,
@@ -1058,7 +1164,7 @@ def run_agent(
     # ~900 tokens of an already-tiny context window on a plan small models follow
     # poorly. They plan inline in the main loop instead.
     if enable_plan and not is_local:
-        messages, plan_text = _planning_step(task, system_prompt, client, model, messages)
+        messages, plan_text = _planning_step(task, system_prompt, client, model, messages, working_dir, permission_mode)
         if plan_text and plan_out is not None:
             plan_out.append(plan_text)
             logger.log_plan(plan_text)

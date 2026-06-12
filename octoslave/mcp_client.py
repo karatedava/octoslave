@@ -113,6 +113,7 @@ class MCPServer:
 
         self.tools: list[dict] = []           # OpenAI-format tool defs (namespaced)
         self._tool_index: dict[str, str] = {}  # namespaced → original tool name
+        self.pruned: dict[str, str] = {}       # tool name → missing CLI binary
         self.connected = False
         self.error: str | None = None
 
@@ -192,11 +193,24 @@ class MCPServer:
     def _load_tools(self, timeout: float) -> None:
         result = self._request("tools/list", {}, timeout=timeout)
         tools = (result or {}).get("tools", []) or []
+        # Prune tools that can only ever fail because the CLI they wrap isn't
+        # installed (e.g. codag's tail_docker with no docker on PATH). Keyed by
+        # the server's configured name against the curated registry; a no-op for
+        # servers we don't recognise.
+        try:
+            from . import mcp_registry
+            dead = mcp_registry.unsupported_tools(self.raw_name)
+        except Exception:
+            dead = {}
+        self.pruned: dict[str, str] = {}
         defs: list[dict] = []
         index: dict[str, str] = {}
         for t in tools:
             orig = t.get("name")
             if not orig:
+                continue
+            if orig in dead:
+                self.pruned[orig] = dead[orig]
                 continue
             ns = namespaced_name(self.name, orig)
             schema = t.get("inputSchema") or {"type": "object", "properties": {}}
@@ -485,7 +499,11 @@ class MCPManager:
                 ok = server.start()
                 self.servers[server.name] = server
                 if ok:
-                    _log(f"MCP: connected '{server.raw_name}' ({len(server.tools)} tool(s)).")
+                    msg = f"MCP: connected '{server.raw_name}' ({len(server.tools)} tool(s))."
+                    if server.pruned:
+                        dropped = ", ".join(f"{t} (no {b})" for t, b in server.pruned.items())
+                        msg += f" Pruned {len(server.pruned)} unavailable: {dropped}."
+                    _log(msg)
                 else:
                     _log(f"MCP: failed to connect '{server.raw_name}': {server.error}")
 
@@ -524,6 +542,7 @@ class MCPManager:
                 "error": server.error,
                 "tools": [server._tool_index[ns] for ns in server._tool_index],
                 "tool_count": len(server.tools),
+                "pruned": dict(server.pruned),
             })
         return out
 
