@@ -22,6 +22,12 @@ pip install pyinstaller
 git clone https://github.com/karatedava/octoslave.git
 cd octoslave
 pip install -e ".[all]"
+
+# Build the Lab web UI (Vite/React) → octoslave/web/lab_static/
+# Required before PyInstaller: the .spec files bundle web/lab_static.
+# (Needs Node.js 18+. The built assets are committed, so this is only needed
+#  when the frontend changed; CI always rebuilds them.)
+npm ci --prefix frontend && npm run build --prefix frontend
 ```
 
 ### macOS
@@ -151,7 +157,14 @@ To cut a release:
 ## Troubleshooting
 
 **PyImportError / missing module at runtime:**  
-Add the module to the `hiddenimports` list in the platform's `.spec` file.
+Add the module to the `hiddenimports` list in the platform's `.spec` file. The
+`octoslave.lab.*` modules are imported lazily, so they are listed explicitly in
+the specs — add any new `lab` submodule there too.
+
+**Lab web UI blank / 404 at `/lab`:**  
+The frozen build is missing `octoslave/web/lab_static`. Run
+`npm run build --prefix frontend` before PyInstaller (the specs bundle that
+directory; CI builds it automatically).
 
 **tkinter not found in frozen build:**  
 On Linux, ensure `python3-tk` / `tk-dev` is installed at build time. tkinter is bundled natively on macOS and Windows.

@@ -18,6 +18,7 @@ block_cipher = None
 datas = [
     (str(OCTOSLAVE_PKG / "prompt_profiles"), "octoslave/prompt_profiles"),
     (str(OCTOSLAVE_PKG / "web" / "static"),  "octoslave/web/static"),
+    (str(OCTOSLAVE_PKG / "web" / "lab_static"), "octoslave/web/lab_static"),
 ]
 
 hidden = [
@@ -25,6 +26,11 @@ hidden = [
     "octoslave.logger", "octoslave.parallel", "octoslave.research",
     "octoslave.tools", "octoslave.tools_bio", "octoslave.vault",
     "octoslave.web.app", "octoslave.wizard",
+    "octoslave.mcp_client", "octoslave.mcp_registry",
+    "octoslave.lab", "octoslave.lab.runner", "octoslave.lab.state",
+    "octoslave.lab.agent_runtime", "octoslave.lab.director",
+    "octoslave.lab.critic", "octoslave.lab.meeting",
+    "octoslave.lab.foundry", "octoslave.lab.llm",
     "fastapi", "fastapi.routing", "fastapi.middleware",
     "starlette", "starlette.routing", "starlette.responses",
     "starlette.staticfiles", "starlette.websockets",

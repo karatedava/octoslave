@@ -26,7 +26,7 @@ job is done. It runs on cloud models (e-INFRA CZ / NVIDIA NIM) or fully offline 
 - **Interactive agent** (`ots`) — chat-style assistant for whole projects or single tasks
 - **One-shot** (`ots run "..."`) — run a task and exit, or stay interactive with `-i`
 - **Parallel agents** (`--parallel N`) — N agents on one task; a Judge / vote / Merger picks the result
-- **Long-research** (`/long-research`) — 8 specialist agents do multi-round research with real data and an HTML report
+- **Autonomous Lab** (`/long-research`, or the web UI at `/lab`) — a Director assembles a custom team of specialists for your problem, a Critic vets the plan, and they research/build over multiple rounds with live human steering → self-contained HTML report
 - **Vault improve** (`ots vault-improve`) — note-by-note improvement of an Obsidian / markdown vault
 - **Batch** (`ots batch tasks.txt`) — run a list of tasks with resume support
 
@@ -74,8 +74,12 @@ git clone https://github.com/karatedava/octoslave.git && cd octoslave
 pip install -e ".[all]"          # or: uv pip install -e ".[all]"
 
 # one-shot installer (macOS / Linux) — picks Python, sets up pipx
-bash octoslave/scripts/install.sh
+bash scripts/install.sh
 ```
+
+The Lab web UI ships **prebuilt** (in `octoslave/web/lab_static/`), so no Node.js is needed to
+install or run. Only if you modify the frontend (`frontend/`) do you need to rebuild it:
+`npm ci --prefix frontend && npm run build --prefix frontend` (Node 18+).
 
 ### Configure your API key
 
@@ -104,9 +108,15 @@ ots run "summarise this paper" -i                # one-shot, then stay interacti
 
 ots run "refactor the auth module" --parallel 3  # 3 agents, Judge picks the winner
 
+# Autonomous Lab — a self-organizing team. Open the web UI and go to /lab,
+# or launch from the TUI:
 ots
 ◆ /long-research "calibration methods for large language models" --rounds 3
 ```
+
+> The **Lab** web UI (`ots web` → `http://127.0.0.1:7860/lab`) is the richest way to
+> run it: watch the team roster, live plan, and per-agent activity; open produced
+> files in the browser; and inject guidance at any time.
 
 ---
 
@@ -120,8 +130,10 @@ ots
 | 💾 **Cross-session memory** | Prior outcomes persisted and injected as context on the next run |
 | 📦 **Smart compaction** | On overflow, oldest turns are summarised (not dropped); errors survive |
 | 🐙 **Parallel agents** | N agents on one task; Judge / vote / Merger picks the winner |
-| 🔬 **Multi-agent research** | 8 specialist roles over multiple rounds → self-contained HTML report |
-| 🛡️ **Data integrity** | Synthetic data forbidden; a Skeptic catches bad plans before code runs |
+| 🔬 **Autonomous Lab** | A Director builds a custom specialist team per task (≤10), revisable mid-run |
+| 🛡️ **Critic gate** | A Critic challenges every plan before implementation — build only sound ideas |
+| 🛠️ **Runtime expansion** | Agents build new tools, add teammates, or connect MCP servers mid-run |
+| 🙋 **Human-in-the-loop** | Inject guidance live or let the team run fully autonomously; watch every agent |
 | ⚡ **GPU-aware** | Hardware probe at startup; CUDA enforced in generated code |
 | 🌐 **Web research** | DuckDuckGo search, full-page/PDF extraction, BFS website crawler |
 | 🧬 **Bio & chem** | Direct REST access to UniProt, PubChem, ChEMBL, RCSB PDB, AlphaFold, GEO, ENA + RDKit |
@@ -169,7 +181,7 @@ Common flags for `ots` and `ots run`:
 | `/permission [mode]` | Show or change permission mode |
 | `/plan` · `/verify` · `/memory` | Toggle agentic behaviours (`on`/`off`) |
 | `/parallel N [strategy] task` | Run N agents on one task |
-| `/long-research TOPIC [flags]` | Launch the research pipeline |
+| `/long-research TASK [flags]` | Launch the autonomous Lab (dynamic team) |
 | `/vault-improve [path]` | Launch vault-wide note improvement |
 | `/local` · `/einfra` · `/nim` | Switch backend |
 | `/mcp …` | Manage MCP servers (see below) |
@@ -240,22 +252,39 @@ ots run "compare A vs B"     --parallel 3 --strategy merge  # synthesised → PA
 Each agent runs in an isolated copy of the working directory under `.parallel/run_{i}/`; the
 winner's files are promoted back. Diversity comes from rotating prompt profiles.
 
-### Long-research pipeline
+### Autonomous Lab
 
-`/long-research` deploys **8 specialist agents** — Researcher → Designer → Skeptic → Coder →
-Debugger → Evaluator → Orchestrator, then a Master Reporter — collaborating over multiple
-autonomous rounds. It works on **real data only** (synthetic data is forbidden), enforces GPU
-use, auto-stops on convergence, and produces a **self-contained HTML report** with all plots
-embedded.
+The Lab is a **dynamic, self-organizing research team** (inspired by Stanford's Virtual Lab).
+Instead of a fixed role list, a **Director** agent reads your task and assembles a custom team of
+up to **10 specialists** tailored to the problem — biology, ML, finance, writing, software,
+anything. The flow each run:
+
+1. **Assemble** — the Director designs the team (each specialist gets a role, expertise, goal, and
+   a curated tool set).
+2. **Plan** — a team meeting debates the approach; a **Critic** challenges it before any work
+   starts (approve / revise / reject).
+3. **Implement** — specialists work in individual meetings, producing real, organized outputs.
+4. **Review** — the team reviews progress; the Director decides to iterate, reshape the team, or
+   report.
+5. **Report** — a self-contained HTML report is written.
+
+**Runtime self-expansion (the tool foundry):** when an agent hits a wall, it can `request_tool`
+(a new Python tool is written, validated, and registered — callable immediately), `request_agent`
+(add a teammate), or `request_mcp` (connect a known MCP server) — all mid-run.
+
+**Human-in-the-loop:** run fully autonomous, or step mode (the Lab pauses at gates for your
+approval). Either way you can inject guidance at any moment from the web UI, which the team folds
+into its next agenda.
 
 ```
-/long-research TOPIC [--rounds N] [--all MODEL] [--overseer MODEL]
-                     [--role ROLE MODEL] [--parallel N] [--resume] [--scrape]
+/long-research TASK [--rounds N] [--all MODEL] [--resume]      # TUI
+ots web   →   http://127.0.0.1:7860/lab                         # web UI (recommended)
 ```
 
-Each run creates a self-contained tree under `research/` (per-round literature, experiment
-design, code, debug + evaluation reports, plots, and a cumulative `findings.md`). Full pipeline
-contract: [docs/RESEARCH.md](docs/RESEARCH.md).
+Everything is persisted under `<working_dir>/lab/`: `state.json`, live `plan.md` and `team.md`,
+meeting transcripts in `meetings/`, organized work in `projects/<subproject>/`, any
+runtime-built tools in `tools/`, and the final `report.html`. All roles run on `kimi-k2.6` by
+default. Full contract: [docs/RESEARCH.md](docs/RESEARCH.md).
 
 ### Vault improve & batch
 
@@ -300,6 +329,10 @@ confirmation; a server that fails to start is reported and skipped without block
 `ask_user`, `compress_log` (drops noisy logs into a templated summary via [codag](https://codag.ai))
 
 **Web** — `web_search`, `web_fetch`, `crawl_tree` (BFS website crawler, Playwright-aware)
+
+**Lab runtime expansion** *(active only inside the Autonomous Lab)* — `request_tool` (build &
+register a new Python tool at runtime), `request_agent` (add a specialist to the team),
+`request_mcp` (connect a registry MCP server). These are off in single-agent / chat mode.
 
 **Biology & chemistry** *(install with `pip install -e ".[bio]"`)* — `bio_inspect`,
 `rdkit_describe`, `uniprot_lookup`, `pubchem_lookup`, `chembl_lookup`, `pdb_fetch`,

@@ -59,6 +59,12 @@ app.add_middleware(_NoCacheJS)
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+# New Lab UI (Vite + React build). Served at /lab; index.html auto-served at the
+# mount root via html=True. Built assets reference /lab/assets/* (vite base).
+LAB_STATIC_DIR = Path(__file__).parent / "lab_static"
+if LAB_STATIC_DIR.exists():
+    app.mount("/lab", StaticFiles(directory=str(LAB_STATIC_DIR), html=True), name="lab")
+
 _ALLOWED_EXT = {
     ".html", ".htm", ".md", ".txt", ".json", ".csv",
     ".png", ".jpg", ".jpeg", ".svg", ".gif", ".py", ".sh",
@@ -418,10 +424,32 @@ async def ws_endpoint(websocket: WebSocket):
                 try:
                     raw = await websocket.receive_text()
                     msg = json.loads(raw)
-                    if msg.get("type") == "permission_response":
+                    mt = msg.get("type")
+                    if mt == "permission_response":
                         resolve_permission(bool(msg.get("allow", False)))
-                    elif msg.get("type") == "user_response":
+                    elif mt == "user_response":
                         resolve_user_response(str(msg.get("answer", "")))
+                    # ---- live lab controls (handled while a lab is running) ----
+                    elif mt == "inject":
+                        sess = state.get("lab_session")
+                        if sess is not None:
+                            sess.add_injection(str(msg.get("text", "")))
+                    elif mt == "set_autonomous":
+                        sess = state.get("lab_session")
+                        if sess is not None:
+                            sess.autonomous = bool(msg.get("autonomous", True))
+                            sess.touch()
+                    elif mt in ("approve", "lab_continue"):
+                        sess = state.get("lab_session")
+                        if sess is not None:
+                            from ..lab.runner import resolve_lab_approval
+                            resolve_lab_approval(sess, "continue")
+                    elif mt == "stop_lab":
+                        sess = state.get("lab_session")
+                        if sess is not None:
+                            from ..lab.runner import resolve_lab_approval
+                            sess.status = "stopped"
+                            resolve_lab_approval(sess, "stop")
                 except Exception:
                     break
 
@@ -1035,6 +1063,104 @@ async def ws_endpoint(websocket: WebSocket):
 
                 threading.Thread(target=research_fn, daemon=True).start()
                 await stream_events()
+
+            # ---- lab (dynamic autonomous team) ----
+            elif mtype in ("start_lab", "lab"):
+                if state["running"]:
+                    await send({"type": "error", "text": "A task is already running."})
+                    continue
+
+                cfg = load_config()
+                task = (msg.get("task") or msg.get("topic") or "").strip()
+                if not task:
+                    await send({"type": "error", "text": "Task is required."})
+                    continue
+
+                working_dir = msg.get("working_dir") or state["working_dir"]
+                state["working_dir"] = working_dir
+                autonomous = bool(msg.get("autonomous", True))
+                max_rounds = max(1, min(12, int(msg.get("rounds", 4))))
+                model_all = msg.get("model_all") or None
+                resume = bool(msg.get("resume", False))
+                state["running"] = True
+
+                if state.get("backend"):
+                    cfg["backend"] = state["backend"]
+                _resolved = resolve_backend(cfg)
+                client = make_client(_resolved["api_key"], _resolved["base_url"])
+                model = model_all or cfg.get("default_model")
+
+                from ..lab.state import LabSession
+                from ..lab.runner import run_lab
+                lab_session = LabSession.load(working_dir) if resume else None
+                if lab_session is None:
+                    lab_session = LabSession(task=task, working_dir=working_dir,
+                                             model=model or "")
+                lab_session.autonomous = autonomous
+                state["lab_session"] = lab_session
+
+                def lab_fn(t=task, wd=working_dir, au=autonomous, mr=max_rounds,
+                           md=model, res=resume, sess=lab_session):
+                    display.set_event_callback(make_emit())
+                    try:
+                        run_lab(task=t, working_dir=wd, client=client, model=md,
+                                autonomous=au, max_rounds=mr, resume=res,
+                                emit=make_emit(), session=sess)
+                    except Exception as exc:
+                        loop.call_soon_threadsafe(
+                            event_q.put_nowait, {"type": "error", "text": str(exc)}
+                        )
+                    finally:
+                        display.clear_event_callback()
+                        loop.call_soon_threadsafe(event_q.put_nowait, {"type": "_sentinel"})
+
+                threading.Thread(target=lab_fn, daemon=True).start()
+                await stream_events()
+                state["lab_session"] = None
+
+            # ---- lab follow-up (act on feedback after completion) ----
+            elif mtype == "lab_followup":
+                if state["running"]:
+                    await send({"type": "error", "text": "A task is already running."})
+                    continue
+                feedback = (msg.get("text") or "").strip()
+                working_dir = msg.get("working_dir") or state["working_dir"]
+                if not feedback:
+                    await send({"type": "error", "text": "Feedback text is required."})
+                    continue
+                state["working_dir"] = working_dir
+
+                cfg = load_config()
+                if state.get("backend"):
+                    cfg["backend"] = state["backend"]
+                _resolved = resolve_backend(cfg)
+                client = make_client(_resolved["api_key"], _resolved["base_url"])
+                model = cfg.get("default_model")
+
+                from ..lab.state import LabSession
+                from ..lab.runner import continue_lab
+                lab_session = LabSession.load(working_dir)
+                if lab_session is None:
+                    await send({"type": "error", "text": "No completed lab found in this directory."})
+                    continue
+                state["running"] = True
+                state["lab_session"] = lab_session
+
+                def followup_fn(fb=feedback, wd=working_dir, md=model, sess=lab_session):
+                    display.set_event_callback(make_emit())
+                    try:
+                        continue_lab(working_dir=wd, client=client, feedback=fb,
+                                     model=md, emit=make_emit(), session=sess)
+                    except Exception as exc:
+                        loop.call_soon_threadsafe(
+                            event_q.put_nowait, {"type": "error", "text": str(exc)})
+                    finally:
+                        display.clear_event_callback()
+                        loop.call_soon_threadsafe(event_q.put_nowait, {"type": "_sentinel"})
+
+                threading.Thread(target=followup_fn, daemon=True).start()
+                await stream_events()
+                state["lab_session"] = None
 
             # ---- role model config ----
             elif mtype == "get_role_models":

@@ -1936,24 +1936,26 @@ def _handle_long_research(arg: str, state: dict, cfg: dict, client):
         # Load per-backend defaults + any saved custom role overrides
         overrides = get_role_models(cfg)
 
-    # --overseer flag takes priority over everything for the orchestrator
-    if overseer_model:
-        overrides["orchestrator"] = overseer_model
+    # The static role pipeline has been replaced by the dynamic Lab. The legacy
+    # per-role / --parallel / --scrape flags no longer apply; warn if used.
+    if role_flag_overrides or overseer_model or num_parallel > 1 or scrape_mode:
+        display.print_info(
+            "  [dim]Note: --role/--overseer/--parallel/--scrape are legacy flags "
+            "from the old fixed pipeline and are ignored by the new Lab.[/dim]"
+        )
 
-    # --role flags take final priority
-    overrides.update(role_flag_overrides)
+    # Single model for all roles: --all wins, else the backend default (kimi-k2.6).
+    lab_model = all_model or cfg.get("default_model")
 
-    run_long_research(
-        topic=topic,
+    from .lab.runner import run_lab
+    run_lab(
+        task=topic,
         working_dir=state["working_dir"],
         client=client,
+        model=lab_model,
+        autonomous=True,
         max_rounds=max_rounds,
-        model_overrides=overrides,
         resume=resume,
-        num_parallel=num_parallel,
-        scrape_mode=scrape_mode,
-        prompt_profile=state.get("prompt_profile", "base"),
-        min_rounds=min_rounds,
     )
 
 

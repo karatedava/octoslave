@@ -1,37 +1,42 @@
-"""Helper script: run the long-research pipeline from the CLI without an interactive REPL."""
-import sys
+"""Helper script: run the autonomous Lab from the CLI without an interactive REPL.
+
+(The old fixed role pipeline has been replaced by the dynamic Lab — see
+octoslave/lab/. ``octoslave.research.run_long_research`` remains importable for
+reference but is no longer the default.)
+"""
 from pathlib import Path
 
 from octoslave.config import load_config
 from octoslave.agent import make_client
-from octoslave.research import run_long_research, PIPELINE
+from octoslave.lab.runner import run_lab
+
 
 def main():
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("task_file", help="Path to task.md (topic comes from file contents)")
+    p.add_argument("task_file", help="Path to a task file (the task is its contents)")
     p.add_argument("--working-dir", required=True)
-    p.add_argument("--rounds", type=int, default=3)
-    p.add_argument("--min-rounds", type=int, default=2, help="Never converge/complete before this round")
-    p.add_argument("--model", default=None, help="Override all role models")
+    p.add_argument("--rounds", type=int, default=4, help="Max implementation/review rounds")
+    p.add_argument("--model", default=None, help="Model for all roles (default: config / kimi-k2.6)")
+    p.add_argument("--manual", action="store_true",
+                   help="Step mode: pause at gates for human approval (default: autonomous)")
     p.add_argument("--resume", action="store_true")
     args = p.parse_args()
 
-    topic = Path(args.task_file).read_text().strip()
+    task = Path(args.task_file).read_text().strip()
     cfg = load_config()
     client = make_client(cfg["api_key"], cfg["base_url"])
 
-    model_overrides = {role: args.model for role in PIPELINE} if args.model else None
-
-    run_long_research(
-        topic=topic,
+    run_lab(
+        task=task,
         working_dir=args.working_dir,
         client=client,
+        model=args.model or cfg.get("default_model"),
+        autonomous=not args.manual,
         max_rounds=args.rounds,
-        model_overrides=model_overrides,
         resume=args.resume,
-        min_rounds=args.min_rounds,
     )
+
 
 if __name__ == "__main__":
     main()

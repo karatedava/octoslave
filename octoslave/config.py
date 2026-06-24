@@ -10,7 +10,7 @@ CONFIG_DIR = Path.home() / ".octoslave"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 BASE_URL = "https://llm.ai.e-infra.cz/v1"
-DEFAULT_MODEL = "kimi-k2.6"
+DEFAULT_MODEL = "kimi-k2.7"
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
 NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NIM_DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b"
@@ -32,7 +32,7 @@ KNOWN_MODELS = [
     "qwen3-coder-30b",
     "qwen3-coder-next",
     "gpt-oss-120b",
-    "kimi-k2.5",
+    "kimi-k2.7",
     "kimi-k2.6",
     "mistral-medium-3.5",
     "llama-4-scout-17b-16e-instruct",

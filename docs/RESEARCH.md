@@ -1,6 +1,15 @@
 # Long Research Pipeline
 
-OctoSlave includes a fully autonomous multi-agent research pipeline that runs multiple specialist agents in coordinated rounds, each building on the previous.
+> **⚠️ Superseded by the Autonomous Lab.** `/long-research` (and the web `/lab` UI) now launch the
+> **dynamic Lab** ([octoslave/lab/](../octoslave/lab/)): a **Director** assembles a custom team of
+> up to 10 specialists per task, a **Critic** vets the plan before implementation, agents can build
+> tools / add teammates / connect MCP servers at runtime, and a human can inject guidance live.
+> Outputs live under `<working_dir>/lab/` (not `research/`), and all roles default to `kimi-k2.6`.
+> The fixed 8-role pipeline described below is retained for reference (still importable as
+> `octoslave.research.run_long_research`) but is no longer the default.
+
+OctoSlave's original research pipeline ran a **fixed** set of specialist agents in coordinated
+rounds, each building on the previous.
 
 ---
 

@@ -6,6 +6,7 @@ import re
 import threading
 from datetime import date, date as _date_cls
 from pathlib import Path
+import httpx
 from openai import (
     OpenAI,
     BadRequestError,
@@ -13,6 +14,13 @@ from openai import (
     APITimeoutError,
     APIStatusError,
 )
+
+# Streaming guard: the client default timeout is 1 hour (long e-INFRA TTFT), but a
+# stream that stalls mid-flight would otherwise hang the whole run for up to that
+# hour. Cap the SILENCE between streamed chunks instead — long time-to-first-token
+# is fine, but if no bytes arrive for this long we treat the call as stalled, raise
+# APITimeoutError, and let the caller's retry path re-issue it.
+_STREAM_READ_TIMEOUT = httpx.Timeout(300.0, connect=30.0)
 
 from . import display
 from . import logger
@@ -171,7 +179,7 @@ def _looks_like_tool_attempt(content: str, valid_names) -> bool:
     return False
 
 
-MAX_ITERATIONS = 100
+MAX_ITERATIONS = 400
 
 
 def _is_retryable_error(exc: Exception) -> bool:
@@ -863,16 +871,21 @@ def _simple_completion(client: OpenAI, model: str, messages: list, max_tokens: i
 # Read-only tools the model may use while orienting itself before it plans.
 # Deliberately excludes everything that writes, runs commands, or hits the
 # network so the orientation pass can never mutate state or stall on a slow
-# command — it just looks at the local workdir, code, and data.
-_ORIENT_TOOLS = frozenset({"read_file", "list_dir", "glob", "grep", "bio_inspect"})
+# command — it just looks at the local workdir, code, and data. OCR is included
+# (local, read-only) so the model can also orient on image/scanned files (PNG,
+# JPG, scanned PDFs) instead of being blind to non-text inputs.
+_ORIENT_TOOLS = frozenset({"read_file", "list_dir", "glob", "grep", "bio_inspect",
+                           "image_ocr", "pdf_ocr"})
 
 _ORIENT_PROMPT = (
     "Before you plan, ORIENT yourself in the working directory. Using ONLY "
-    "read-only tools (list_dir, glob, grep, read_file, bio_inspect): explore the "
-    "directory layout, read the task and any files it references, and inspect the "
-    "specific code and data you will need to change. Do NOT write, edit, or run "
-    "anything yet. When you have seen enough to write a concrete, file-specific "
-    "plan, stop calling tools and reply with just the word READY."
+    "read-only tools (list_dir, glob, grep, read_file, bio_inspect; and image_ocr / "
+    "pdf_ocr to read text from image or scanned-PDF files): explore the directory "
+    "layout, read the task and any files it references, and inspect the specific "
+    "code and data you will need to change — including images/scans via OCR if "
+    "those are what's present. Do NOT write, edit, or run anything yet. When you "
+    "have seen enough to write a concrete, file-specific plan, stop calling tools "
+    "and reply with just the word READY."
 )
 
 
@@ -1026,6 +1039,7 @@ def _stream_completion(client: OpenAI, model: str, messages: list, force_tool: b
     profile-appropriate set.
     """
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
     tool_call_map: dict[int, dict] = {}
     finish_reason = "stop"
 
@@ -1043,6 +1057,7 @@ def _stream_completion(client: OpenAI, model: str, messages: list, force_tool: b
         tools=tools,
         tool_choice="required" if force_tool else "auto",
         stream=True,
+        timeout=_STREAM_READ_TIMEOUT,
         **extra,
     ) as stream:
         for chunk in stream:
@@ -1056,6 +1071,7 @@ def _stream_completion(client: OpenAI, model: str, messages: list, force_tool: b
             # turn shows visible progress instead of a frozen "waiting" spinner.
             reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
             if reasoning:
+                reasoning_parts.append(reasoning)
                 display.stream_reason(reasoning)
 
             if delta.content:
@@ -1093,6 +1109,7 @@ def _stream_completion(client: OpenAI, model: str, messages: list, force_tool: b
     tool_calls = [tool_call_map[i] for i in sorted(tool_call_map)]
     return {
         "content": "".join(content_parts),
+        "reasoning": "".join(reasoning_parts),
         "tool_calls": tool_calls,
         "finish_reason": finish_reason,
     }

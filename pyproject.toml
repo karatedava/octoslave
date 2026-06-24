@@ -96,6 +96,9 @@ octoslave = [
     "web/static/*.png",
     "web/static/css/*.css",
     "web/static/js/*.js",
+    "web/lab_static/*.html",
+    "web/lab_static/assets/*.js",
+    "web/lab_static/assets/*.css",
 ]
 
 [tool.uv.workspace]

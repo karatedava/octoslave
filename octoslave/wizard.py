@@ -3,13 +3,28 @@
 Called automatically when running a frozen (PyInstaller) binary with no config file.
 Can also be triggered manually via: ots config --wizard
 """
+from __future__ import annotations  # keep tk.* type hints lazy so this imports without Tk
+
 import json
 import sys
 import threading
-import tkinter as tk
 import webbrowser
 from pathlib import Path
-from tkinter import messagebox
+
+try:
+    import tkinter as tk
+    from tkinter import messagebox
+    _TK_OK = True
+except Exception:  # Python built without _tkinter (e.g. some conda envs)
+    tk = None
+    messagebox = None
+    _TK_OK = False
+
+# Bases for the wizard widgets — real Tk classes when available, else harmless
+# stubs so this module still IMPORTS on Tk-less Pythons (the GUI just won't open;
+# needs_wizard() returns False and run_wizard() degrades gracefully).
+_TkFrame = tk.Frame if _TK_OK else object
+_TkRoot = tk.Tk if _TK_OK else object
 
 # ---------------------------------------------------------------------------
 # API-key registration pages — where users generate the key for each backend
@@ -77,7 +92,7 @@ _W, _H = 740, 540
 _SIDE  = 170
 
 
-class _Page(tk.Frame):
+class _Page(_TkFrame):
     """Base class for wizard pages."""
     def __init__(self, parent: tk.Frame):
         super().__init__(parent, bg=_C["bg"])
@@ -393,7 +408,7 @@ class _PageDone(_Page):
 _STEPS = ["Welcome", "Backend", "Credentials", "Model", "Test", "Done"]
 
 
-class SetupWizard(tk.Tk):
+class SetupWizard(_TkRoot):
     def __init__(self):
         super().__init__()
         self.title("OctoSlave — Setup Wizard")
@@ -580,11 +595,16 @@ class SetupWizard(tk.Tk):
 
 def run_wizard() -> bool:
     """Launch the wizard.  Returns True if config was written."""
+    if not _TK_OK:
+        print("The setup wizard needs a GUI (tkinter), which isn't available in this "
+              "Python build. Configure with 'ots config' or edit "
+              "~/.octoslave/config.json directly.")
+        return False
     app = SetupWizard()
     app.mainloop()
     return _CONFIG_FILE.exists()
 
 
 def needs_wizard() -> bool:
-    """True when the wizard should run (frozen binary, no config yet)."""
-    return getattr(sys, "frozen", False) and not _CONFIG_FILE.exists()
+    """True when the wizard should run (frozen binary with a GUI, no config yet)."""
+    return _TK_OK and getattr(sys, "frozen", False) and not _CONFIG_FILE.exists()
