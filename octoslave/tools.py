@@ -747,7 +747,7 @@ _ARG_HINTS: dict[str, str] = {
     "crawl_tree": "Pass `root_url` as a fully-qualified http(s) URL.",
     "image_ocr": "Pass `path` to an image file (PNG/JPG/TIFF/BMP/GIF/WEBP).",
     "pdf_ocr": "Pass `path` to a PDF file. Use `pages` to limit page range.",
-    "bio_inspect": "Pass `path` to a bio/chem data file.",
+    "bio_inspect": "Pass `path` to a data table (CSV/TSV/Parquet/JSONL) or bio/chem data file.",
     "rdkit_describe": "Pass `smiles` (e.g. {\"smiles\": \"CC(=O)O\"}).",
     "pdb_fetch": "Pass `pdb_id` (4-char RCSB ID, e.g. \"1CRN\").",
     "alphafold_fetch": "Pass `uniprot_id` (e.g. \"P12345\").",
@@ -885,6 +885,13 @@ def _extract_docx(resolved: Path, offset: int = None, limit: int = None) -> tupl
     return header + "\n".join(selected), True
 
 
+# A full-file read above this size (with no offset/limit) is refused in favour of
+# a bounded head + a pointer to bio_inspect / bash, so one read can't blow up
+# memory or the model's context (e.g. a 38 MB / multi-GB CSV).
+_LARGE_TEXT_BYTES = 5 * 1024 * 1024  # 5 MB
+_LARGE_TEXT_PREVIEW_LINES = 50
+
+
 def _read_file(path: str, working_dir: str, offset: int = None, limit: int = None) -> tuple[str, bool]:
     resolved = _resolve(path, working_dir)
     if not resolved.exists():
@@ -911,6 +918,31 @@ def _read_file(path: str, working_dir: str, offset: int = None, limit: int = Non
             f"Binary file: {resolved.name} ({size:,} bytes). "
             "Cannot read as text. Use a dedicated tool or convert it first.",
             False,
+        )
+
+    # Large text file with no explicit window → don't load the whole thing into
+    # memory and the model's context. Return a bounded head + guidance so the
+    # model reaches for the right tool (bio_inspect for tables, bash/pandas for
+    # stats, or read_file with offset/limit to page). Paged reads (offset/limit
+    # given) and small files fall through to the normal path unchanged.
+    if offset is None and limit is None and resolved.stat().st_size > _LARGE_TEXT_BYTES:
+        size = resolved.stat().st_size
+        preview_lines: list[str] = []
+        with open(resolved, "r", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i >= _LARGE_TEXT_PREVIEW_LINES:
+                    break
+                preview_lines.append(line.rstrip("\n"))
+        numbered = "\n".join(f"{i + 1}\t{ln}" for i, ln in enumerate(preview_lines))
+        ext = resolved.suffix.lower()
+        if ext in (".csv", ".tsv", ".tab", ".parquet", ".pq", ".jsonl", ".ndjson"):
+            tip = f"This is a data table — call bio_inspect(path='{path}') for a schema-aware preview (shape, dtypes, summary)."
+        else:
+            tip = "Use bash (head/grep/awk) or read_file with offset/limit to page through it; do not read it whole."
+        return (
+            f"File: {path} ({size:,} bytes — too large to read whole; showing first "
+            f"{len(preview_lines)} lines).\n{numbered}\n\n[LARGE FILE] {tip}",
+            True,
         )
 
     try:

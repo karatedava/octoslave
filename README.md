@@ -100,9 +100,12 @@ install reference, including the optional [`codag`](https://codag.ai) helper tha
 
 ```bash
 ots                                            # interactive TUI (default backend)
+ots run "build a todo API"                     # one-shot task, then exit
+ots improved                                   # Improved TUI — a unified model council (see below)
+ots improved run "analyse this dataset"        # one-shot through the council
 ots --local                                    # local Ollama
 ots --nim                                       # NVIDIA NIM
-ots web                                          # browser UI at http://127.0.0.1:7860
+ots web                                          # browser UI at http://127.0.0.1:7860 (Improved toggle ON by default)
 ots run "build a Flask REST API for a todo app"
 ots run "summarise this paper" -i                # one-shot, then stay interactive
 
@@ -124,6 +127,7 @@ ots
 
 | | |
 |---|---|
+| 🐙 **Improved mode** | A unified model council — Thinker · Worker · Verifier behind one agent (`ots improved`) |
 | 🔁 **Autonomous loop** | Runs many tool-call iterations end-to-end — no hand-holding |
 | 🧠 **Upfront planning** | Writes a numbered execution plan before touching files |
 | ✅ **Self-verification** | Optional DONE / PARTIAL / FAILED grade after each task (`--verify`) |
@@ -180,6 +184,7 @@ Common flags for `ots` and `ots run`:
 | `/profile [name]` | Switch prompt profile |
 | `/permission [mode]` | Show or change permission mode |
 | `/plan` · `/verify` · `/memory` | Toggle agentic behaviours (`on`/`off`) |
+| `/improved [on\|off\|status]` | Toggle Improved (council) mode and show the resolved roles |
 | `/parallel N [strategy] task` | Run N agents on one task |
 | `/long-research TASK [flags]` | Launch the autonomous Lab (dynamic team) |
 | `/vault-improve [path]` | Launch vault-wide note improvement |
@@ -226,6 +231,41 @@ Per-role model defaults for `/long-research` and full hardware recommendations a
 ---
 
 ## Modes in depth
+
+### Improved (council) mode
+
+Instead of one model doing everything, a lightweight coordinator unifies a small pool of
+**role-specialized** models behind a **single agent surface** — so a diverse pool beats any
+single model.
+
+```bash
+ots improved                                   # Improved TUI (interactive)
+ots improved run "analyse this dataset" -p analyst -d ~/data   # one-shot (mirrors `ots run`)
+ots improved --thinker glm-5.2                 # override a role
+ots web                                         # web UI ships the "🐙 Improved" toggle ON by default
+```
+
+Three roles, drawn from the best of the e-INFRA offer:
+
+| Role | Default | Job |
+|------|---------|-----|
+| 🔧 **Worker** | `kimi-k2.7` | Drives the tool loop — reads, writes, runs commands |
+| 🧠 **Thinker** | `kimi-k2.7` | Orients, writes the plan, course-corrects when the Worker stalls |
+| 🔍 **Verifier** | `glm-5.2` | Independent critic — reviews risky actions *before* they run and gates completion |
+
+A **heuristic coordinator** routes each step (no extra routing call, so it stays fast):
+
+- read-only steps run on the Worker alone;
+- **mutating** actions (`write_file` / `edit_file` / `apply_patch` / `bash` / `run_background`)
+  are reviewed by the Verifier *before* execution — on `REVISE`, the Worker fixes and retries;
+- repeated errors pull in the Thinker for a course correction;
+- when the Worker claims done, the Verifier grades the result and can send it back for another round.
+
+Models are **probed live** at startup and resolved down a fallback chain; override any role with
+`--worker/--thinker/--verifier` or `OCTOSLAVE_COUNCIL_{WORKER,THINKER,VERIFIER}`. Toggle mid-session
+with `/improved on|off|status`. Needs a cloud backend (e-INFRA / NIM); on local Ollama it falls back
+to the normal single agent. The plain `ots` is unchanged. Full details:
+[docs/IMPROVED_MODE.md](docs/IMPROVED_MODE.md).
 
 ### Agentic behaviour
 
@@ -366,6 +406,7 @@ modifying action), `supervised` (ask before file edits only). See
 
 | Doc | Contents |
 |-----|----------|
+| [docs/IMPROVED_MODE.md](docs/IMPROVED_MODE.md) | Improved (council) mode — roles, coordinator, config |
 | [docs/USAGE.md](docs/USAGE.md) | Extended usage examples and install reference |
 | [docs/RESEARCH.md](docs/RESEARCH.md) | Long-research pipeline contract and per-role models |
 | [docs/VAULT_IMPROVE.md](docs/VAULT_IMPROVE.md) | Vault-improve pipeline |

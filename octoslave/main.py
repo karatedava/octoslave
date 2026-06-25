@@ -15,7 +15,10 @@ from prompt_toolkit.completion import Completer, Completion
 from . import display
 from . import __version__
 from .agent import make_client, run_agent, continue_agent, load_session_memory, save_session_memory, MEMORY_FILE
-from .research import run_long_research, ROLES as RESEARCH_ROLES
+from .council import (
+    resolve_council_roles, run_council_agent, continue_council_agent,
+    council_available, print_roles as print_council_roles,
+)
 from .vault import run_vault_improve
 from .config import (
     KNOWN_MODELS, DEFAULT_MODEL, BASE_URL, OLLAMA_BASE_URL,
@@ -281,6 +284,223 @@ def run(task, model, working_dir, api_key, base_url, local, prompt_profile, inte
                 status = "failed"
             note = verify_out[0][:200]
         save_session_memory(task, status=status, note=note)
+
+    if interactive:
+        _repl_loop(client, cfg, messages)
+
+
+# ---------------------------------------------------------------------------
+# `improved` — council single agent (Thinker/Worker/Verifier). A click GROUP:
+#   ots improved              → interactive TUI
+#   ots improved run "task"   → one-shot, non-interactive (mirrors `ots run`)
+# ---------------------------------------------------------------------------
+
+def _council_overrides(worker, thinker, verifier) -> dict:
+    """Merge CLI flags with OCTOSLAVE_COUNCIL_* env into a role-override dict."""
+    return {
+        "worker":   worker   or os.environ.get("OCTOSLAVE_COUNCIL_WORKER"),
+        "thinker":  thinker  or os.environ.get("OCTOSLAVE_COUNCIL_THINKER"),
+        "verifier": verifier or os.environ.get("OCTOSLAVE_COUNCIL_VERIFIER"),
+    }
+
+
+def _improved_setup(model, working_dir, api_key, base_url, prompt_profile,
+                    permission_mode, verbose, worker, thinker, verifier,
+                    enable_plan: bool = True, enable_memory: bool = True) -> tuple[dict, object]:
+    """Build cfg, resolve the council roles, and make a client.
+
+    Shared by the Improved TUI and `improved run` so both resolve the council
+    identically. On the Ollama backend (no cloud pool) council is disabled and
+    ``cfg['council']`` is False — the caller falls back to the normal agent.
+    Returns ``(cfg, client)``.
+    """
+    if verbose:
+        display.set_verbose(True)
+    cfg = _resolve_config(model, working_dir, api_key, base_url, local=False)
+    cfg["prompt_profile"] = prompt_profile
+    cfg["verbose"] = verbose
+    cfg["enable_plan"] = enable_plan
+    cfg["enable_memory"] = enable_memory
+    if permission_mode:
+        cfg["permission_mode"] = permission_mode
+    else:
+        cfg["permission_mode"] = load_config().get("permission_mode", "autonomous")
+
+    if not council_available(cfg):
+        display.print_error(
+            "Improved (council) mode needs a cloud model pool (e-INFRA / NIM / custom).\n"
+            "The local Ollama backend can't co-resident three large models.\n"
+            "Switch with `ots config` (einfra), then `ots improved` again. "
+            "Falling back to the normal single agent."
+        )
+        cfg["council"] = False
+    else:
+        if not cfg.get("api_key"):
+            display.print_error(
+                "No API key configured. Run `ots config` or set OCTOSLAVE_API_KEY."
+            )
+            sys.exit(1)
+        client_probe = make_client(cfg["api_key"], cfg["base_url"])
+        roles, notes = resolve_council_roles(
+            client_probe, load_config(), _council_overrides(worker, thinker, verifier)
+        )
+        cfg["council"] = True
+        cfg["council_roles"] = roles
+        cfg["council_notes"] = notes
+        # The "active model" in council mode is the Worker (the executor that
+        # drives the tool loop) — surface that, not the stale single-model default.
+        cfg["model"] = roles["worker"]
+
+    client = make_client(cfg["api_key"], cfg["base_url"])
+    return cfg, client
+
+
+@cli.group("improved", invoke_without_command=True)
+@click.option("-m", "--model", default=None, help="(unused in council; see --worker/--thinker/--verifier)")
+@click.option("-d", "--dir", "working_dir", default=None, help="Working directory")
+@click.option("--api-key", default=None, envvar="OCTOSLAVE_API_KEY")
+@click.option("--base-url", default=None, envvar="OCTOSLAVE_BASE_URL")
+@click.option("-p", "--prompt-profile", default="base", help="Prompt profile (default: base)")
+@click.option("--permission-mode", default=None,
+              type=click.Choice(["autonomous", "controlled", "supervised"]))
+@click.option("-v", "--verbose", is_flag=True, default=False)
+@click.option("--worker", default=None, help="Override the Worker model (executor / tool loop)")
+@click.option("--thinker", default=None, help="Override the Thinker model (planner / reasoner)")
+@click.option("--verifier", default=None, help="Override the Verifier model (critic / gate)")
+@click.pass_context
+def improved(ctx, model, working_dir, api_key, base_url, prompt_profile,
+             permission_mode, verbose, worker, thinker, verifier):
+    """IMPROVED (council) mode — a unified single agent.
+
+    One surface, but internally a coordinator routes each step between
+    role-specialized e-INFRA models — Thinker / Worker / Verifier — so a diverse
+    pool beats any single model. The plain `ots` command is unchanged.
+
+    \b
+    With no subcommand, launches the interactive TUI (use /improved on|off to
+    toggle mid-session). For a one-shot, non-interactive run, use `run`:
+
+    \b
+      ots improved                              # interactive TUI
+      ots improved run "analyse this dataset"   # one-shot, then exit
+    """
+    # Stash the group-level options so an `improved <subcommand>` can merge them
+    # (subcommand-level flags take precedence over these).
+    ctx.ensure_object(dict)
+    ctx.obj["improved_opts"] = {
+        "model": model, "working_dir": working_dir, "api_key": api_key,
+        "base_url": base_url, "prompt_profile": prompt_profile,
+        "permission_mode": permission_mode, "verbose": verbose,
+        "worker": worker, "thinker": thinker, "verifier": verifier,
+    }
+    if ctx.invoked_subcommand is not None:
+        return  # a subcommand (e.g. `run`) handles it
+
+    # No subcommand → interactive TUI (unchanged behavior).
+    cfg, client = _improved_setup(
+        model, working_dir, api_key, base_url, prompt_profile,
+        permission_mode, verbose, worker, thinker, verifier,
+        enable_plan=ctx.obj.get("enable_plan", True),
+        enable_memory=ctx.obj.get("enable_memory", True),
+    )
+    banner_model = "🐙 council" if cfg.get("council") else cfg["model"]
+    display.print_welcome(banner_model, cfg["working_dir"], backend=cfg["backend"])
+    if cfg.get("council"):
+        print_council_roles(cfg["council_roles"], cfg.get("council_notes"))
+    display.console.print()
+    _repl_loop(client, cfg, [])
+
+
+@improved.command("run")
+@click.argument("task")
+@click.option("-d", "--dir", "working_dir", default=None, help="Working directory (default: current directory)")
+@click.option("-p", "--prompt-profile", default=None, help="Prompt profile (base, coder, analyst, biomedic)")
+@click.option("-i", "--interactive", is_flag=True, help="Stay interactive after the task")
+@click.option("--permission-mode", default=None,
+              type=click.Choice(["autonomous", "controlled", "supervised"]))
+@click.option("-v", "--verbose", is_flag=True, default=False)
+@click.option("-n", "--new-project", is_flag=True, default=False, help="Create a new project dir in ~/octoslave/projects/ for output")
+@click.option("--no-plan", "disable_plan", is_flag=True, default=False, help="Skip the upfront Thinker planning step")
+@click.option("--no-memory", "disable_memory", is_flag=True, default=False, help="Do not load or save cross-session memory")
+@click.option("--worker", default=None, help="Override the Worker model (executor / tool loop)")
+@click.option("--thinker", default=None, help="Override the Thinker model (planner / reasoner)")
+@click.option("--verifier", default=None, help="Override the Verifier model (critic / gate)")
+@click.option("--api-key", default=None, envvar="OCTOSLAVE_API_KEY")
+@click.option("--base-url", default=None, envvar="OCTOSLAVE_BASE_URL")
+@click.pass_context
+def improved_run(ctx, task, working_dir, prompt_profile, interactive, permission_mode,
+                 verbose, new_project, disable_plan, disable_memory,
+                 worker, thinker, verifier, api_key, base_url):
+    """Run a single TASK through the council and exit (or continue with -i).
+
+    The Improved counterpart of `ots run` — same one-shot UX, but driven by the
+    Thinker / Worker / Verifier council instead of one model.
+
+    \b
+    Examples:
+      ots improved run "build a REST API for a todo app"
+      ots improved run "analyse this dataset" -p analyst -d ~/data
+      ots improved run "add unit tests" -i
+      ots improved run "explain this repo" --no-plan
+    """
+    # Merge: subcommand flag wins, else the group-level value (so options work
+    # both before and after `run`).
+    g = (ctx.obj or {}).get("improved_opts", {})
+    prompt_profile = prompt_profile or g.get("prompt_profile") or "base"
+    working_dir = working_dir or g.get("working_dir")
+    permission_mode = permission_mode or g.get("permission_mode")
+    api_key = api_key or g.get("api_key")
+    base_url = base_url or g.get("base_url")
+    verbose = verbose or g.get("verbose", False)
+    worker = worker or g.get("worker")
+    thinker = thinker or g.get("thinker")
+    verifier = verifier or g.get("verifier")
+    enable_plan = not disable_plan
+    enable_memory = not disable_memory
+
+    cfg, client = _improved_setup(
+        g.get("model"), working_dir, api_key, base_url, prompt_profile,
+        permission_mode, verbose, worker, thinker, verifier,
+        enable_plan=enable_plan, enable_memory=enable_memory,
+    )
+
+    if new_project and not working_dir:
+        cfg["working_dir"] = _make_project_dir(task)
+        display.console.print(f"[dim]📁 project dir:[/dim] [bold]{cfg['working_dir']}[/bold]")
+
+    banner_model = "🐙 council" if cfg.get("council") else cfg["model"]
+    display.print_header(banner_model, cfg["working_dir"], backend=cfg["backend"])
+    if cfg["permission_mode"] == "autonomous":
+        mode_tag = "[bold #7fd88f]autonomous[/bold #7fd88f]"
+    elif cfg["permission_mode"] == "controlled":
+        mode_tag = "[bold #f5a742]controlled[/bold #f5a742]"
+    else:
+        mode_tag = "[bold #5c9cf5]supervised[/bold #5c9cf5]"
+    display.console.print(f"[dim #7a7d86]permission mode: {mode_tag}[/dim #7a7d86]")
+    if cfg.get("council"):
+        print_council_roles(cfg["council_roles"], cfg.get("council_notes"))
+    display.console.print()
+    display.print_task(task)
+
+    if cfg.get("council"):
+        messages = run_council_agent(
+            task, cfg["working_dir"], client, cfg["council_roles"],
+            prompt_profile=cfg["prompt_profile"],
+            permission_mode=cfg["permission_mode"],
+            enable_plan=enable_plan,
+            enable_memory=enable_memory,
+        )
+    else:
+        # Ollama fallback — council unavailable, drive the normal single agent.
+        messages = run_agent(
+            task, cfg["model"], cfg["working_dir"], client,
+            cfg["prompt_profile"], cfg["permission_mode"],
+            enable_plan=enable_plan, enable_verify=False,
+            enable_memory=enable_memory,
+        )
+
+    if enable_memory:
+        save_session_memory(task, status="completed", note="")
 
     if interactive:
         _repl_loop(client, cfg, messages)
@@ -773,6 +993,8 @@ def _repl_loop(client, cfg: dict, messages: list[dict]):
         "enable_verify": cfg.get("enable_verify", False),
         "enable_memory": cfg.get("enable_memory", True),
         "current_plan":  "",   # last generated plan (shown by /show-plan)
+        "council":       cfg.get("council", False),         # improved (council) mode on?
+        "council_roles": cfg.get("council_roles") or {},    # {worker,thinker,verifier}
     }
     if state["verbose"]:
         display.set_verbose(True)
@@ -825,25 +1047,42 @@ def _repl_loop(client, cfg: dict, messages: list[dict]):
         display.print_task(user_input)
         try:
             if messages:
-                messages = continue_agent(
-                    messages, user_input, state["model"],
-                    state["working_dir"], client,
-                    state["permission_mode"]
-                )
+                if state.get("council") and state.get("council_roles"):
+                    messages = continue_council_agent(
+                        messages, user_input, client, state["council_roles"],
+                        state["working_dir"], state["permission_mode"],
+                    )
+                else:
+                    messages = continue_agent(
+                        messages, user_input, state["model"],
+                        state["working_dir"], client,
+                        state["permission_mode"]
+                    )
             else:
                 plan_out: list[str] = []
                 verify_out: list[str] = []
-                messages = run_agent(
-                    user_input, state["model"],
-                    state["working_dir"], client,
-                    state["prompt_profile"],
-                    state["permission_mode"],
-                    enable_plan=state["enable_plan"],
-                    enable_verify=state["enable_verify"],
-                    enable_memory=state["enable_memory"],
-                    plan_out=plan_out,
-                    verify_out=verify_out,
-                )
+                if state.get("council") and state.get("council_roles"):
+                    messages = run_council_agent(
+                        user_input, state["working_dir"], client,
+                        state["council_roles"],
+                        prompt_profile=state["prompt_profile"],
+                        permission_mode=state["permission_mode"],
+                        enable_plan=state["enable_plan"],
+                        enable_memory=state["enable_memory"],
+                        plan_out=plan_out,
+                    )
+                else:
+                    messages = run_agent(
+                        user_input, state["model"],
+                        state["working_dir"], client,
+                        state["prompt_profile"],
+                        state["permission_mode"],
+                        enable_plan=state["enable_plan"],
+                        enable_verify=state["enable_verify"],
+                        enable_memory=state["enable_memory"],
+                        plan_out=plan_out,
+                        verify_out=verify_out,
+                    )
                 if plan_out:
                     state["current_plan"] = plan_out[0]
                 if state["enable_memory"]:
@@ -1078,6 +1317,38 @@ def _handle_slash(cmd: str, state: dict, cfg: dict, messages: list, client) -> s
         else:
             status = "[bold green]ON[/bold green]" if state.get("enable_verify", False) else "[bold red]OFF[/bold red]"
             display.console.print(f"[dim]Verify:[/dim] {status}  [dim]Use /verify on|off to toggle[/dim]")
+        return "ok"
+
+    if name == "/improved":
+        sub = arg.strip().lower()
+        if sub == "off":
+            state["council"] = False
+            display.print_info("Improved (council) mode OFF — using the normal single agent.")
+            messages.clear()
+            return "ok"
+        if sub in ("on", "status", ""):
+            if state.get("backend") == "ollama":
+                display.print_error(
+                    "Improved (council) mode needs a cloud pool (e-INFRA / NIM / custom). "
+                    "Switch backend with /einfra, then /improved on."
+                )
+                return "ok"
+            if sub == "status" or (sub == "" and state.get("council")):
+                if state.get("council") and state.get("council_roles"):
+                    print_council_roles(state["council_roles"])
+                else:
+                    display.print_info("Improved (council) mode is OFF. Enable with /improved on.")
+                return "ok"
+            # turn on (resolve roles fresh against the live catalog)
+            roles, notes = resolve_council_roles(client, load_config(), _council_overrides(None, None, None))
+            state["council"] = True
+            state["council_roles"] = roles
+            state["model"] = roles["worker"]  # Worker is the visible executor
+            display.print_info("Improved (council) mode ON.")
+            print_council_roles(roles, notes)
+            messages.clear()
+            return "ok"
+        display.print_error("Usage: /improved on|off|status")
         return "ok"
 
     if name == "/undo":
@@ -2027,6 +2298,9 @@ def _handle_vault_improve(arg: str, state: dict, client):
 def _make_prompt(state: dict):
     model_short = state["model"][:20]
     backend = state.get("backend", "einfra")
+    if state.get("council"):
+        # Unified-agent surface: the Worker is the visible executor.
+        return HTML(f'<prompt>🐙</prompt> <model-tag>[council:{model_short}]</model-tag> ')
     if backend == "ollama":
         return HTML(f'<prompt-local>●</prompt-local> <model-tag>[local:{model_short}]</model-tag> ')
     if backend == "nim":
@@ -2059,10 +2333,18 @@ def _make_toolbar(state: dict):
     plan_short = "plan:on" if state.get("enable_plan", True) else "plan:off"
     verify_short = "verify:on" if state.get("enable_verify", False) else "verify:off"
     mem_short = "mem:on" if state.get("enable_memory", True) else "mem:off"
+    if state.get("council"):
+        roles = state.get("council_roles") or {}
+        council_tag = (
+            f'  🐙council[W:{roles.get("worker","?")} '
+            f'T:{roles.get("thinker","?")} V:{roles.get("verifier","?")}]'
+        )
+    else:
+        council_tag = ""
     return HTML(
-        f'<{toolbar_cls}>  📁 {wd}{backend_tag}  ●{profile}  🛡{perm_short}'
+        f'<{toolbar_cls}>  📁 {wd}{backend_tag}{council_tag}  ●{profile}  🛡{perm_short}'
         f'  {plan_short}  {verify_short}  {mem_short}'
-        f'   /help · /model · /plan · /verify · /memory · /clear · /exit</{toolbar_cls}>'
+        f'   /help · /improved · /model · /plan · /memory · /clear · /exit</{toolbar_cls}>'
     )
 
 

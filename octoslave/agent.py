@@ -1228,6 +1228,142 @@ def continue_agent(
     return _agent_loop(messages, model, working_dir, client, permission_mode)
 
 
+def _robust_stream(
+    client: OpenAI,
+    model: str,
+    messages: list[dict],
+    force_tool: bool,
+    state: dict,
+    iteration: int,
+) -> tuple[dict | None, str, list[dict]]:
+    """Run one ``_stream_completion`` with the full retry / trim / error policy.
+
+    Returns ``(response, signal, messages)`` where ``signal`` is one of:
+      ``"ok"``        — ``response`` is the completion dict.
+      ``"retry"``     — transient; caller should ``iteration -= 1; continue``.
+                        ``messages`` may have been compacted or rolled back, and any
+                        backoff sleep has already happened inside this call.
+      ``"interrupt"`` — KeyboardInterrupt; caller should stop the loop.
+      ``"fatal"``     — unrecoverable; the error has already been printed and the
+                        caller should break.
+
+    Retry counters persist across calls in ``state`` (keys: ``rate``/``timeout``/``conn``).
+    Extracted from ``_agent_loop`` so both the single-model loop and the council loop
+    (council.py) share identical robustness. Behaviour is intentionally unchanged.
+    """
+    import time as _time
+    messages = _proactive_trim(messages)
+    try:
+        response = _stream_completion(client, model, messages, force_tool=force_tool)
+        state["rate"] = 0
+        state["timeout"] = 0
+        state["conn"] = 0
+        return response, "ok", messages
+    except BadRequestError as e:
+        err_str = str(e)
+        logger.log_error(f"BadRequestError on turn {iteration}", exc=e)
+        if _is_context_window_error(err_str):
+            compacted = _compact_and_trim(messages, groups=10)
+            if len(compacted) < len(messages):
+                display.print_info(
+                    f"Context window exceeded — compacted oldest turns "
+                    f"(~{_estimated_tokens(compacted):,} tokens left) and retrying."
+                )
+                logger.log_info(
+                    "Context window exceeded — compacted and retrying.",
+                    est_tokens=_estimated_tokens(compacted),
+                )
+                return None, "retry", compacted
+            display.print_error(
+                "Context window exceeded and cannot be compacted further.\n"
+                "Use /compact to summarise history, or /clear to start fresh."
+            )
+            return None, "fatal", messages
+        elif "Unterminated string" in err_str or "Extra data" in err_str:
+            # The model's tool-call arguments were cut off mid-stream, leaving
+            # invalid JSON in the message history.  Roll back the last assistant
+            # turn (and any partial tool results) and ask the model to retry.
+            while messages and messages[-1].get("role") in ("tool", "assistant"):
+                messages.pop()
+            display.print_info(
+                "Tool call arguments were truncated — rolling back and retrying."
+            )
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Your previous response was cut off before the tool arguments "
+                    "were complete. Please redo the last action from scratch, making "
+                    "sure to produce a complete, valid response."
+                ),
+            })
+            return None, "retry", messages
+        else:
+            display.print_error(f"API error: {e}")
+            return None, "fatal", messages
+    except KeyboardInterrupt:
+        return None, "interrupt", messages
+    except Exception as e:
+        err_str = str(e)
+        if "429" in err_str or "rate" in err_str.lower() or "RateLimit" in type(e).__name__:
+            state["rate"] += 1
+            wait = min(60, 5 * (2 ** (state["rate"] - 1)))
+            display.print_info(f"Rate limit — waiting {wait}s ({state['rate']}/5).")
+            if state["rate"] > 5:
+                display.print_error("Rate limit persists after 5 retries.")
+                return None, "fatal", messages
+            _time.sleep(wait)
+            return None, "retry", messages
+        elif "timeout" in err_str.lower() or "timed out" in err_str.lower() or "Timeout" in type(e).__name__:
+            state["timeout"] += 1
+            wait = min(30, 5 * (2 ** (state["timeout"] - 1)))
+            display.print_info(f"Request timeout — retrying in {wait}s ({state['timeout']}/3).")
+            if state["timeout"] > 3:
+                display.print_error("Request keeps timing out after 3 retries.")
+                return None, "fatal", messages
+            _time.sleep(wait)
+            return None, "retry", messages
+        elif _is_retryable_error(e):
+            # Transient connection drop ("peer closed connection without sending
+            # complete message body" / "incomplete chunked read") or gateway 5xx.
+            state["conn"] += 1
+            wait = min(30, 5 * (2 ** (state["conn"] - 1)))
+            logger.log_error(f"Connection error on turn {iteration}", exc=e)
+            display.print_info(
+                f"Connection dropped — retrying in {wait}s ({state['conn']}/4)."
+            )
+            if state["conn"] > 4:
+                display.print_error("Connection keeps dropping after 4 retries.")
+                return None, "fatal", messages
+            _time.sleep(wait)
+            return None, "retry", messages
+        elif "410" in err_str and ("end of life" in err_str.lower() or "Gone" in err_str):
+            display.print_error(
+                "Model has reached end of life and is no longer available.\n"
+                "Switch to a different model with [bold]/model <name>[/bold]  "
+                "or run [bold]/model[/bold] to list available models."
+            )
+            return None, "fatal", messages
+        elif "404" in err_str:
+            if "not found for account" in err_str.lower():
+                display.print_error(
+                    "Model is not accessible with your NVIDIA NIM account tier.\n"
+                    "This model may require a paid plan or special access.\n"
+                    "Switch to a different model with [bold]/model <name>[/bold]  "
+                    "or run [bold]/model[/bold] to list models available to your account."
+                )
+            else:
+                display.print_error(
+                    "Model not found (404). The model ID may be incorrect or the model\n"
+                    "is no longer available at this endpoint.\n"
+                    "Switch to a different model with [bold]/model <name>[/bold]  "
+                    "or run [bold]/model[/bold] to list available models."
+                )
+            return None, "fatal", messages
+        logger.log_error(f"Unexpected error on turn {iteration}", exc=e)
+        display.print_error(f"Unexpected error: {e}")
+        return None, "fatal", messages
+
+
 def _agent_loop(
     messages: list[dict],
     model: str,
@@ -1235,12 +1371,9 @@ def _agent_loop(
     client: OpenAI,
     permission_mode: str = "autonomous",
 ) -> list[dict]:
-    import time as _time
     from collections import Counter
     iteration = 0
-    _rate_limit_retries = 0
-    _timeout_retries = 0
-    _conn_retries = 0  # transient connection-drop / gateway-5xx retries
+    _retry_state = {"rate": 0, "timeout": 0, "conn": 0}  # persisted across _robust_stream calls
     _end_reason = "completed"  # how the loop terminated (for accurate session_end log)
     _tool_call_counts: Counter = Counter()  # (name, args_json) → call count
     _no_tool_nudges = 0  # consecutive text-only responses (resets on tool use)
@@ -1256,133 +1389,18 @@ def _agent_loop(
         # so a model that has finished can naturally return a text-only "done"
         # response instead of being pushed into redundant verification calls.
         _force = iteration == 1
-        # Proactive: compact BEFORE sending if we're already over the soft
-        # budget. Catches provider error-string mismatches and saves a wasted
-        # round-trip on hosts that 400 without a parseable error message.
-        messages = _proactive_trim(messages)
-        try:
-            response = _stream_completion(client, model, messages, force_tool=_force)
-            _rate_limit_retries = 0
-            _timeout_retries = 0
-            _conn_retries = 0
-        except BadRequestError as e:
-            err_str = str(e)
-            logger.log_error(f"BadRequestError on turn {iteration}", exc=e)
-            if _is_context_window_error(err_str):
-                compacted = _compact_and_trim(messages, groups=10)
-                if len(compacted) < len(messages):
-                    display.print_info(
-                        f"Context window exceeded — compacted oldest turns "
-                        f"(~{_estimated_tokens(compacted):,} tokens left) and retrying."
-                    )
-                    logger.log_info(
-                        "Context window exceeded — compacted and retrying.",
-                        est_tokens=_estimated_tokens(compacted),
-                    )
-                    messages = compacted
-                    iteration -= 1  # compaction doesn't consume a turn
-                    continue
-                # Nothing left to compact
-                display.print_error(
-                    "Context window exceeded and cannot be compacted further.\n"
-                    "Use /compact to summarise history, or /clear to start fresh."
-                )
-            elif "Unterminated string" in err_str or "Extra data" in err_str:
-                # The model's tool-call arguments were cut off mid-stream, leaving
-                # invalid JSON in the message history.  Roll back the last assistant
-                # turn (and any partial tool results) and ask the model to retry.
-                while messages and messages[-1].get("role") in ("tool", "assistant"):
-                    messages.pop()
-                display.print_info(
-                    "Tool call arguments were truncated — rolling back and retrying."
-                )
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "Your previous response was cut off before the tool arguments "
-                        "were complete. Please redo the last action from scratch, making "
-                        "sure to produce a complete, valid response."
-                    ),
-                })
-                iteration -= 1
-                continue
-            else:
-                display.print_error(f"API error: {e}")
-            _end_reason = "error"
-            break
-        except KeyboardInterrupt:
+        response, _signal, messages = _robust_stream(
+            client, model, messages, _force, _retry_state, iteration
+        )
+        if _signal == "retry":
+            iteration -= 1  # transient error — don't count this as a used turn
+            continue
+        if _signal == "interrupt":
             display.stream_end(False)
             display.console.print("\n[dim]Interrupted.[/dim]")
             logger.log_session_end(iteration, reason="interrupted")
             return messages
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "rate" in err_str.lower() or "RateLimit" in type(e).__name__:
-                _rate_limit_retries += 1
-                wait = min(60, 5 * (2 ** (_rate_limit_retries - 1)))
-                display.print_info(f"Rate limit — waiting {wait}s ({_rate_limit_retries}/5).")
-                if _rate_limit_retries > 5:
-                    display.print_error("Rate limit persists after 5 retries.")
-                    _end_reason = "error"
-                    break
-                _time.sleep(wait)
-                iteration -= 1  # don't count this as a used iteration
-                continue
-            elif "timeout" in err_str.lower() or "timed out" in err_str.lower() or "Timeout" in type(e).__name__:
-                _timeout_retries += 1
-                wait = min(30, 5 * (2 ** (_timeout_retries - 1)))
-                display.print_info(f"Request timeout — retrying in {wait}s ({_timeout_retries}/3).")
-                if _timeout_retries > 3:
-                    display.print_error("Request keeps timing out after 3 retries.")
-                    _end_reason = "error"
-                    break
-                _time.sleep(wait)
-                iteration -= 1
-                continue
-            elif _is_retryable_error(e):
-                # Transient connection drop ("peer closed connection without sending
-                # complete message body" / "incomplete chunked read") or gateway 5xx.
-                # These hit long-TTFT models mid-stream; a fresh retry usually works.
-                _conn_retries += 1
-                wait = min(30, 5 * (2 ** (_conn_retries - 1)))
-                logger.log_error(f"Connection error on turn {iteration}", exc=e)
-                display.print_info(
-                    f"Connection dropped — retrying in {wait}s ({_conn_retries}/4)."
-                )
-                if _conn_retries > 4:
-                    display.print_error("Connection keeps dropping after 4 retries.")
-                    _end_reason = "error"
-                    break
-                _time.sleep(wait)
-                iteration -= 1
-                continue
-            elif "410" in err_str and ("end of life" in err_str.lower() or "Gone" in err_str):
-                display.print_error(
-                    "Model has reached end of life and is no longer available.\n"
-                    "Switch to a different model with [bold]/model <name>[/bold]  "
-                    "or run [bold]/model[/bold] to list available models."
-                )
-                _end_reason = "error"
-                break
-            elif "404" in err_str:
-                if "not found for account" in err_str.lower():
-                    display.print_error(
-                        "Model is not accessible with your NVIDIA NIM account tier.\n"
-                        "This model may require a paid plan or special access.\n"
-                        "Switch to a different model with [bold]/model <name>[/bold]  "
-                        "or run [bold]/model[/bold] to list models available to your account."
-                    )
-                else:
-                    display.print_error(
-                        "Model not found (404). The model ID may be incorrect or the model\n"
-                        "is no longer available at this endpoint.\n"
-                        "Switch to a different model with [bold]/model <name>[/bold]  "
-                        "or run [bold]/model[/bold] to list available models."
-                    )
-                _end_reason = "error"
-                break
-            logger.log_error(f"Unexpected error on turn {iteration}", exc=e)
-            display.print_error(f"Unexpected error: {e}")
+        if _signal == "fatal":
             _end_reason = "error"
             break
 

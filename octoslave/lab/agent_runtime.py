@@ -2,10 +2,9 @@
 Agent runtime — run ONE AgentSpec on the shared agent engine.
 
 This is the atomic unit every higher layer (meetings, runner) composes. It is a
-cleaned-up generalization of ``research._run_specialist``: a robust tool-using
-loop (transient-error retries, proactive context trimming, truncated-args
-rollback, no-tool exit + nudge) driven by a *dynamic* AgentSpec rather than the
-old static ROLES table.
+robust tool-using loop (transient-error retries, proactive context trimming,
+truncated-args rollback, no-tool exit + nudge) driven by a *dynamic* AgentSpec
+rather than a static role table.
 
 Tool surface is restricted to the agent's allowlist by threading ``tools=`` into
 ``agent._stream_completion`` on every turn (not just turn 1), so a specialist

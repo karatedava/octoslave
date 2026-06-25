@@ -45,12 +45,15 @@
       </svg>
       <span>Chat</span>
     </button>
-    <button class="nav-btn" data-tab="research" title="Research">
+    <a class="nav-btn nav-link" href="/lab" title="Lab — autonomous research team">
       <svg class="nav-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M9 3h6m-6 0v7L5 17a3 3 0 0 0 2.6 4.5h8.8A3 3 0 0 0 19 17l-4-7V3"/>
+        <circle cx="12" cy="12" r="2.2"/>
+        <ellipse cx="12" cy="12" rx="10" ry="4.4"/>
+        <ellipse cx="12" cy="12" rx="10" ry="4.4" transform="rotate(60 12 12)"/>
+        <ellipse cx="12" cy="12" rx="10" ry="4.4" transform="rotate(120 12 12)"/>
       </svg>
-      <span>Research</span>
-    </button>
+      <span>Lab</span>
+    </a>
     <button class="nav-btn" data-tab="settings" title="Settings">
       <svg class="nav-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="12" cy="12" r="3"/>
@@ -104,6 +107,13 @@
         <option value="controlled">Controlled</option>
         <option value="supervised">Supervised</option>
       </select>
+      <div class="config-divider"></div>
+      <label class="council-switch" id="council-switch-label"
+             title="Improved mode — a model council (Thinker · Worker · Verifier) behind one agent. Stronger results; uses more tokens. Cloud backends only.">
+        <input type="checkbox" id="chat-council-toggle" checked>
+        <span class="council-switch-track"><span class="council-switch-thumb"></span></span>
+        <span class="council-switch-text">🐙 Improved</span>
+      </label>
       <div class="config-divider" style="display:none;"></div>
       <div class="dir-field">
         <svg class="dir-field-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -200,165 +210,6 @@
           <span class="parallel-hint">leave blank to inherit</span>
         </div>
         <div class="parallel-rows" id="parallel-rows"></div>
-      </div>
-    </div>
-  </div>
-
-  <!-- ── TAB: RESEARCH ─────────────────────────────────────── -->
-  <div class="tab-pane" id="tab-research">
-    <div class="research-layout">
-
-      <div class="research-left">
-        <div class="research-form-section">
-          <label class="form-label">Research Topic</label>
-          <textarea id="research-topic" rows="5" placeholder="Describe your research question or topic…"></textarea>
-        </div>
-
-        <div class="research-form-section">
-          <label class="form-label">Configuration</label>
-          <div class="field-row">
-            <div class="field-group">
-              <label class="field-label">Provider</label>
-              <select id="research-backend-select" class="backend-select" data-backend="einfra">
-                <!-- options injected dynamically from /list_providers -->
-                <option value="einfra">e-INFRA CZ</option>
-                <option value="ollama">Local (Ollama)</option>
-                <option value="nim">NVIDIA NIM</option>
-              </select>
-            </div>
-            <div class="field-group">
-              <label class="field-label">Rounds</label>
-              <input type="number" id="research-rounds" value="3" min="1" max="20">
-            </div>
-          </div>
-          <div class="field-row">
-            <div class="field-group" style="flex: 1;">
-              <label class="field-label">Model (all roles)</label>
-              <select id="research-model-select">
-                <option value="">(use defaults)</option>
-              </select>
-            </div>
-          </div>
-          <label class="checkbox-row" id="research-resume-row">
-            <input type="checkbox" id="research-resume">
-            <span>Resume previous research</span>
-          </label>
-        </div>
-
-        <div class="research-form-section">
-          <div class="committee-head">
-            <label class="form-label">Model committee</label>
-            <button class="btn-secondary btn-sm" id="committee-toggle-btn" type="button">
-              Configure per-role
-            </button>
-          </div>
-          <p class="committee-hint">
-            Pick a different model for each agent in the long-research pipeline.
-            Leave any row on <em>(default)</em> to use the backend's recommended model.
-            Custom picks override the “Model (all roles)” dropdown above.
-          </p>
-          <div class="committee-grid" id="committee-grid" style="display:none">
-            <!-- rows injected at runtime by initResearchCommittee() -->
-          </div>
-          <div class="committee-actions" id="committee-actions" style="display:none">
-            <button class="btn-secondary btn-sm" id="committee-reset-btn" type="button">
-              Reset to defaults
-            </button>
-            <span class="committee-status" id="committee-status"></span>
-          </div>
-        </div>
-
-        <div class="research-form-section">
-          <label class="form-label">Working Directory</label>
-          <div class="dir-field">
-            <svg class="dir-field-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-            </svg>
-            <input type="text" id="research-dir-input" placeholder="./research">
-            <button class="btn-browse" onclick="browseDir('research-dir-input')" title="Browse for folder">
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                <polyline points="6 9 12 15 18 9"/>
-              </svg>
-            </button>
-          </div>
-        </div>
-
-        <button id="research-start-btn">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none">
-            <polygon points="5 3 19 12 5 21 5 3"/>
-          </svg>
-          Start Research
-        </button>
-
-        <div class="pipeline-section" id="pipeline-section">
-          <div class="round-progress">
-            <div class="round-progress-label" id="round-progress-label">Initializing…</div>
-            <div class="round-progress-track">
-              <div class="round-progress-fill" id="round-progress-fill"></div>
-            </div>
-          </div>
-          <div class="pipeline-boxes" id="pipeline-boxes">
-            <div class="pipeline-box pending" data-role="researcher">
-              <span class="p-icon">🔬</span>
-              <span class="p-label">Researcher</span>
-              <span class="p-model"></span>
-              <span class="p-elapsed"></span>
-            </div>
-            <div class="pipeline-box pending" data-role="hypothesis">
-              <span class="p-icon">💡</span>
-              <span class="p-label">Experiment Designer</span>
-              <span class="p-model"></span>
-              <span class="p-elapsed"></span>
-            </div>
-            <div class="pipeline-box pending" data-role="skeptic">
-              <span class="p-icon">🤨</span>
-              <span class="p-label">Skeptic</span>
-              <span class="p-model"></span>
-              <span class="p-elapsed"></span>
-            </div>
-            <div class="pipeline-box pending" data-role="coder">
-              <span class="p-icon">💻</span>
-              <span class="p-label">Coder</span>
-              <span class="p-model"></span>
-              <span class="p-elapsed"></span>
-            </div>
-            <div class="pipeline-box pending" data-role="debugger">
-              <span class="p-icon">🐛</span>
-              <span class="p-label">Debugger</span>
-              <span class="p-model"></span>
-              <span class="p-elapsed"></span>
-            </div>
-            <div class="pipeline-box pending" data-role="evaluator">
-              <span class="p-icon">⚖️</span>
-              <span class="p-label">Evaluator</span>
-              <span class="p-model"></span>
-              <span class="p-elapsed"></span>
-            </div>
-            <div class="pipeline-box pending" data-role="orchestrator">
-              <span class="p-icon">🧠</span>
-              <span class="p-label">Orchestrator</span>
-              <span class="p-model"></span>
-              <span class="p-elapsed"></span>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div class="research-right">
-        <div class="console-header">
-          <span class="console-label">Live Console</span>
-        </div>
-        <div id="research-console"></div>
-
-        <div class="completion-card" id="completion-card">
-          <span class="comp-title" id="comp-title">Research Complete</span>
-          <span class="comp-btns">
-            <a id="comp-report-btn" href="#" target="_blank" class="btn-primary" style="text-decoration:none;font-size:12px;font-weight:500;display:inline-flex;align-items:center;gap:6px">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-              Open Report
-            </a>
-          </span>
-        </div>
       </div>
     </div>
   </div>

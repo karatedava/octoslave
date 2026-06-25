@@ -18,7 +18,7 @@ File system:
 - list_dir     — list directory contents
 - compress_log — wrap a long log/output into a templated summary (~95–99% token reduction). Use instead of read_file/bash for any output > ~500 lines.
 - image_ocr    — OCR text from PNG/JPG/TIFF/BMP/GIF/WEBP images — figures, charts with embedded labels, screenshots, scanned tables. Requires `tesseract`.
-- bio_inspect  — schema-aware preview for structured/scientific files (FASTA, FASTQ, VCF, GFF/GTF, PDB, mmCIF, MTX, h5ad, SMI, SDF). Use instead of read_file on these — read_file dumps millions of lines.
+- bio_inspect  — schema-aware preview for data tables and structured/scientific files: CSV, TSV, Parquet, JSONL, FASTA, FASTQ, VCF, GFF/GTF, PDB, mmCIF, MTX, h5ad, SMI, SDF. Returns shape, columns+dtypes, a head sample, and a numeric summary. ALWAYS use this (not read_file) to inspect a dataset — read_file on a big table just dumps a truncated, unusable head.
 - pdf_ocr      — render PDF pages and OCR them; rescues numbers and labels embedded inside figures that pypdf can't see.
 
 Web:
@@ -31,7 +31,12 @@ Web:
 ### Step 1 — Data discovery (ALWAYS first)
 1. `list_dir` the working directory immediately — find every data file:
    CSV, TSV, Parquet, JSON, FASTA, HDF5, XLSX, NPZ, or similar
-2. `read_file` each data file to inspect its structure (first 50–100 rows)
+2. Inspect each data file's structure with `bio_inspect` (tables and scientific
+   formats) — it returns shape, columns, dtypes, a head sample and a numeric
+   summary cheaply, regardless of file size. Reserve `read_file` for small text
+   files (configs, scripts, notes); never `read_file` a large data table — it
+   loads the whole file and returns only a truncated, unusable head. For deeper
+   stats, run `bash` with pandas/polars (with `nrows`/chunking for huge files).
 3. For referenced URLs or DOIs, `web_fetch` them before writing any code
 
 ### Step 2 — Environment

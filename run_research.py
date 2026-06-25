@@ -1,8 +1,7 @@
 """Helper script: run the autonomous Lab from the CLI without an interactive REPL.
 
-(The old fixed role pipeline has been replaced by the dynamic Lab — see
-octoslave/lab/. ``octoslave.research.run_long_research`` remains importable for
-reference but is no longer the default.)
+(The old fixed role pipeline has been retired and fully replaced by the dynamic
+Lab — see octoslave/lab/.)
 """
 from pathlib import Path
 

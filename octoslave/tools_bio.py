@@ -53,12 +53,14 @@ BIO_TOOL_DEFINITIONS = [
         "function": {
             "name": "bio_inspect",
             "description": (
-                "Schema-aware preview of a biological / chemical data file. "
-                "Auto-detects format (FASTA, FASTQ, VCF, GFF/GTF, PDB, mmCIF, "
-                "Matrix Market .mtx, AnnData .h5ad, SMILES .smi/.smiles, SDF) "
-                "and returns counts, schema, and a small head preview. "
-                "ALWAYS use this on bio/chem files instead of read_file — "
-                "read_file will dump millions of lines for large datasets."
+                "Schema-aware preview of a data table or biological / chemical "
+                "data file. Auto-detects format (CSV, TSV, Parquet, JSONL, FASTA, "
+                "FASTQ, VCF, GFF/GTF, PDB, mmCIF, Matrix Market .mtx, AnnData "
+                ".h5ad, SMILES .smi/.smiles, SDF). For tables it returns shape, "
+                "columns+dtypes, a head sample, a numeric summary and missing-value "
+                "counts (computed on a bounded row sample, so it's fast on multi-GB "
+                "files). ALWAYS use this to inspect a dataset instead of read_file — "
+                "read_file just dumps a truncated, unusable head of a large file."
             ),
             "parameters": {
                 "type": "object",
@@ -67,9 +69,10 @@ BIO_TOOL_DEFINITIONS = [
                     "format": {
                         "type": "string",
                         "description": (
-                            "Optional override. One of: fasta, fastq, vcf, gff, gtf, "
-                            "pdb, cif, mtx, h5ad, smi, sdf. Auto-detected from "
-                            "extension if omitted."
+                            "Optional override. One of: table, fasta, fastq, vcf, "
+                            "gff, gtf, pdb, cif, mtx, h5ad, smi, sdf. Auto-detected "
+                            "from extension if omitted (use 'table' for CSV/TSV/"
+                            "Parquet/JSONL)."
                         ),
                     },
                     "head": {
@@ -370,6 +373,10 @@ _FORMAT_BY_EXT = {
     ".h5ad": "h5ad",
     ".smi": "smi", ".smiles": "smi",
     ".sdf": "sdf", ".mol": "sdf",
+    # tabular / scientific data tables — schema-aware preview instead of a raw dump
+    ".csv": "table", ".tsv": "table", ".tab": "table",
+    ".parquet": "table", ".pq": "table",
+    ".jsonl": "table", ".ndjson": "table",
 }
 
 
@@ -409,6 +416,7 @@ def _bio_inspect(path: str, working_dir: str, format: str = None, head: int = 3)
         "h5ad": _inspect_h5ad,
         "smi": _inspect_smi,
         "sdf": _inspect_sdf,
+        "table": _inspect_table,
     }
     return handlers[fmt](resolved, head, fmt)
 
@@ -762,6 +770,86 @@ def _inspect_sdf(path: Path, head: int, _fmt: str) -> tuple[str, bool]:
         "property_keys": sorted(prop_keys)[:50],
         "preview": preview,
     }, indent=2), True
+
+
+# Read at most this many rows to infer dtypes / compute the numeric summary, so
+# bio_inspect stays fast and bounded even on multi-GB tables (the FULL file is
+# never loaded into the model's context — only this compact schema digest is).
+_TABLE_SUMMARY_ROWS = 50_000
+
+
+def _count_lines(path: Path) -> int:
+    """Fast newline count without parsing — cheap even for multi-GB files."""
+    total = 0
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1 << 20)
+            if not chunk:
+                break
+            total += chunk.count(b"\n")
+    return total
+
+
+def _inspect_table(path: Path, head: int, _fmt: str) -> tuple[str, bool]:
+    """Schema-aware preview for CSV/TSV/Parquet/JSONL tables.
+
+    Returns shape, per-column dtypes, a head sample, and a numeric describe()
+    computed on a bounded row sample — a compact digest the model can plan on,
+    instead of read_file dumping (and trying to number) millions of lines.
+    """
+    try:
+        import pandas as pd
+    except ImportError:
+        return "pandas is not installed. Run: pip install pandas", False
+
+    ext = path.suffix.lower()
+    head = max(1, min(int(head or 5), 50))
+    sampled = False
+    try:
+        if ext in (".parquet", ".pq"):
+            df = pd.read_parquet(path)
+            n_rows = len(df)
+            if n_rows > _TABLE_SUMMARY_ROWS:
+                df = df.head(_TABLE_SUMMARY_ROWS); sampled = True
+        elif ext in (".jsonl", ".ndjson"):
+            n_rows = _count_lines(path)
+            df = pd.read_json(path, lines=True, nrows=_TABLE_SUMMARY_ROWS)
+            sampled = n_rows > len(df)
+        else:  # csv / tsv / tab
+            sep = "\t" if ext in (".tsv", ".tab") else ","
+            # data rows ≈ lines minus header (best-effort; not exact with quoted newlines)
+            n_rows = max(0, _count_lines(path) - 1)
+            df = pd.read_csv(path, sep=sep, nrows=_TABLE_SUMMARY_ROWS)
+            sampled = n_rows > len(df)
+    except Exception as e:
+        return f"Table read error ({path.name}): {e}", False
+
+    n_cols = df.shape[1]
+    columns = {str(c): str(t) for c, t in df.dtypes.items()}
+    summary: dict = {
+        "format": f"table ({ext.lstrip('.') or 'csv'})",
+        "file": path.name,
+        "shape": [int(n_rows), int(n_cols)],
+        "columns": dict(list(columns.items())[:100]),
+        "head": df.head(head).to_dict(orient="records"),
+    }
+    num = df.select_dtypes("number")
+    if not num.empty:
+        desc = num.describe().T[["mean", "std", "min", "50%", "max"]]
+        summary["numeric_summary"] = {
+            str(k): {kk: (None if pd.isna(vv) else round(float(vv), 4)) for kk, vv in v.items()}
+            for k, v in desc.head(60).to_dict(orient="index").items()
+        }
+    na = df.isna().sum()
+    na = na[na > 0].sort_values(ascending=False)
+    if len(na):
+        summary["columns_with_missing"] = {str(k): int(v) for k, v in list(na.items())[:20]}
+    if sampled:
+        summary["note"] = (
+            f"shape.rows is the full count; dtypes / summary computed on the first "
+            f"{_TABLE_SUMMARY_ROWS:,} rows. Use bash + pandas for full-data statistics."
+        )
+    return json.dumps(summary, indent=2, default=str), True
 
 
 # ---------------------------------------------------------------------------
