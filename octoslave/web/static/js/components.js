@@ -16,7 +16,6 @@ window.appState = {
   retries: 0,
   retryTimer: null,
   running: false,
-  researchRunning: false,
   config: {},
   currentAssistantBubble: null,
   currentToolCallsDiv: null,
@@ -27,8 +26,6 @@ window.appState = {
   currentChatId: null,
   suppressNextChatSavedId: false,
   attachedFiles: [],
-  researchDir: '',
-  researchMaxRounds: 3,
 };
 
 /**
@@ -241,13 +238,11 @@ function setChatRunning(running) {
   window.appState.running = running;
   const statusBadge = document.getElementById('chat-status');
   const sendBtn = document.getElementById('chat-send-btn');
-  const startBtn = document.getElementById('research-start-btn');
-  
+
   if (statusBadge) {
     statusBadge.textContent = running ? 'running' : 'idle';
     statusBadge.className = running ? 'badge badge-running' : 'badge badge-idle';
   }
-  
+
   if (sendBtn) sendBtn.disabled = running;
-  if (startBtn) startBtn.disabled = running;
 }

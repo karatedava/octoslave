@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "octoslave"
-version = "1.0.0"
+version = "1.0.1"
 description = "Autonomous AI research & coding assistant — terminal + web UI, multi-agent parallel mode, e-INFRA CZ / NVIDIA NIM / Ollama backends"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -96,10 +96,7 @@ octoslave = [
     "web/static/*.png",
     "web/static/css/*.css",
     "web/static/js/*.js",
-]
-
-[tool.uv.workspace]
-members = [
-    "debug/new_benchmark",
-    "Converter",
+    "web/lab_static/*.html",
+    "web/lab_static/assets/*.js",
+    "web/lab_static/assets/*.css",
 ]

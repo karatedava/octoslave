@@ -1,0 +1,14 @@
+{
+  "n_total": 8,
+  "n_active": 5,
+  "n_inactive": 3,
+  "threshold_rule": "charge>=2.5 AND gravy<=0.6",
+  "AUROC": 0.833,
+  "accuracy": 0.875,
+  "sensitivity": 0.8,
+  "specificity": 1.0,
+  "TP": 4,
+  "FP": 0,
+  "TN": 3,
+  "FN": 1
+}

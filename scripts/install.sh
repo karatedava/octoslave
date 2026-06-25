@@ -25,6 +25,8 @@
 #   OCTOSLAVE_VENV_DIR   where the fallback venv lives (default: ~/.local/share/octoslave-venv)
 #   OCTOSLAVE_NO_CODAG   set to 1 to skip installing the codag CLI
 #                        (used by the `compress_log` tool — optional)
+#   OCTOSLAVE_NO_TESSERACT  set to 1 to skip installing the tesseract OCR engine
+#                        (used by the image_ocr / pdf_ocr tools — optional)
 #
 
 set -euo pipefail
@@ -36,6 +38,7 @@ OCTOSLAVE_EXTRAS="${OCTOSLAVE_EXTRAS-[all]}"
 OCTOSLAVE_NO_PIPX="${OCTOSLAVE_NO_PIPX:-0}"
 OCTOSLAVE_VENV_DIR="${OCTOSLAVE_VENV_DIR:-$HOME/.local/share/octoslave-venv}"
 OCTOSLAVE_NO_CODAG="${OCTOSLAVE_NO_CODAG:-0}"
+OCTOSLAVE_NO_TESSERACT="${OCTOSLAVE_NO_TESSERACT:-0}"
 
 # ── Pretty output helpers ─────────────────────────────────────────────────
 bold()   { printf "\033[1m%s\033[0m\n" "$*"; }
@@ -238,9 +241,10 @@ install_codag() {
 }
 install_codag
 
-# Register codag's MCP server (tail_kubernetes / tail_docker / tail_aws_logs /
-# tail_vercel / tail_gh_actions / wrap / compact / health) in ~/.octoslave/
-# config.json so the agent can reach those tools without manual /mcp setup.
+# Register codag's MCP server (wrap / compact / health, plus tail_* log-tailers
+# for any installed log CLIs — docker/kubectl/aws/gh/vercel; tail tools whose
+# CLI is missing are pruned automatically at load) in ~/.octoslave/config.json
+# so the agent can reach those tools without manual /mcp setup.
 # Idempotent. Skip with OCTOSLAVE_NO_CODAG_MCP_REGISTER=1.
 register_codag_mcp() {
     if [ "$OCTOSLAVE_NO_CODAG_MCP_REGISTER" = "1" ]; then
@@ -267,10 +271,64 @@ register_codag_mcp() {
         return 0
     fi
     if "$OTS_PY" -c "from octoslave.config import ensure_codag_mcp_registered; print('registered' if ensure_codag_mcp_registered() else 'already-registered')" 2>/dev/null | grep -q registered; then
-        green "✓ codag MCP server registered (tail_kubernetes, tail_docker, tail_aws_logs, …)"
+        green "✓ codag MCP server registered (wrap, compact, health + tail_* for installed log CLIs)"
     fi
 }
 register_codag_mcp
+
+# ── 6b. Install tesseract OCR engine (optional — powers image_ocr / pdf_ocr) ──
+#
+# pytesseract (pulled in by the [all] extra) is only a thin wrapper around the
+# `tesseract` system binary — without the engine, image_ocr / pdf_ocr can't run.
+# Best-effort across the common package managers; never fails the install.
+# Skip with OCTOSLAVE_NO_TESSERACT=1.
+#
+install_tesseract() {
+    if [ "$OCTOSLAVE_NO_TESSERACT" = "1" ]; then
+        info "skipping tesseract install (OCTOSLAVE_NO_TESSERACT=1)"
+        return 0
+    fi
+    if command -v tesseract >/dev/null 2>&1; then
+        green "✓ tesseract already installed at $(command -v tesseract)"
+        return 0
+    fi
+    info "installing tesseract OCR engine (used by image_ocr / pdf_ocr)"
+
+    local os; os="$(uname -s)"
+    if [ "$os" = "Darwin" ]; then
+        if command -v brew >/dev/null 2>&1; then
+            if brew install tesseract >/dev/null 2>&1; then
+                green "✓ tesseract installed"
+                return 0
+            fi
+        else
+            yellow "  Homebrew not found — install tesseract with: brew install tesseract"
+            return 0
+        fi
+    elif [ "$os" = "Linux" ]; then
+        # Use sudo only when not already root and sudo exists.
+        local SUDO=""
+        if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+        fi
+        if command -v apt-get >/dev/null 2>&1; then
+            $SUDO apt-get update -qq >/dev/null 2>&1 || true
+            $SUDO apt-get install -y tesseract-ocr >/dev/null 2>&1 && { green "✓ tesseract installed"; return 0; }
+        elif command -v dnf >/dev/null 2>&1; then
+            $SUDO dnf install -y tesseract >/dev/null 2>&1 && { green "✓ tesseract installed"; return 0; }
+        elif command -v yum >/dev/null 2>&1; then
+            $SUDO yum install -y tesseract >/dev/null 2>&1 && { green "✓ tesseract installed"; return 0; }
+        elif command -v pacman >/dev/null 2>&1; then
+            $SUDO pacman -S --noconfirm tesseract >/dev/null 2>&1 && { green "✓ tesseract installed"; return 0; }
+        elif command -v zypper >/dev/null 2>&1; then
+            $SUDO zypper install -y tesseract-ocr >/dev/null 2>&1 && { green "✓ tesseract installed"; return 0; }
+        fi
+    fi
+    yellow "  could not auto-install tesseract — image_ocr / pdf_ocr will be unavailable."
+    yellow "  macOS: brew install tesseract   Linux: apt install tesseract-ocr (or dnf/yum/pacman/zypper)"
+    return 0
+}
+install_tesseract
 
 echo
 

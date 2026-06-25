@@ -27,17 +27,17 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from .. import display
 from ..display import resolve_permission, resolve_user_response
 from ..agent import continue_agent, make_client, run_agent, list_prompt_profiles
+from ..council import (
+    resolve_council_roles, run_council_agent, continue_council_agent, council_available,
+)
 from ..parallel import run_parallel_agents
 from ..config import (
     load_config,
-    get_role_models, save_role_model, reset_role_models,
-    PIPELINE_ROLES,
     resolve_backend, list_providers,
-    get_custom_providers, get_custom_provider,
+    get_custom_provider,
     add_custom_provider, update_custom_provider, remove_custom_provider,
     get_mcp_servers, add_mcp_server, remove_mcp_server, set_mcp_server_enabled,
 )
-from ..research import PIPELINE, run_long_research
 
 # ---------------------------------------------------------------------------
 
@@ -58,6 +58,12 @@ app.add_middleware(_NoCacheJS)
 
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+# New Lab UI (Vite + React build). Served at /lab; index.html auto-served at the
+# mount root via html=True. Built assets reference /lab/assets/* (vite base).
+LAB_STATIC_DIR = Path(__file__).parent / "lab_static"
+if LAB_STATIC_DIR.exists():
+    app.mount("/lab", StaticFiles(directory=str(LAB_STATIC_DIR), html=True), name="lab")
 
 _ALLOWED_EXT = {
     ".html", ".htm", ".md", ".txt", ".json", ".csv",
@@ -418,10 +424,32 @@ async def ws_endpoint(websocket: WebSocket):
                 try:
                     raw = await websocket.receive_text()
                     msg = json.loads(raw)
-                    if msg.get("type") == "permission_response":
+                    mt = msg.get("type")
+                    if mt == "permission_response":
                         resolve_permission(bool(msg.get("allow", False)))
-                    elif msg.get("type") == "user_response":
+                    elif mt == "user_response":
                         resolve_user_response(str(msg.get("answer", "")))
+                    # ---- live lab controls (handled while a lab is running) ----
+                    elif mt == "inject":
+                        sess = state.get("lab_session")
+                        if sess is not None:
+                            sess.add_injection(str(msg.get("text", "")))
+                    elif mt == "set_autonomous":
+                        sess = state.get("lab_session")
+                        if sess is not None:
+                            sess.autonomous = bool(msg.get("autonomous", True))
+                            sess.touch()
+                    elif mt in ("approve", "lab_continue"):
+                        sess = state.get("lab_session")
+                        if sess is not None:
+                            from ..lab.runner import resolve_lab_approval
+                            resolve_lab_approval(sess, "continue")
+                    elif mt == "stop_lab":
+                        sess = state.get("lab_session")
+                        if sess is not None:
+                            from ..lab.runner import resolve_lab_approval
+                            sess.status = "stopped"
+                            resolve_lab_approval(sess, "stop")
                 except Exception:
                     break
 
@@ -843,11 +871,43 @@ async def ws_endpoint(websocket: WebSocket):
                 _resolved = resolve_backend(cfg)
                 client = make_client(_resolved["api_key"], _resolved["base_url"])
 
-                def chat_fn(txt=message_text, mdl=model, wd=working_dir, new=new_conv, 
-                           pp=prompt_profile, pm=permission_mode):
+                # Improved (council) mode — opt-in per message; the web
+                # UI ships it ON by default. Needs a cloud pool, so it auto-falls
+                # back to the normal single agent on the Ollama backend.
+                use_council = bool(msg.get("council", False))
+                council_roles = None
+                if use_council and council_available(cfg):
+                    try:
+                        council_roles, council_notes = resolve_council_roles(client, cfg, {})
+                        await send({
+                            "type": "info",
+                            "text": (
+                                "🐙 council — Worker: " + council_roles["worker"]
+                                + " · Thinker: " + council_roles["thinker"]
+                                + " · Verifier: " + council_roles["verifier"]
+                            ),
+                        })
+                    except Exception as exc:
+                        council_roles = None
+                        await send({"type": "info", "text": f"council unavailable ({exc}); using single agent."})
+                elif use_council and not council_available(cfg):
+                    await send({
+                        "type": "info",
+                        "text": "Improved mode needs a cloud pool (e-INFRA / NIM); using the single local agent.",
+                    })
+
+                def chat_fn(txt=message_text, mdl=model, wd=working_dir, new=new_conv,
+                           pp=prompt_profile, pm=permission_mode, roles=council_roles):
                     display.set_event_callback(make_emit())
                     try:
-                        if new:
+                        if roles:
+                            if new:
+                                result = run_council_agent(txt, wd, client, roles,
+                                                           prompt_profile=pp, permission_mode=pm)
+                            else:
+                                result = continue_council_agent(state["messages"], txt, client,
+                                                                roles, wd, pm)
+                        elif new:
                             result = run_agent(txt, mdl, wd, client, pp, pm)
                         else:
                             result = continue_agent(state["messages"], txt, mdl, wd, client, pm)
@@ -986,45 +1046,48 @@ async def ws_endpoint(websocket: WebSocket):
                 except Exception as exc:
                     await send({"type": "error", "text": f"Failed to load chat: {exc}"})
 
-            # ---- research ----
-            elif mtype == "research":
+            # ---- lab (dynamic autonomous team) ----
+            elif mtype in ("start_lab", "lab"):
                 if state["running"]:
                     await send({"type": "error", "text": "A task is already running."})
                     continue
 
                 cfg = load_config()
-                topic = msg.get("topic", "").strip()
-                if not topic:
-                    await send({"type": "error", "text": "Topic is required."})
+                task = (msg.get("task") or msg.get("topic") or "").strip()
+                if not task:
+                    await send({"type": "error", "text": "Task is required."})
                     continue
 
-                rounds = max(1, min(20, int(msg.get("rounds", 3))))
-                model_all = msg.get("model_all") or None
-                resume = bool(msg.get("resume", False))
                 working_dir = msg.get("working_dir") or state["working_dir"]
                 state["working_dir"] = working_dir
+                autonomous = bool(msg.get("autonomous", True))
+                max_rounds = max(1, min(12, int(msg.get("rounds", 4))))
+                model_all = msg.get("model_all") or None
+                resume = bool(msg.get("resume", False))
                 state["running"] = True
 
                 if state.get("backend"):
                     cfg["backend"] = state["backend"]
-                if model_all:
-                    model_overrides = {role: model_all for role in PIPELINE_ROLES}
-                else:
-                    model_overrides = get_role_models(cfg)
                 _resolved = resolve_backend(cfg)
                 client = make_client(_resolved["api_key"], _resolved["base_url"])
+                model = model_all or cfg.get("default_model")
 
-                def research_fn(t=topic, r=rounds, mo=model_overrides, wd=working_dir, res=resume):
+                from ..lab.state import LabSession
+                from ..lab.runner import run_lab
+                lab_session = LabSession.load(working_dir) if resume else None
+                if lab_session is None:
+                    lab_session = LabSession(task=task, working_dir=working_dir,
+                                             model=model or "")
+                lab_session.autonomous = autonomous
+                state["lab_session"] = lab_session
+
+                def lab_fn(t=task, wd=working_dir, au=autonomous, mr=max_rounds,
+                           md=model, res=resume, sess=lab_session):
                     display.set_event_callback(make_emit())
                     try:
-                        run_long_research(
-                            topic=t,
-                            working_dir=wd,
-                            client=client,
-                            max_rounds=r,
-                            model_overrides=mo,
-                            resume=res,
-                        )
+                        run_lab(task=t, working_dir=wd, client=client, model=md,
+                                autonomous=au, max_rounds=mr, resume=res,
+                                emit=make_emit(), session=sess)
                     except Exception as exc:
                         loop.call_soon_threadsafe(
                             event_q.put_nowait, {"type": "error", "text": str(exc)}
@@ -1033,60 +1096,53 @@ async def ws_endpoint(websocket: WebSocket):
                         display.clear_event_callback()
                         loop.call_soon_threadsafe(event_q.put_nowait, {"type": "_sentinel"})
 
-                threading.Thread(target=research_fn, daemon=True).start()
+                threading.Thread(target=lab_fn, daemon=True).start()
                 await stream_events()
+                state["lab_session"] = None
 
-            # ---- role model config ----
-            elif mtype == "get_role_models":
-                cfg = load_config()
-                effective = get_role_models(cfg)
-                backend = state.get("backend") or cfg.get("backend", "einfra")
-                custom = cfg.get(f"role_models_{backend}") or {}
-                await send({
-                    "type": "role_models",
-                    "backend": backend,
-                    "effective": effective,
-                    "custom": custom,
-                })
+            # ---- lab follow-up (act on feedback after completion) ----
+            elif mtype == "lab_followup":
+                if state["running"]:
+                    await send({"type": "error", "text": "A task is already running."})
+                    continue
+                feedback = (msg.get("text") or "").strip()
+                working_dir = msg.get("working_dir") or state["working_dir"]
+                if not feedback:
+                    await send({"type": "error", "text": "Feedback text is required."})
+                    continue
+                state["working_dir"] = working_dir
 
-            elif mtype == "set_role_model":
-                role = msg.get("role", "").lower()
-                model_name = msg.get("model", "").strip()
                 cfg = load_config()
-                backend = msg.get("backend") or state.get("backend") or cfg.get("backend", "einfra")
-                if role not in PIPELINE_ROLES:
-                    await send({"type": "error", "text": f"Unknown role '{role}'"})
-                    continue
-                if not model_name:
-                    await send({"type": "error", "text": "model is required"})
-                    continue
-                save_role_model(role, model_name, backend)
-                cfg = load_config()
-                effective = get_role_models(cfg)
-                custom = cfg.get(f"role_models_{backend}") or {}
-                await send({
-                    "type": "role_models",
-                    "backend": backend,
-                    "effective": effective,
-                    "custom": custom,
-                })
+                if state.get("backend"):
+                    cfg["backend"] = state["backend"]
+                _resolved = resolve_backend(cfg)
+                client = make_client(_resolved["api_key"], _resolved["base_url"])
+                model = cfg.get("default_model")
 
-            elif mtype == "reset_role_models":
-                cfg = load_config()
-                backend = msg.get("backend") or state.get("backend") or cfg.get("backend", "einfra")
-                # Allow built-ins or any registered custom provider
-                if backend not in ("einfra", "nim", "ollama") and not get_custom_provider(cfg, backend):
-                    await send({"type": "error", "text": f"Unknown backend '{backend}'"})
+                from ..lab.state import LabSession
+                from ..lab.runner import continue_lab
+                lab_session = LabSession.load(working_dir)
+                if lab_session is None:
+                    await send({"type": "error", "text": "No completed lab found in this directory."})
                     continue
-                reset_role_models(backend)
-                cfg = load_config()
-                effective = get_role_models(cfg)
-                await send({
-                    "type": "role_models",
-                    "backend": backend,
-                    "effective": effective,
-                    "custom": {},
-                })
+                state["running"] = True
+                state["lab_session"] = lab_session
+
+                def followup_fn(fb=feedback, wd=working_dir, md=model, sess=lab_session):
+                    display.set_event_callback(make_emit())
+                    try:
+                        continue_lab(working_dir=wd, client=client, feedback=fb,
+                                     model=md, emit=make_emit(), session=sess)
+                    except Exception as exc:
+                        loop.call_soon_threadsafe(
+                            event_q.put_nowait, {"type": "error", "text": str(exc)})
+                    finally:
+                        display.clear_event_callback()
+                        loop.call_soon_threadsafe(event_q.put_nowait, {"type": "_sentinel"})
+
+                threading.Thread(target=followup_fn, daemon=True).start()
+                await stream_events()
+                state["lab_session"] = None
 
     except WebSocketDisconnect:
         pass

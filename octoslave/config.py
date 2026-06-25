@@ -10,7 +10,7 @@ CONFIG_DIR = Path.home() / ".octoslave"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 BASE_URL = "https://llm.ai.e-infra.cz/v1"
-DEFAULT_MODEL = "kimi-k2.6"
+DEFAULT_MODEL = "kimi-k2.7"
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
 NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NIM_DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b"
@@ -32,7 +32,7 @@ KNOWN_MODELS = [
     "qwen3-coder-30b",
     "qwen3-coder-next",
     "gpt-oss-120b",
-    "kimi-k2.5",
+    "kimi-k2.7",
     "kimi-k2.6",
     "mistral-medium-3.5",
     "llama-4-scout-17b-16e-instruct",
@@ -114,6 +114,77 @@ NIM_ROLE_MODELS: dict[str, str] = {
     "reporter":     "nvidia/nemotron-3-super-120b-a12b",
     "merger":       "nvidia/nemotron-3-super-120b-a12b",
 }
+
+
+# ---------------------------------------------------------------------------
+# Council ("improved") role models
+# ---------------------------------------------------------------------------
+# The improved single-agent mode unifies a small pool of role-specialized
+# e-INFRA models behind one agent surface (see council.py):
+#   worker   — drives the tool loop (best agentic / tool-calling / coding)
+#   thinker  — plans & course-corrects (strongest reasoning)
+#   verifier — independent critic that reviews risky actions & completion
+# Distinct model *families* are deliberate — they catch different mistakes.
+
+COUNCIL_ROLES = ("worker", "thinker", "verifier")
+
+# Default assignment when the preferred ids resolve live.
+COUNCIL_ROLE_MODELS: dict[str, str] = {
+    "worker":   "kimi-k2.7",
+    "thinker":  "kimi-k2.7",
+    "verifier": "glm-5.2",
+}
+
+# Per-role preference chains: the first id that exists in the live /v1/models
+# catalog wins; otherwise we fall back down the chain. This is how the user's
+# requested "deepseek-v4" is honored if/when the endpoint exposes it, without
+# hard-failing when it does not.
+COUNCIL_ROLE_PREFERENCES: dict[str, list[str]] = {
+    "worker":   ["kimi-k2.7", "kimi-k2.6"],
+    "thinker":  ["kimi-k2.7", "glm-5.2", "kimi-k2.6"],
+    "verifier": ["glm-5.2", "kimi-k2.7"],
+}
+
+
+def resolve_council_models(
+    available: list[str] | None = None,
+    overrides: dict | None = None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Return ``(roles, notes)`` mapping each council role to a concrete model.
+
+    ``available`` is the live model id list (from ``einfra_list_models`` or the
+    active provider). ``overrides`` are explicit per-role choices (CLI flags or
+    env) that always win. For each role we pick the first preference present in
+    ``available``; if none match (or ``available`` is empty/unknown) we fall back
+    to ``COUNCIL_ROLE_MODELS`` and record a note so the caller can surface it.
+    """
+    overrides = {k: v for k, v in (overrides or {}).items() if v}
+    avail_set = {m for m in (available or [])}
+    roles: dict[str, str] = {}
+    notes: dict[str, str] = {}
+    for role in COUNCIL_ROLES:
+        if role in overrides:
+            roles[role] = overrides[role]
+            if avail_set and overrides[role] not in avail_set:
+                notes[role] = f"{overrides[role]} (override; not in live catalog)"
+            continue
+        if not avail_set:
+            # Catalog unknown (no api key / probe failed): use known-safe defaults
+            # rather than speculatively picking an unverified preferred id.
+            roles[role] = COUNCIL_ROLE_MODELS[role]
+            continue
+        chosen = None
+        for cand in COUNCIL_ROLE_PREFERENCES.get(role, []):
+            if cand in avail_set:
+                chosen = cand
+                break
+        if chosen is None:
+            chosen = COUNCIL_ROLE_MODELS[role]
+            notes[role] = f"{chosen} (default fallback — none of the preferred ids are live)"
+        elif chosen != COUNCIL_ROLE_PREFERENCES.get(role, [None])[0]:
+            notes[role] = f"{chosen} (first available preference)"
+        roles[role] = chosen
+    return roles, notes
 
 
 # ---------------------------------------------------------------------------

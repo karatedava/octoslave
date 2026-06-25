@@ -260,8 +260,11 @@ export function handleSlashCommand(text) {
       appendChatInfo('👋 Goodbye! You can close this tab now.');
       return true;
       
+    case '/lab':
+    case '/research':
     case '/long-research':
-      appendChatInfo('🔬 Use the [bold]Research[/bold] tab to start a long-research pipeline.');
+      appendChatInfo('🔬 Opening the [bold]Lab[/bold] — autonomous research team…');
+      window.location.href = '/lab';
       return true;
       
     default:

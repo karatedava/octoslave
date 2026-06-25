@@ -731,6 +731,7 @@ def print_help():
         "  [cyan]/show-plan[/cyan]              Show the plan generated at the start of the last task\n"
         "  [cyan]/plan on|off[/cyan]            Enable/disable the upfront planning step (default: on)\n"
         "  [cyan]/verify on|off[/cyan]          Enable/disable post-task verification grade (default: off)\n"
+        "  [cyan]/improved on|off|status[/cyan] Toggle council mode (Thinker/Worker/Verifier model pool)\n"
         "  [cyan]/memory[/cyan]                 Show cross-session memory (remembered insights + prior task outcomes)\n"
         "  [cyan]/memory clear[/cyan]           Erase the session memory file\n"
         "  [cyan]/memory on|off[/cyan]          Enable/disable memory loading/saving (default: on)\n\n"
@@ -786,22 +787,6 @@ def print_help():
 # Multi-agent research display
 # ---------------------------------------------------------------------------
 
-def print_research_start(topic: str, max_rounds: int, roles: dict, overrides: dict):
-    _emit({"type": "research_start", "topic": topic, "max_rounds": max_rounds})
-    lines = Text()
-    lines.append("🐙 AUTONOMOUS RESEARCH PIPELINE\n\n", style="bold bright_white")
-    lines.append("Topic   : ", style="dim"); lines.append(topic + "\n", style="bold white")
-    lines.append("Rounds  : ", style="dim"); lines.append(str(max_rounds) + "\n", style="bold white")
-    lines.append("\nAgents  :\n", style="dim")
-    for role, cfg in roles.items():
-        model = overrides.get(role) or cfg["default_model"]
-        lines.append(f"  {cfg['icon']}  ", style="")
-        lines.append(f"{cfg['label']:<24}", style=cfg["color"])
-        lines.append(f"→  {model}\n", style="dim")
-    console.print(Panel(lines, border_style="bright_blue", padding=(0, 2)))
-    console.print()
-
-
 def print_round_header(round_num: int, max_rounds: int, round_dir: str):
     _emit({"type": "round_start", "round": round_num,
            "max_rounds": max_rounds, "dir": round_dir})
@@ -855,27 +840,6 @@ def print_round_done(round_num: int, round_dir: str):
     console.print(
         f"[dim]  Round {round_num} complete → {round_dir}[/dim]"
     )
-
-
-def print_research_complete(rounds_done: int, research_dir: str):
-    from pathlib import Path as _Path
-    report_path = str(_Path(research_dir) / "final_report.html")
-    _emit({"type": "research_complete", "rounds": rounds_done, "dir": research_dir, "report_path": report_path})
-    console.print()
-    console.print(Panel(
-        f"[bold bright_white]🎉 Research complete[/bold bright_white]\n\n"
-        f"[dim]Rounds completed : {rounds_done}[/dim]\n"
-        f"[dim]Output directory : {research_dir}[/dim]\n\n"
-        "[white]Key files:[/white]\n"
-        f"  [bold cyan]{research_dir}/final_report.html[/bold cyan]    ← master HTML report (open in browser)\n"
-        f"  [cyan]{research_dir}/findings.md[/cyan]              ← cumulative findings\n"
-        f"  [cyan]{research_dir}/round_*/07_report.html[/cyan]   ← per-round HTML reports\n"
-        f"  [cyan]{research_dir}/round_*/06_synthesis.md[/cyan]  ← per-round synthesis\n"
-        f"  [cyan]{research_dir}/round_*/03_code/results/[/cyan] ← plots & data",
-        border_style="bright_green",
-        padding=(0, 2),
-    ))
-    console.print()
 
 
 def request_permission(tool_name: str, args: dict, working_dir: str, permission_mode: str = "controlled") -> bool:

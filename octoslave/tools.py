@@ -122,13 +122,16 @@ TOOL_DEFINITIONS = [
                 "Do NOT start long-running servers or blocking processes (e.g. 'python app.py', 'flask run') — "
                 "they will block until timeout. To verify a web app, use syntax checks or import tests instead. "
                 "Default timeout is 300 s. "
-                "For longer jobs set timeout explicitly: e.g. 600 for a slow test suite or large pip install, 28800 for ML training."
+                "For any job that may exceed a few minutes (model training, large simulations/resampling "
+                "runs, big data processing, dev servers), PREFER run_background over raising this timeout — a long "
+                "bash call blocks everything (in a team, the whole lab stalls) until it returns. Only raise "
+                "timeout for bounded one-offs like a large pip install or a full test suite (e.g. 600)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "Shell command to run"},
-                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 300). Increase for slow installs (600), full test suites (600-3600), or ML training (28800-86400). No hard cap."},
+                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 300). Prefer run_background over a large timeout for long/expensive jobs; only raise this for bounded one-offs like big installs or full test suites (600-3600)."},
                 },
                 "required": ["command"],
             },
@@ -512,8 +515,34 @@ LOCAL_TOOL_ALLOWLIST = frozenset({
 })
 
 
+# ---------------------------------------------------------------------------
+# Dynamic tool registry — runtime-built tools (the Lab "foundry") and the
+# Lab meta-tools register here. Each entry maps a tool name to (definition,
+# func) where func has signature func(args: dict, working_dir: str) ->
+# tuple[str, bool]. Strictly additive: empty by default, never affects the
+# core toolbox or non-Lab callers.
+# ---------------------------------------------------------------------------
+_DYNAMIC_TOOLS: dict[str, "tuple[dict, callable]"] = {}
+
+
+def register_dynamic_tool(definition: dict, func) -> None:
+    """Register (or replace) a runtime tool. ``definition`` is an OpenAI
+    function-tool schema; ``func(args, working_dir) -> (text, ok)``."""
+    name = definition["function"]["name"]
+    _DYNAMIC_TOOLS[name] = (definition, func)
+
+
+def unregister_dynamic_tool(name: str) -> None:
+    _DYNAMIC_TOOLS.pop(name, None)
+
+
+def dynamic_tool_names() -> set[str]:
+    return set(_DYNAMIC_TOOLS)
+
+
 def all_tool_definitions(profile: str | None = None) -> list[dict]:
-    """Built-in tools plus any tools exposed by connected MCP servers.
+    """Built-in tools plus any tools exposed by connected MCP servers, plus any
+    runtime-registered dynamic tools (Lab foundry / meta-tools).
 
     When profile == "local" (small local/Ollama models), return only the
     curated LOCAL_TOOL_ALLOWLIST and skip MCP tools entirely — a tight,
@@ -522,19 +551,22 @@ def all_tool_definitions(profile: str | None = None) -> list[dict]:
     if profile == "local":
         return [td for td in TOOL_DEFINITIONS
                 if td["function"]["name"] in LOCAL_TOOL_ALLOWLIST]
+    defs = list(TOOL_DEFINITIONS)
     mgr = _mcp_manager()
-    if mgr is None:
-        return list(TOOL_DEFINITIONS)
-    return list(TOOL_DEFINITIONS) + mgr.tool_definitions()
+    if mgr is not None:
+        defs += mgr.tool_definitions()
+    defs += [d for (d, _f) in _DYNAMIC_TOOLS.values()]
+    return defs
 
 
 def valid_tool_names() -> set[str]:
-    """Names of all callable tools (built-in + MCP). Used by the text-format
-    tool-call fallback parser."""
+    """Names of all callable tools (built-in + MCP + dynamic). Used by the
+    text-format tool-call fallback parser."""
     names = {td["function"]["name"] for td in TOOL_DEFINITIONS}
     mgr = _mcp_manager()
     if mgr is not None:
         names |= mgr.tool_names()
+    names |= set(_DYNAMIC_TOOLS)
     return names
 
 
@@ -621,6 +653,9 @@ def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str =
             if mgr is None:
                 return f"MCP is unavailable; cannot run {name}", False
             return mgr.call(name, args)
+        elif name in _DYNAMIC_TOOLS:
+            _def, func = _DYNAMIC_TOOLS[name]
+            return func(args, working_dir)
         else:
             return f"Unknown tool: {name}", False
     except TypeError as e:
@@ -712,7 +747,7 @@ _ARG_HINTS: dict[str, str] = {
     "crawl_tree": "Pass `root_url` as a fully-qualified http(s) URL.",
     "image_ocr": "Pass `path` to an image file (PNG/JPG/TIFF/BMP/GIF/WEBP).",
     "pdf_ocr": "Pass `path` to a PDF file. Use `pages` to limit page range.",
-    "bio_inspect": "Pass `path` to a bio/chem data file.",
+    "bio_inspect": "Pass `path` to a data table (CSV/TSV/Parquet/JSONL) or bio/chem data file.",
     "rdkit_describe": "Pass `smiles` (e.g. {\"smiles\": \"CC(=O)O\"}).",
     "pdb_fetch": "Pass `pdb_id` (4-char RCSB ID, e.g. \"1CRN\").",
     "alphafold_fetch": "Pass `uniprot_id` (e.g. \"P12345\").",
@@ -850,6 +885,13 @@ def _extract_docx(resolved: Path, offset: int = None, limit: int = None) -> tupl
     return header + "\n".join(selected), True
 
 
+# A full-file read above this size (with no offset/limit) is refused in favour of
+# a bounded head + a pointer to bio_inspect / bash, so one read can't blow up
+# memory or the model's context (e.g. a 38 MB / multi-GB CSV).
+_LARGE_TEXT_BYTES = 5 * 1024 * 1024  # 5 MB
+_LARGE_TEXT_PREVIEW_LINES = 50
+
+
 def _read_file(path: str, working_dir: str, offset: int = None, limit: int = None) -> tuple[str, bool]:
     resolved = _resolve(path, working_dir)
     if not resolved.exists():
@@ -876,6 +918,31 @@ def _read_file(path: str, working_dir: str, offset: int = None, limit: int = Non
             f"Binary file: {resolved.name} ({size:,} bytes). "
             "Cannot read as text. Use a dedicated tool or convert it first.",
             False,
+        )
+
+    # Large text file with no explicit window → don't load the whole thing into
+    # memory and the model's context. Return a bounded head + guidance so the
+    # model reaches for the right tool (bio_inspect for tables, bash/pandas for
+    # stats, or read_file with offset/limit to page). Paged reads (offset/limit
+    # given) and small files fall through to the normal path unchanged.
+    if offset is None and limit is None and resolved.stat().st_size > _LARGE_TEXT_BYTES:
+        size = resolved.stat().st_size
+        preview_lines: list[str] = []
+        with open(resolved, "r", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i >= _LARGE_TEXT_PREVIEW_LINES:
+                    break
+                preview_lines.append(line.rstrip("\n"))
+        numbered = "\n".join(f"{i + 1}\t{ln}" for i, ln in enumerate(preview_lines))
+        ext = resolved.suffix.lower()
+        if ext in (".csv", ".tsv", ".tab", ".parquet", ".pq", ".jsonl", ".ndjson"):
+            tip = f"This is a data table — call bio_inspect(path='{path}') for a schema-aware preview (shape, dtypes, summary)."
+        else:
+            tip = "Use bash (head/grep/awk) or read_file with offset/limit to page through it; do not read it whole."
+        return (
+            f"File: {path} ({size:,} bytes — too large to read whole; showing first "
+            f"{len(preview_lines)} lines).\n{numbered}\n\n[LARGE FILE] {tip}",
+            True,
         )
 
     try:
@@ -1442,9 +1509,10 @@ def _compress_log(
             False,
         )
 
-    # Also register codag's richer MCP server (tail_kubernetes, tail_docker,
-    # tail_aws_logs, tail_vercel, tail_gh_actions, wrap, compact, health) on
-    # first successful use, so future runs of any role can use them directly.
+    # Also register codag's richer MCP server (wrap, compact, health, plus
+    # tail_* log-tailers) on first successful use, so future runs of any role
+    # can use them directly. Tail tools whose CLI is missing (docker/kubectl/
+    # aws/gh/vercel) are pruned at load — see mcp_registry.unsupported_tools.
     # Idempotent; opt out via OCTOSLAVE_NO_CODAG_MCP_REGISTER=1.
     try:
         from .config import ensure_codag_mcp_registered
@@ -1452,9 +1520,8 @@ def _compress_log(
             from . import display
             display.print_info(
                 "compress_log: registered the codag MCP server "
-                "(exposes tail_kubernetes / tail_docker / tail_aws_logs / "
-                "tail_vercel / tail_gh_actions / wrap / compact). "
-                "Restart octoslave to load it."
+                "(exposes wrap / compact / health plus tail_* tools for any "
+                "installed log CLIs). Restart octoslave to load it."
             )
     except Exception:
         pass

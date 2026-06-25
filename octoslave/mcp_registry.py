@@ -321,6 +321,18 @@ REGISTRY: list[dict] = [
         "command": "codag",
         "args": ["mcp", "serve"],
         "inputs": [],
+        # Each tail_* tool shells out to a provider CLI. If that CLI isn't on
+        # PATH the tool can only ever fail ("executable file not found"), so we
+        # prune it at load time. Self-healing: install the CLI and the tool
+        # reappears on the next reconnect. health/compact/wrap have no single
+        # hard dependency (wrap validates its own allowlist) and are kept.
+        "tool_deps": {
+            "tail_docker": "docker",
+            "tail_kubernetes": "kubectl",
+            "tail_aws_logs": "aws",
+            "tail_gh_actions": "gh",
+            "tail_vercel": "vercel",
+        },
         "homepage": "https://codag.ai",
     },
 ]
@@ -369,6 +381,22 @@ def runtime_available(runtime: str) -> bool:
 
 def runtime_hint(runtime: str) -> str:
     return _RUNTIME_HINTS.get(runtime, "")
+
+
+def unsupported_tools(server_id: str) -> dict[str, str]:
+    """Tools from a known registry server whose required CLI is missing.
+
+    Returns a mapping ``{tool_name: missing_binary}`` for every tool the entry
+    declares in ``tool_deps`` whose binary is not on PATH. Servers not in the
+    registry (or with no ``tool_deps``) yield an empty mapping, so this is a
+    no-op for user-defined servers. Used to prune dead tools at MCP load time.
+    """
+    entry = get_entry(server_id)
+    if not entry:
+        return {}
+    deps = entry.get("tool_deps") or {}
+    return {tool: binary for tool, binary in deps.items()
+            if shutil.which(binary) is None}
 
 
 # ---------------------------------------------------------------------------

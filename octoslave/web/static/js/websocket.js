@@ -177,7 +177,6 @@ export function populateBackendSelects(providers, active) {
     }
   };
   fillSelect(document.getElementById('backend-select'));
-  fillSelect(document.getElementById('research-backend-select'));
   applyBackend(active || providerLookup.keys().next().value || 'einfra');
 }
 
@@ -190,11 +189,6 @@ function applyBackend(backend) {
     chatSel.value = backend;
     chatSel.dataset.backend = backend;
   }
-  const researchSel = document.getElementById('research-backend-select');
-  if (researchSel) {
-    researchSel.value = backend;
-    researchSel.dataset.backend = backend;
-  }
   const pill = document.getElementById('backend-pill');
   if (pill) {
     // Built-in pills get short labels; custom providers show the id verbatim
@@ -203,6 +197,10 @@ function applyBackend(backend) {
     pill.textContent = builtinLabels[backend] || backend;
     pill.dataset.backend = backend;
     pill.title = getProviderName(backend);
+  }
+  // Reflect council availability for the active backend (greyed out on Ollama).
+  if (typeof window._updateCouncilAvailability === 'function') {
+    window._updateCouncilAvailability(backend);
   }
 }
 
@@ -224,7 +222,6 @@ export function applyConfig(data) {
     sel.value = model;
   }
   document.getElementById('chat-dir-input').value     = dir;
-  document.getElementById('research-dir-input').value = dir;
 
   document.getElementById('settings-api-key').value     = data?.has_api_key ? '••••••••' : '';
   document.getElementById('settings-nim-api-key').value = data?.has_nim_key  ? '••••••••' : '';
@@ -244,11 +241,9 @@ export function applyConfig(data) {
 export function populateModelSelects(models) {
   console.log('[websocket] populateModelSelects called with', models.length, 'models');
   const chatSel     = document.getElementById('chat-model-select');
-  const researchSel = document.getElementById('research-model-select');
   const prevChat    = chatSel?.value;
 
   console.log('[websocket] chatSel:', chatSel ? 'found' : 'NOT FOUND');
-  console.log('[websocket] researchSel:', researchSel ? 'found' : 'NOT FOUND');
 
   if (chatSel) {
     chatSel.innerHTML = '';
@@ -269,20 +264,6 @@ export function populateModelSelects(models) {
     }
   } else {
     console.error('[websocket] ERROR: chat-model-select element not found!');
-  }
-
-  if (researchSel) {
-    const prevResearch = researchSel.value;
-    researchSel.innerHTML = '<option value="">(use default)</option>';
-    models.forEach(m => {
-      const o = document.createElement('option');
-      o.value = o.textContent = m;
-      researchSel.appendChild(o);
-    });
-    console.log('[websocket] Added', models.length, 'options to research select');
-    if (prevResearch) researchSel.value = prevResearch;
-  } else {
-    console.error('[websocket] ERROR: research-model-select element not found!');
   }
 }
 

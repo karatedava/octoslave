@@ -6,6 +6,7 @@ import re
 import threading
 from datetime import date, date as _date_cls
 from pathlib import Path
+import httpx
 from openai import (
     OpenAI,
     BadRequestError,
@@ -13,6 +14,13 @@ from openai import (
     APITimeoutError,
     APIStatusError,
 )
+
+# Streaming guard: the client default timeout is 1 hour (long e-INFRA TTFT), but a
+# stream that stalls mid-flight would otherwise hang the whole run for up to that
+# hour. Cap the SILENCE between streamed chunks instead — long time-to-first-token
+# is fine, but if no bytes arrive for this long we treat the call as stalled, raise
+# APITimeoutError, and let the caller's retry path re-issue it.
+_STREAM_READ_TIMEOUT = httpx.Timeout(300.0, connect=30.0)
 
 from . import display
 from . import logger
@@ -171,7 +179,7 @@ def _looks_like_tool_attempt(content: str, valid_names) -> bool:
     return False
 
 
-MAX_ITERATIONS = 100
+MAX_ITERATIONS = 400
 
 
 def _is_retryable_error(exc: Exception) -> bool:
@@ -860,23 +868,126 @@ def _simple_completion(client: OpenAI, model: str, messages: list, max_tokens: i
         return ""
 
 
+# Read-only tools the model may use while orienting itself before it plans.
+# Deliberately excludes everything that writes, runs commands, or hits the
+# network so the orientation pass can never mutate state or stall on a slow
+# command — it just looks at the local workdir, code, and data. OCR is included
+# (local, read-only) so the model can also orient on image/scanned files (PNG,
+# JPG, scanned PDFs) instead of being blind to non-text inputs.
+_ORIENT_TOOLS = frozenset({"read_file", "list_dir", "glob", "grep", "bio_inspect",
+                           "image_ocr", "pdf_ocr"})
+
+_ORIENT_PROMPT = (
+    "Before you plan, ORIENT yourself in the working directory. Using ONLY "
+    "read-only tools (list_dir, glob, grep, read_file, bio_inspect; and image_ocr / "
+    "pdf_ocr to read text from image or scanned-PDF files): explore the directory "
+    "layout, read the task and any files it references, and inspect the specific "
+    "code and data you will need to change — including images/scans via OCR if "
+    "those are what's present. Do NOT write, edit, or run anything yet. When you "
+    "have seen enough to write a concrete, file-specific plan, stop calling tools "
+    "and reply with just the word READY."
+)
+
+
+def _orientation_phase(
+    client: OpenAI,
+    model: str,
+    messages: list[dict],
+    working_dir: str,
+    permission_mode: str,
+    max_rounds: int = 5,
+) -> list[dict]:
+    """Let the model look around with read-only tools before it plans.
+
+    Runs a short, bounded loop that offers ONLY ``_ORIENT_TOOLS`` and executes
+    any read-only calls the model makes, so the subsequent plan is grounded in
+    files it has actually read. All messages are appended, so the main loop
+    inherits the gathered context and need not re-read. Best-effort: any error
+    just ends orientation early and falls through to planning.
+    """
+    orient_tools = [td for td in all_tool_definitions(profile=_rt("tool_profile", None))
+                    if td["function"]["name"] in _ORIENT_TOOLS]
+    if not orient_tools:
+        return messages
+
+    display.print_info("Orienting…")
+    messages = list(messages) + [{"role": "user", "content": _ORIENT_PROMPT}]
+
+    for rnd in range(max_rounds):
+        try:
+            response = _stream_completion(
+                client, model, messages,
+                force_tool=(rnd == 0),  # ensure it actually starts looking
+                tools=orient_tools,
+            )
+        except Exception as e:  # noqa: BLE001 — orientation is best-effort
+            display.print_info(f"Orientation ended early ({type(e).__name__}).")
+            break
+
+        content = response.get("content") or ""
+        tool_calls = response.get("tool_calls") or []
+        if not tool_calls and content:
+            tool_calls, content = _extract_text_tool_calls(content)
+
+        assistant_msg: dict = {"role": "assistant", "content": content}
+        if tool_calls:
+            assistant_msg["tool_calls"] = tool_calls
+        messages.append(assistant_msg)
+
+        if not tool_calls:
+            break  # model signalled READY — done looking
+
+        for tc in tool_calls:
+            name = tc["function"]["name"]
+            raw_args = tc["function"]["arguments"]
+            try:
+                args = json.loads(raw_args) if raw_args else {}
+            except json.JSONDecodeError:
+                tc["function"]["arguments"] = "{}"
+                messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                 "content": "Malformed JSON arguments — retry."})
+                continue
+            # Hard guard: never let a write/exec tool through during orientation.
+            if name not in _ORIENT_TOOLS:
+                messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                 "content": f"'{name}' is not available while orienting — "
+                                            "use only read-only tools. Save it for after the plan."})
+                continue
+            display.print_tool_call(name, args)
+            result, success = execute_tool(name, args, working_dir, permission_mode)
+            result = _cap_result(result, name)
+            display.print_tool_result(name, result, success)
+            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+
+    return messages
+
+
 def _planning_step(
     task: str,
     system_prompt: str,
     client: OpenAI,
     model: str,
     messages: list[dict],
+    working_dir: str,
+    permission_mode: str,
 ) -> tuple[list[dict], str]:
     """
-    Run a planning-only pass before the main loop.
-    Appends the plan request + plan response to messages so the main loop
-    has the plan as context.  Returns (updated_messages, plan_text).
+    Run an orient-then-plan pass before the main loop.
+
+    First the model orients itself with read-only tools (``_orientation_phase``),
+    then it writes the plan grounded in what it actually saw. Appends the
+    orientation, the plan request, and the plan response to messages, so the
+    main loop inherits all of it. Returns (updated_messages, plan_text).
     """
+    messages = _orientation_phase(client, model, messages, working_dir, permission_mode)
+
     display.print_info("Planning…")
     plan_request = (
-        "Before you begin, write a concise numbered plan (3–8 steps) of exactly what "
-        "you will do to complete this task. Be specific: which tools, what order, "
-        "what you will verify when done. Do NOT call any tools — reply with the plan only."
+        "Now that you have looked around, write a concise numbered plan (3–8 "
+        "steps) of exactly what you will do to complete this task. Ground it in "
+        "what you just saw — name the specific files/functions you will change "
+        "and what you will verify when done. Do NOT call any tools — reply with "
+        "the plan only."
     )
     plan_messages = list(messages) + [{"role": "user", "content": plan_request}]
     plan_text = _simple_completion(client, model, plan_messages, max_tokens=700)
@@ -916,13 +1027,19 @@ def _verify_completion(
     return _simple_completion(client, model, verify_messages, max_tokens=100)
 
 
-def _stream_completion(client: OpenAI, model: str, messages: list, force_tool: bool = False) -> dict:
+def _stream_completion(client: OpenAI, model: str, messages: list, force_tool: bool = False,
+                       tools: list | None = None) -> dict:
     """
     Stream one completion turn. Returns:
       {"content": str, "tool_calls": list[dict], "finish_reason": str}
     Raises BadRequestError on API errors (including context-window exceeded).
+
+    ``tools`` overrides the tool surface offered for this turn (e.g. the
+    read-only subset used during the orientation phase); defaults to the full
+    profile-appropriate set.
     """
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
     tool_call_map: dict[int, dict] = {}
     finish_reason = "stop"
 
@@ -931,12 +1048,16 @@ def _stream_completion(client: OpenAI, model: str, messages: list, force_tool: b
     is_ollama = _is_ollama_client(client)
     extra = {"extra_body": _ollama_extra_body()} if is_ollama else {}
 
+    if tools is None:
+        tools = all_tool_definitions(profile=_rt("tool_profile", None))
+
     with client.chat.completions.create(
         model=model,
         messages=messages,
-        tools=all_tool_definitions(profile=_rt("tool_profile", None)),
+        tools=tools,
         tool_choice="required" if force_tool else "auto",
         stream=True,
+        timeout=_STREAM_READ_TIMEOUT,
         **extra,
     ) as stream:
         for chunk in stream:
@@ -950,6 +1071,7 @@ def _stream_completion(client: OpenAI, model: str, messages: list, force_tool: b
             # turn shows visible progress instead of a frozen "waiting" spinner.
             reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
             if reasoning:
+                reasoning_parts.append(reasoning)
                 display.stream_reason(reasoning)
 
             if delta.content:
@@ -987,6 +1109,7 @@ def _stream_completion(client: OpenAI, model: str, messages: list, force_tool: b
     tool_calls = [tool_call_map[i] for i in sorted(tool_call_map)]
     return {
         "content": "".join(content_parts),
+        "reasoning": "".join(reasoning_parts),
         "tool_calls": tool_calls,
         "finish_reason": finish_reason,
     }
@@ -1058,7 +1181,7 @@ def run_agent(
     # ~900 tokens of an already-tiny context window on a plan small models follow
     # poorly. They plan inline in the main loop instead.
     if enable_plan and not is_local:
-        messages, plan_text = _planning_step(task, system_prompt, client, model, messages)
+        messages, plan_text = _planning_step(task, system_prompt, client, model, messages, working_dir, permission_mode)
         if plan_text and plan_out is not None:
             plan_out.append(plan_text)
             logger.log_plan(plan_text)
@@ -1105,6 +1228,142 @@ def continue_agent(
     return _agent_loop(messages, model, working_dir, client, permission_mode)
 
 
+def _robust_stream(
+    client: OpenAI,
+    model: str,
+    messages: list[dict],
+    force_tool: bool,
+    state: dict,
+    iteration: int,
+) -> tuple[dict | None, str, list[dict]]:
+    """Run one ``_stream_completion`` with the full retry / trim / error policy.
+
+    Returns ``(response, signal, messages)`` where ``signal`` is one of:
+      ``"ok"``        — ``response`` is the completion dict.
+      ``"retry"``     — transient; caller should ``iteration -= 1; continue``.
+                        ``messages`` may have been compacted or rolled back, and any
+                        backoff sleep has already happened inside this call.
+      ``"interrupt"`` — KeyboardInterrupt; caller should stop the loop.
+      ``"fatal"``     — unrecoverable; the error has already been printed and the
+                        caller should break.
+
+    Retry counters persist across calls in ``state`` (keys: ``rate``/``timeout``/``conn``).
+    Extracted from ``_agent_loop`` so both the single-model loop and the council loop
+    (council.py) share identical robustness. Behaviour is intentionally unchanged.
+    """
+    import time as _time
+    messages = _proactive_trim(messages)
+    try:
+        response = _stream_completion(client, model, messages, force_tool=force_tool)
+        state["rate"] = 0
+        state["timeout"] = 0
+        state["conn"] = 0
+        return response, "ok", messages
+    except BadRequestError as e:
+        err_str = str(e)
+        logger.log_error(f"BadRequestError on turn {iteration}", exc=e)
+        if _is_context_window_error(err_str):
+            compacted = _compact_and_trim(messages, groups=10)
+            if len(compacted) < len(messages):
+                display.print_info(
+                    f"Context window exceeded — compacted oldest turns "
+                    f"(~{_estimated_tokens(compacted):,} tokens left) and retrying."
+                )
+                logger.log_info(
+                    "Context window exceeded — compacted and retrying.",
+                    est_tokens=_estimated_tokens(compacted),
+                )
+                return None, "retry", compacted
+            display.print_error(
+                "Context window exceeded and cannot be compacted further.\n"
+                "Use /compact to summarise history, or /clear to start fresh."
+            )
+            return None, "fatal", messages
+        elif "Unterminated string" in err_str or "Extra data" in err_str:
+            # The model's tool-call arguments were cut off mid-stream, leaving
+            # invalid JSON in the message history.  Roll back the last assistant
+            # turn (and any partial tool results) and ask the model to retry.
+            while messages and messages[-1].get("role") in ("tool", "assistant"):
+                messages.pop()
+            display.print_info(
+                "Tool call arguments were truncated — rolling back and retrying."
+            )
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Your previous response was cut off before the tool arguments "
+                    "were complete. Please redo the last action from scratch, making "
+                    "sure to produce a complete, valid response."
+                ),
+            })
+            return None, "retry", messages
+        else:
+            display.print_error(f"API error: {e}")
+            return None, "fatal", messages
+    except KeyboardInterrupt:
+        return None, "interrupt", messages
+    except Exception as e:
+        err_str = str(e)
+        if "429" in err_str or "rate" in err_str.lower() or "RateLimit" in type(e).__name__:
+            state["rate"] += 1
+            wait = min(60, 5 * (2 ** (state["rate"] - 1)))
+            display.print_info(f"Rate limit — waiting {wait}s ({state['rate']}/5).")
+            if state["rate"] > 5:
+                display.print_error("Rate limit persists after 5 retries.")
+                return None, "fatal", messages
+            _time.sleep(wait)
+            return None, "retry", messages
+        elif "timeout" in err_str.lower() or "timed out" in err_str.lower() or "Timeout" in type(e).__name__:
+            state["timeout"] += 1
+            wait = min(30, 5 * (2 ** (state["timeout"] - 1)))
+            display.print_info(f"Request timeout — retrying in {wait}s ({state['timeout']}/3).")
+            if state["timeout"] > 3:
+                display.print_error("Request keeps timing out after 3 retries.")
+                return None, "fatal", messages
+            _time.sleep(wait)
+            return None, "retry", messages
+        elif _is_retryable_error(e):
+            # Transient connection drop ("peer closed connection without sending
+            # complete message body" / "incomplete chunked read") or gateway 5xx.
+            state["conn"] += 1
+            wait = min(30, 5 * (2 ** (state["conn"] - 1)))
+            logger.log_error(f"Connection error on turn {iteration}", exc=e)
+            display.print_info(
+                f"Connection dropped — retrying in {wait}s ({state['conn']}/4)."
+            )
+            if state["conn"] > 4:
+                display.print_error("Connection keeps dropping after 4 retries.")
+                return None, "fatal", messages
+            _time.sleep(wait)
+            return None, "retry", messages
+        elif "410" in err_str and ("end of life" in err_str.lower() or "Gone" in err_str):
+            display.print_error(
+                "Model has reached end of life and is no longer available.\n"
+                "Switch to a different model with [bold]/model <name>[/bold]  "
+                "or run [bold]/model[/bold] to list available models."
+            )
+            return None, "fatal", messages
+        elif "404" in err_str:
+            if "not found for account" in err_str.lower():
+                display.print_error(
+                    "Model is not accessible with your NVIDIA NIM account tier.\n"
+                    "This model may require a paid plan or special access.\n"
+                    "Switch to a different model with [bold]/model <name>[/bold]  "
+                    "or run [bold]/model[/bold] to list models available to your account."
+                )
+            else:
+                display.print_error(
+                    "Model not found (404). The model ID may be incorrect or the model\n"
+                    "is no longer available at this endpoint.\n"
+                    "Switch to a different model with [bold]/model <name>[/bold]  "
+                    "or run [bold]/model[/bold] to list available models."
+                )
+            return None, "fatal", messages
+        logger.log_error(f"Unexpected error on turn {iteration}", exc=e)
+        display.print_error(f"Unexpected error: {e}")
+        return None, "fatal", messages
+
+
 def _agent_loop(
     messages: list[dict],
     model: str,
@@ -1112,12 +1371,9 @@ def _agent_loop(
     client: OpenAI,
     permission_mode: str = "autonomous",
 ) -> list[dict]:
-    import time as _time
     from collections import Counter
     iteration = 0
-    _rate_limit_retries = 0
-    _timeout_retries = 0
-    _conn_retries = 0  # transient connection-drop / gateway-5xx retries
+    _retry_state = {"rate": 0, "timeout": 0, "conn": 0}  # persisted across _robust_stream calls
     _end_reason = "completed"  # how the loop terminated (for accurate session_end log)
     _tool_call_counts: Counter = Counter()  # (name, args_json) → call count
     _no_tool_nudges = 0  # consecutive text-only responses (resets on tool use)
@@ -1133,133 +1389,18 @@ def _agent_loop(
         # so a model that has finished can naturally return a text-only "done"
         # response instead of being pushed into redundant verification calls.
         _force = iteration == 1
-        # Proactive: compact BEFORE sending if we're already over the soft
-        # budget. Catches provider error-string mismatches and saves a wasted
-        # round-trip on hosts that 400 without a parseable error message.
-        messages = _proactive_trim(messages)
-        try:
-            response = _stream_completion(client, model, messages, force_tool=_force)
-            _rate_limit_retries = 0
-            _timeout_retries = 0
-            _conn_retries = 0
-        except BadRequestError as e:
-            err_str = str(e)
-            logger.log_error(f"BadRequestError on turn {iteration}", exc=e)
-            if _is_context_window_error(err_str):
-                compacted = _compact_and_trim(messages, groups=10)
-                if len(compacted) < len(messages):
-                    display.print_info(
-                        f"Context window exceeded — compacted oldest turns "
-                        f"(~{_estimated_tokens(compacted):,} tokens left) and retrying."
-                    )
-                    logger.log_info(
-                        "Context window exceeded — compacted and retrying.",
-                        est_tokens=_estimated_tokens(compacted),
-                    )
-                    messages = compacted
-                    iteration -= 1  # compaction doesn't consume a turn
-                    continue
-                # Nothing left to compact
-                display.print_error(
-                    "Context window exceeded and cannot be compacted further.\n"
-                    "Use /compact to summarise history, or /clear to start fresh."
-                )
-            elif "Unterminated string" in err_str or "Extra data" in err_str:
-                # The model's tool-call arguments were cut off mid-stream, leaving
-                # invalid JSON in the message history.  Roll back the last assistant
-                # turn (and any partial tool results) and ask the model to retry.
-                while messages and messages[-1].get("role") in ("tool", "assistant"):
-                    messages.pop()
-                display.print_info(
-                    "Tool call arguments were truncated — rolling back and retrying."
-                )
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "Your previous response was cut off before the tool arguments "
-                        "were complete. Please redo the last action from scratch, making "
-                        "sure to produce a complete, valid response."
-                    ),
-                })
-                iteration -= 1
-                continue
-            else:
-                display.print_error(f"API error: {e}")
-            _end_reason = "error"
-            break
-        except KeyboardInterrupt:
+        response, _signal, messages = _robust_stream(
+            client, model, messages, _force, _retry_state, iteration
+        )
+        if _signal == "retry":
+            iteration -= 1  # transient error — don't count this as a used turn
+            continue
+        if _signal == "interrupt":
             display.stream_end(False)
             display.console.print("\n[dim]Interrupted.[/dim]")
             logger.log_session_end(iteration, reason="interrupted")
             return messages
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "rate" in err_str.lower() or "RateLimit" in type(e).__name__:
-                _rate_limit_retries += 1
-                wait = min(60, 5 * (2 ** (_rate_limit_retries - 1)))
-                display.print_info(f"Rate limit — waiting {wait}s ({_rate_limit_retries}/5).")
-                if _rate_limit_retries > 5:
-                    display.print_error("Rate limit persists after 5 retries.")
-                    _end_reason = "error"
-                    break
-                _time.sleep(wait)
-                iteration -= 1  # don't count this as a used iteration
-                continue
-            elif "timeout" in err_str.lower() or "timed out" in err_str.lower() or "Timeout" in type(e).__name__:
-                _timeout_retries += 1
-                wait = min(30, 5 * (2 ** (_timeout_retries - 1)))
-                display.print_info(f"Request timeout — retrying in {wait}s ({_timeout_retries}/3).")
-                if _timeout_retries > 3:
-                    display.print_error("Request keeps timing out after 3 retries.")
-                    _end_reason = "error"
-                    break
-                _time.sleep(wait)
-                iteration -= 1
-                continue
-            elif _is_retryable_error(e):
-                # Transient connection drop ("peer closed connection without sending
-                # complete message body" / "incomplete chunked read") or gateway 5xx.
-                # These hit long-TTFT models mid-stream; a fresh retry usually works.
-                _conn_retries += 1
-                wait = min(30, 5 * (2 ** (_conn_retries - 1)))
-                logger.log_error(f"Connection error on turn {iteration}", exc=e)
-                display.print_info(
-                    f"Connection dropped — retrying in {wait}s ({_conn_retries}/4)."
-                )
-                if _conn_retries > 4:
-                    display.print_error("Connection keeps dropping after 4 retries.")
-                    _end_reason = "error"
-                    break
-                _time.sleep(wait)
-                iteration -= 1
-                continue
-            elif "410" in err_str and ("end of life" in err_str.lower() or "Gone" in err_str):
-                display.print_error(
-                    "Model has reached end of life and is no longer available.\n"
-                    "Switch to a different model with [bold]/model <name>[/bold]  "
-                    "or run [bold]/model[/bold] to list available models."
-                )
-                _end_reason = "error"
-                break
-            elif "404" in err_str:
-                if "not found for account" in err_str.lower():
-                    display.print_error(
-                        "Model is not accessible with your NVIDIA NIM account tier.\n"
-                        "This model may require a paid plan or special access.\n"
-                        "Switch to a different model with [bold]/model <name>[/bold]  "
-                        "or run [bold]/model[/bold] to list models available to your account."
-                    )
-                else:
-                    display.print_error(
-                        "Model not found (404). The model ID may be incorrect or the model\n"
-                        "is no longer available at this endpoint.\n"
-                        "Switch to a different model with [bold]/model <name>[/bold]  "
-                        "or run [bold]/model[/bold] to list available models."
-                    )
-                _end_reason = "error"
-                break
-            logger.log_error(f"Unexpected error on turn {iteration}", exc=e)
-            display.print_error(f"Unexpected error: {e}")
+        if _signal == "fatal":
             _end_reason = "error"
             break
 

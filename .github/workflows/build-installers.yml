@@ -32,6 +32,16 @@ jobs:
           pip install -e .
           pip install pyinstaller pillow
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build Lab UI (Vite/React) → octoslave/web/lab_static
+        run: |
+          npm ci --prefix frontend
+          npm run build --prefix frontend
+
       - name: Install create-dmg
         run: brew install create-dmg
 
@@ -69,6 +79,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .
           pip install pyinstaller pillow
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build Lab UI (Vite/React) -> octoslave/web/lab_static
+        run: |
+          npm ci --prefix frontend
+          npm run build --prefix frontend
 
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
@@ -123,6 +143,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .
           pip install pyinstaller
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build Lab UI (Vite/React) → octoslave/web/lab_static
+        run: |
+          npm ci --prefix frontend
+          npm run build --prefix frontend
 
       - name: Download appimagetool
         run: |

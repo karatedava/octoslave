@@ -42,7 +42,6 @@ function handleServerMessage(msg) {
     onParallelEvent(msg);
     return;
   }
-  if (msg.type === 'role_models') { onRoleModels(msg); return; }
   if (msg.type === 'providers') { onProviders(msg); return; }
   if (msg.type === 'provider_test') { onProviderTest(msg); return; }
   if (msg.type === 'mcp_servers') { onMcpServers(msg); return; }
@@ -74,12 +73,6 @@ function handleServerMessage(msg) {
       refreshHistory();
       break;
     case 'chat_loaded': onChatLoaded(msg); break;
-    case 'research_start':    onResearchStart(msg); break;
-    case 'round_start':       onRoundStart(msg); break;
-    case 'round_done':        onRoundDone(msg); break;
-    case 'agent_start':       onAgentStart(msg); break;
-    case 'agent_done':        onAgentDone(msg); break;
-    case 'research_complete':    onResearchComplete(msg); break;
     case 'permission_request':  onPermissionRequest(msg); break;
     case 'user_question':       onUserQuestion(msg); break;
     case 'todos':               onTodos(msg); break;
@@ -322,6 +315,9 @@ function sendChat() {
   const dir   = document.getElementById('chat-dir-input').value.trim();
   const profile = document.getElementById('chat-profile-select').value;
   const permMode = document.getElementById('chat-permission-select').value;
+  // Improved (council) mode — on by default; backend auto-falls back
+  // to the single agent on local/Ollama.
+  const council = !!document.getElementById('chat-council-toggle')?.checked;
 
   // Parallel mode short-circuit: when the popover toggle is on, route to the
   // multi-agent handler with per-candidate model/profile selections.
@@ -349,7 +345,7 @@ function sendChat() {
   const type = window.appState.chatIsFirst ? 'chat' : 'chat_continue';
   window.appState.chatIsFirst = false;
 
-  sendMsg({ type, message: fullText, model, working_dir: dir, prompt_profile: profile, permission_mode: permMode });
+  sendMsg({ type, message: fullText, model, working_dir: dir, prompt_profile: profile, permission_mode: permMode, council });
 }
 
 function appendUserMessage(text) {
@@ -617,7 +613,6 @@ function onDone(iterations) {
 
 function onServerError(text) {
   appendChatError(text);
-  window.appState.researchRunning = false;
   setChatRunning(false);
 }
 
@@ -625,15 +620,13 @@ function setChatRunning(running) {
   window.appState.running = running;
   const statusBadge = document.getElementById('chat-status');
   const sendBtn = document.getElementById('chat-send-btn');
-  const startBtn = document.getElementById('research-start-btn');
-  
+
   if (statusBadge) {
     statusBadge.textContent = running ? 'running' : 'idle';
     statusBadge.className = running ? 'badge badge-running' : 'badge badge-idle';
   }
-  
+
   if (sendBtn) sendBtn.disabled = running;
-  if (startBtn) startBtn.disabled = running;
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -665,83 +658,6 @@ function onChatLoaded(msg) {
   });
   
   scrollToBottom(container);
-}
-
-// ──────────────────────────────────────────────────────────────
-// Research functions
-// ──────────────────────────────────────────────────────────────
-
-function onResearchStart(msg) {
-  window.appState.researchRunning = true;
-  setChatRunning(true);
-  document.getElementById('pipeline-section').classList.add('show');
-  document.getElementById('research-console').innerHTML = '';
-  document.getElementById('completion-card').classList.remove('show');
-  // Reset all pipeline boxes to pending state for the new run
-  document.querySelectorAll('.pipeline-box').forEach(box => {
-    box.className = 'pipeline-box pending';
-    const m = box.querySelector('.p-model'); if (m) m.textContent = '';
-    const e = box.querySelector('.p-elapsed'); if (e) e.textContent = '';
-  });
-}
-
-function onRoundStart(msg) {
-  const label = document.getElementById('round-progress-label');
-  const fill = document.getElementById('round-progress-fill');
-  if (label) label.textContent = `Round ${msg.round}/${window.appState.researchMaxRounds}`;
-  if (fill) fill.style.width = '10%';
-  
-  appendToConsole(`<span class="console-round">═══ ROUND ${msg.round} ═══</span>`);
-}
-
-function onRoundDone(msg) {
-  const fill = document.getElementById('round-progress-fill');
-  if (fill) fill.style.width = `${Math.min(90, ((msg.round / window.appState.researchMaxRounds) * 100))}%`;
-}
-
-function onAgentStart(msg) {
-  const box = document.querySelector(`.pipeline-box[data-role="${msg.role}"]`);
-  if (box) {
-    box.classList.remove('pending');
-    box.classList.add('active');
-    box.querySelector('.p-model').textContent = msg.model || '';
-  }
-  
-  appendToConsole(`<span class="console-agent">▶ ${msg.role}</span> starting...`);
-}
-
-function onAgentDone(msg) {
-  const box = document.querySelector(`.pipeline-box[data-role="${msg.role}"]`);
-  if (box) {
-    box.classList.remove('active');
-    box.classList.add('done');
-    box.querySelector('.p-elapsed').textContent = msg.elapsed || '';
-  }
-  
-  appendToConsole(`<span class="console-agent">✓ ${msg.role}</span> done in ${msg.elapsed || '?'}`);
-}
-
-function onResearchComplete(msg) {
-  window.appState.researchRunning = false;
-  setChatRunning(false);
-  document.getElementById('pipeline-section').classList.remove('show');
-  document.getElementById('completion-card').classList.add('show');
-  
-  const reportPath = msg.report_path || 'research/final_report.html';
-  const reportBtn = document.getElementById('comp-report-btn');
-  if (reportBtn) reportBtn.href = `/api/files/view/${encodeURIComponent(reportPath)}`;
-  
-  appendToConsole('<span class="console-success">═════ RESEARCH COMPLETE ═════</span>');
-}
-
-function appendToConsole(text) {
-  const consoleEl = document.getElementById('research-console');
-  if (!consoleEl) return;
-  
-  const line = document.createElement('div');
-  line.innerHTML = text;
-  consoleEl.appendChild(line);
-  consoleEl.scrollTop = consoleEl.scrollHeight;
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -937,6 +853,8 @@ function populatePromptProfiles(profiles) {
 function initApp() {
   // Tab switching
   document.querySelectorAll('.nav-btn').forEach(btn => {
+    // Links (e.g. the Lab nav item) navigate natively — skip tab handling.
+    if (!btn.dataset.tab) return;
     btn.addEventListener('click', () => {
       document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
@@ -972,9 +890,6 @@ function initApp() {
   // Parallel-agents popover
   initParallelPopover();
 
-  // Long-research model committee
-  initResearchCommittee();
-
   document.getElementById('chat-send-btn')?.addEventListener('click', sendChat);
 
   document.getElementById('chat-attach-btn')?.addEventListener('click', () => {
@@ -1002,20 +917,32 @@ function initApp() {
   });
 
   // Backend select change handler — send switch_backend and refresh model list.
-  // The chat tab and research tab each have their own selector but they
-  // control a single shared backend, so wire both to the same handler.
+  // Improved (council) mode needs a cloud pool — grey out the toggle on Ollama
+  // so the user sees it won't apply there (backend also falls back gracefully).
+  function _updateCouncilAvailability(backend) {
+    const label = document.getElementById('council-switch-label');
+    const toggle = document.getElementById('chat-council-toggle');
+    if (!label || !toggle) return;
+    const ok = backend !== 'ollama';
+    label.classList.toggle('disabled', !ok);
+    toggle.disabled = !ok;
+    label.title = ok
+      ? 'Improved mode — a model council (Thinker · Worker · Verifier) behind one agent. Stronger results; uses more tokens.'
+      : 'Improved mode needs a cloud backend (e-INFRA / NIM). Not available on local Ollama.';
+  }
+  window._updateCouncilAvailability = _updateCouncilAvailability;
+
   function _onBackendChange(e) {
     const backend = e.target.value;
     const chatSel = document.getElementById('backend-select');
-    const researchSel = document.getElementById('research-backend-select');
     if (chatSel) { chatSel.value = backend; chatSel.dataset.backend = backend; }
-    if (researchSel) { researchSel.value = backend; researchSel.dataset.backend = backend; }
+    _updateCouncilAvailability(backend);
     appendChatInfo(`🔄 Switching to [bold]${getProviderName(backend)}[/bold] backend…`);
     sendMsg({ type: 'switch_backend', backend });
     setTimeout(() => sendMsg({ type: 'list_models' }), 600);
   }
   document.getElementById('backend-select')?.addEventListener('change', _onBackendChange);
-  document.getElementById('research-backend-select')?.addEventListener('change', _onBackendChange);
+  _updateCouncilAvailability(document.getElementById('backend-select')?.value || 'einfra');
 
   // Model select change handler - update the badge in the sidebar
   document.getElementById('chat-model-select')?.addEventListener('change', (e) => {
@@ -1047,33 +974,6 @@ function initApp() {
 
   // MCP server management
   initMcpPanel();
-
-  // Research start button
-  document.getElementById('research-start-btn')?.addEventListener('click', () => {
-    if (window.appState.running) return;
-    const topic = document.getElementById('research-topic').value.trim();
-    if (!topic) {
-      appendChatError('⚠ Research topic is required.');
-      return;
-    }
-    
-    const rounds = parseInt(document.getElementById('research-rounds').value) || 3;
-    const modelAll = document.getElementById('research-model-select').value || undefined;
-    const resume = document.getElementById('research-resume').checked;
-    const workingDir = document.getElementById('research-dir-input').value || '.';
-    
-    window.appState.researchMaxRounds = rounds;
-    window.appState.researchDir = workingDir;
-    
-    sendMsg({ 
-      type: 'research', 
-      topic, 
-      rounds, 
-      model_all: modelAll, 
-      resume,
-      working_dir: workingDir
-    });
-  });
 
   // Fetch available prompt profiles dynamically
   fetchPromptProfiles();
@@ -1119,100 +1019,6 @@ function initApp() {
   );
 
   console.log('OctoSlave Web UI initialized');
-}
-
-// ──────────────────────────────────────────────────────────────
-// Long-research model committee
-// ──────────────────────────────────────────────────────────────
-
-const RESEARCH_ROLES = [
-  { key: 'researcher',   icon: '🔬', label: 'Researcher',   blurb: 'reads inventory, scouts SOTA papers' },
-  { key: 'hypothesis',   icon: '💡', label: 'Designer',     blurb: 'commits to one concrete experiment' },
-  { key: 'skeptic',      icon: '🤨', label: 'Skeptic',      blurb: 'pre-hoc PI review of the plan' },
-  { key: 'coder',        icon: '💻', label: 'Coder',        blurb: 'implements on real data, GPU-aware' },
-  { key: 'debugger',     icon: '🐛', label: 'Debugger',     blurb: 'runs the code, validates numbers' },
-  { key: 'evaluator',    icon: '⚖️', label: 'Evaluator',    blurb: 'scores results vs SOTA' },
-  { key: 'orchestrator', icon: '🧠', label: 'Orchestrator', blurb: 'synthesises round, plans next' },
-  { key: 'reporter',     icon: '📊', label: 'Reporter',     blurb: 'produces self-contained HTML report' },
-  { key: 'merger',       icon: '🪡', label: 'Merger',       blurb: 'combines parallel candidates' },
-];
-
-const committeeState = {
-  expanded: false,
-  effective: {},     // { role: model } — current effective assignment
-  custom: {},        // { role: model } — only the user-overridden ones
-  models: [],        // model list (kept in sync with research-model-select)
-};
-
-function refreshCommitteeModels() {
-  const sel = document.getElementById('research-model-select');
-  if (!sel) return;
-  // Pull all option values except the placeholder "(use defaults)"
-  committeeState.models = Array.from(sel.options)
-    .map(o => o.value)
-    .filter(v => v && v.length);
-}
-
-function renderCommittee() {
-  const grid = document.getElementById('committee-grid');
-  if (!grid) return;
-  refreshCommitteeModels();
-  const html = RESEARCH_ROLES.map(role => {
-    const eff = committeeState.effective[role.key] || '';
-    const isCustom = !!committeeState.custom[role.key];
-    const opts = [
-      `<option value="">(default: ${esc(eff || '—')})</option>`,
-      ...committeeState.models.map(m =>
-        `<option value="${esc(m)}"${isCustom && committeeState.custom[role.key] === m ? ' selected' : ''}>${esc(m)}</option>`
-      ),
-    ].join('');
-    return `
-      <div class="committee-row${isCustom ? ' committee-custom' : ''}">
-        <div class="committee-role">
-          <span class="committee-role-icon">${role.icon}</span>
-          <div class="committee-role-text">
-            <div class="committee-role-name">${esc(role.label)}</div>
-            <div class="committee-role-blurb">${esc(role.blurb)}</div>
-          </div>
-        </div>
-        <select class="committee-model" data-role="${role.key}">${opts}</select>
-      </div>`;
-  }).join('');
-  grid.innerHTML = html;
-
-  // Wire change events
-  grid.querySelectorAll('.committee-model').forEach(sel => {
-    sel.addEventListener('change', e => {
-      const role = e.target.dataset.role;
-      const value = e.target.value;
-      if (!value) {
-        // Clearing means "use default" — but we don't have a clear-one event,
-        // so we send the effective default explicitly.
-        const def = committeeState.effective[role];
-        sendMsg({ type: 'set_role_model', role, model: def });
-        delete committeeState.custom[role];
-      } else {
-        sendMsg({ type: 'set_role_model', role, model: value });
-        committeeState.custom[role] = value;
-      }
-      // Backend will respond with role_models which re-renders.
-    });
-  });
-
-  // Status text
-  const statusEl = document.getElementById('committee-status');
-  if (statusEl) {
-    const customCount = Object.keys(committeeState.custom).length;
-    statusEl.textContent = customCount
-      ? `${customCount} of ${RESEARCH_ROLES.length} role${customCount === 1 ? '' : 's'} customised`
-      : 'using backend defaults';
-  }
-}
-
-function onRoleModels(msg) {
-  committeeState.effective = msg.effective || {};
-  committeeState.custom    = msg.custom || {};
-  if (committeeState.expanded) renderCommittee();
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -1524,35 +1330,6 @@ function initMcpPanel() {
     const httpFields = document.getElementById('mcp-http-fields');
     if (stdioFields) stdioFields.style.display = isHttp ? 'none' : 'block';
     if (httpFields) httpFields.style.display = isHttp ? 'block' : 'none';
-  });
-}
-
-function initResearchCommittee() {
-  const toggle = document.getElementById('committee-toggle-btn');
-  const grid = document.getElementById('committee-grid');
-  const actions = document.getElementById('committee-actions');
-  const reset = document.getElementById('committee-reset-btn');
-  if (!toggle || !grid) return;
-
-  toggle.addEventListener('click', () => {
-    committeeState.expanded = !committeeState.expanded;
-    grid.style.display    = committeeState.expanded ? 'grid'  : 'none';
-    actions.style.display = committeeState.expanded ? 'flex' : 'none';
-    toggle.textContent = committeeState.expanded ? 'Hide per-role config' : 'Configure per-role';
-    if (committeeState.expanded) {
-      sendMsg({ type: 'get_role_models' });   // backend will respond → renderCommittee()
-      // Optimistic render in case the response is delayed
-      renderCommittee();
-    }
-  });
-
-  reset?.addEventListener('click', () => {
-    sendMsg({ type: 'reset_role_models' });
-  });
-
-  // Re-render when the model list changes (e.g. after a backend switch).
-  document.getElementById('research-model-select')?.addEventListener('change', () => {
-    if (committeeState.expanded) renderCommittee();
   });
 }
 
