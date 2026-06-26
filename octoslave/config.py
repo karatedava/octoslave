@@ -153,7 +153,7 @@ COUNCIL_ROLE_PREFERENCES: dict[str, list[str]] = {
 # whose family differs from the resolved Worker wins; if none differ, escalation
 # is simply disabled (graceful).
 COUNCIL_WORKER_ESCALATION: list[str] = [
-    "deepseek-v3.2-thinking", "glm-5.2", "qwen3-coder", "kimi-k2.6",
+    "kimi-k2.6","glm-5.2","deepseek-v3.2-thinking"
 ]
 
 
