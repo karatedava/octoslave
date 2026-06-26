@@ -31,7 +31,7 @@ octoslave vault-improve VAULT_PATH [OPTIONS]
 | Flag | Short | Description |
 |------|-------|-------------|
 | `VAULT_PATH` | | Path to vault (default: current directory) |
-| `--profile NAME` | `-p` | Writing style profile (`base`, `biomedic`, etc.) |
+| `--profile NAME` | `-p` | Writing style profile (`base`, `coder`, etc.) |
 | `--model MODEL` | `-m` | Override model for all agents |
 | `--resume` | | Skip completed batches, continue from last position |
 | `--api-key KEY` | | API key |
@@ -39,16 +39,16 @@ octoslave vault-improve VAULT_PATH [OPTIONS]
 
 ```bash
 # Basic run
-octoslave vault-improve ~/Brain2 --profile biomedic
+octoslave vault-improve ~/Brain2 --profile base
 
 # Resume after crash or interruption
-octoslave vault-improve ~/Brain2 --profile biomedic --resume
+octoslave vault-improve ~/Brain2 --profile base --resume
 
 # Use a stronger model for better quality
 octoslave vault-improve ~/Brain2 --model deepseek-v3.2-thinking
 
 # Run in background, log to file
-nohup octoslave vault-improve ~/Brain2 --profile biomedic --resume \
+nohup octoslave vault-improve ~/Brain2 --profile base --resume \
   > ~/octoslave/vault.log 2>&1 &
 ```
 
@@ -59,7 +59,7 @@ nohup octoslave vault-improve ~/Brain2 --profile biomedic --resume \
 ```
 
 ```bash
-/vault-improve ~/Brain2 --profile biomedic    # profile from /profile command
+/vault-improve ~/Brain2 --profile base    # profile from /profile command
 /vault-improve ~/Brain2 --resume
 /vault-improve                                 # uses current working directory
 ```
@@ -80,7 +80,7 @@ After=network.target
 Type=simple
 User=kowalski
 WorkingDirectory=/home/kowalski/octoslave
-ExecStart=/home/kowalski/octoslave/.venv/bin/octoslave vault-improve /home/kowalski/Brain2 --profile biomedic --resume
+ExecStart=/home/kowalski/octoslave/.venv/bin/octoslave vault-improve /home/kowalski/Brain2 --profile base --resume
 Restart=on-failure
 RestartSec=30
 StandardOutput=append:/home/kowalski/octoslave/vault.log
@@ -142,25 +142,18 @@ All pipeline working files are written to `VAULT_PATH/.vault_work/`:
 cat ~/Brain2/.vault_work/plan.json | python3 -m json.tool | grep -E '"status"|"label"'
 
 # Resume — skips done batches, retries pending ones
-octoslave vault-improve ~/Brain2 --profile biomedic --resume
+octoslave vault-improve ~/Brain2 --profile base --resume
 ```
 
 ---
 
 ## Profiles with vault-improve
 
-The `biomedic` profile is designed specifically for Obsidian medical/study notes:
+Pass any prompt profile with `--profile NAME` to control the writing style the
+editor applies to your notes:
 
 ```bash
-octoslave vault-improve ~/Brain2 --profile biomedic
+octoslave vault-improve ~/Brain2 --profile base
 ```
-
-The editor will:
-- Write in **Czech**
-- Add Latin terminology in parentheses
-- Add `## Zajímavosti` section (3–5 surprising facts) to every note
-- Create `[[wikilinks]]` to related topics
-- Add `## Kontext` and `## Související témata` sections
-- Reference standard sources (Junqueira, Sadler, Stryer, Alberts, Harrison)
 
 See [PROMPT_PROFILES.md](PROMPT_PROFILES.md) for all profiles.

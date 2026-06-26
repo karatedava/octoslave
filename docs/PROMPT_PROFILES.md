@@ -52,28 +52,6 @@ octoslave run "analyze sales_data.csv and create summary plots" -p analyst -d ~/
 
 ---
 
-### `biomedic`
-
-Czech biomedical study notes profile. Designed for Obsidian vaults with medical/scientific content.
-
-- **Language: Czech** throughout
-- Latin terminology in parentheses: *jádro buňky (nucleus cellulae)*
-- `[[wikilinks]]` to every related concept — builds knowledge graph
-- Every note must include `## Zajímavosti` (3–5 surprising facts)
-- `## Kontext` block with parent/sibling node links
-- `## Související témata` closing section
-- Sources: Junqueira, Sadler, Stryer, Alberts, Harrison, Cecil
-- Clinical correlations included where relevant
-
-```bash
-octoslave -p biomedic
-octoslave vault-improve ~/Brain2 --profile biomedic
-/profile biomedic
-/long-research "Histologie jaterní tkáně" --rounds 5
-```
-
----
-
 ## Switching profiles
 
 ```bash
@@ -82,7 +60,7 @@ octoslave -p analyst
 octoslave run "task" -p coder
 
 # Mid-session (resets conversation)
-/profile biomedic
+/profile analyst
 /profile base
 
 # Show current profile and available options

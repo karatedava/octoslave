@@ -44,7 +44,7 @@ Launches the interactive REPL. Type tasks directly, use slash commands to contro
 |------|-------|-------------|
 | `--model MODEL` | `-m` | Model to use (overrides config default) |
 | `--dir PATH` | `-d` | Working directory (default: auto-created project dir) |
-| `--prompt-profile NAME` | `-p` | Prompt profile: `base`, `coder`, `analyst`, `biomedic` |
+| `--prompt-profile NAME` | `-p` | Prompt profile: `base`, `coder`, `analyst` |
 | `--permission-mode MODE` | | `autonomous` / `controlled` / `supervised` |
 | `--verbose` | `-v` | Show full diffs, tool output, bash commands live |
 | `--local` | | Use local Ollama models |
@@ -54,7 +54,7 @@ Launches the interactive REPL. Type tasks directly, use slash commands to contro
 ```bash
 # Examples
 octoslave
-octoslave -p biomedic
+octoslave -p base
 octoslave -v -p coder
 octoslave -m deepseek-v3.2-thinking
 octoslave --permission-mode controlled
@@ -86,7 +86,7 @@ Runs a single task and exits. Add `-i` to stay in interactive mode after.
 octoslave run "build a REST API for a todo app"
 octoslave run "research recent papers on RAG" -m qwen3-coder
 octoslave run "add unit tests" -i
-octoslave run "reorganize my notes" -p biomedic -v
+octoslave run "reorganize my notes" -p base -v
 octoslave run "analyze sales data" -p analyst -d ~/data
 octoslave run "fix the bug in main.py" --permission-mode controlled
 ```
@@ -112,8 +112,8 @@ Autonomously improves every `.md` file in a vault. Runs headlessly — no termin
 
 ```bash
 # Examples
-octoslave vault-improve ~/Brain2 --profile biomedic
-octoslave vault-improve ~/Brain2 --profile biomedic --resume
+octoslave vault-improve ~/Brain2 --profile base
+octoslave vault-improve ~/Brain2 --profile base --resume
 octoslave vault-improve ~/Brain2 --model deepseek-v3.2-thinking
 octoslave vault-improve  # uses current directory
 ```
@@ -205,7 +205,7 @@ Available inside `octoslave` interactive sessions.
 | `/dir` | Show current working directory |
 | `/dir PATH` | Change working directory |
 | `/profile` | Show current profile and list available |
-| `/profile NAME` | Switch prompt profile (`base`, `coder`, `analyst`, `biomedic`) |
+| `/profile NAME` | Switch prompt profile (`base`, `coder`, `analyst`) |
 
 ### Permission & verbosity
 
@@ -269,10 +269,8 @@ See [PROMPT_PROFILES.md](PROMPT_PROFILES.md) for full documentation.
 | `base` | English | General tasks, coding, research |
 | `coder` | English | Pure coding — no research preamble |
 | `analyst` | English | Data analysis, statistics, plots |
-| `biomedic` | Czech | Obsidian medical notes with [[wikilinks]] |
 
 ```bash
-octoslave -p biomedic
 octoslave run "analyze dataset" -p analyst
 /profile coder
 ```

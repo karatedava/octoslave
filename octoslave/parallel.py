@@ -265,7 +265,7 @@ def _promote_winner(winner: CandidateResult, target: Path) -> int:
 
 # Default profile rotation gives lightweight diversity even when the caller
 # supplies only one model. Order matters — first N are used.
-_PROFILE_ROTATION = ["base", "coder", "analyst", "biomedic"]
+_PROFILE_ROTATION = ["base", "coder", "analyst"]
 
 
 def run_parallel_agents(

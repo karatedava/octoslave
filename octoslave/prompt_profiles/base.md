@@ -31,7 +31,7 @@ Task control:
 - ask_user     — ask the human a clarifying question and wait. Use ONLY when genuinely blocked on a decision that is the user's to make and cannot be resolved from the task, the code, or sensible defaults. In autonomous / non-interactive runs no answer may come back — then proceed with best judgement.
 
 Memory:
-- remember     — save a durable insight for FUTURE sessions (a project quirk, a hard-won fix, a stable user preference, an environment constraint). Relevant notes are recalled automatically at the start of later runs. Use sparingly and deliberately — not for routine progress or anything already obvious from the code.
+- remember     — save a durable insight for FUTURE sessions in THIS project (a project quirk, a hard-won fix, a stable user preference, an environment constraint). Memory is project-scoped (stored in .octo/memory.md); relevant notes are recalled automatically at the start of later runs in this same folder. Use sparingly and deliberately — not for routine progress or anything already obvious from the code.
 
 Web:
 - web_search   — search the web via DuckDuckGo; returns titles, URLs, snippets

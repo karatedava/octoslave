@@ -145,6 +145,26 @@ COUNCIL_ROLE_PREFERENCES: dict[str, list[str]] = {
     "verifier": ["glm-5.2", "kimi-k2.7"],
 }
 
+# Escalation pool for the *alternate* Worker — a strong model from a DIFFERENT
+# family than the primary Worker, used only when the primary gets stuck (repeated
+# errors, a verifier-deadlocked action, or rejected completion). Switching family
+# at the point of failure harvests ensemble diversity where it matters: a model
+# from another family often clears a block the first one cannot. First live id
+# whose family differs from the resolved Worker wins; if none differ, escalation
+# is simply disabled (graceful).
+COUNCIL_WORKER_ESCALATION: list[str] = [
+    "deepseek-v3.2-thinking", "glm-5.2", "qwen3-coder", "kimi-k2.6",
+]
+
+
+def _model_family(model: str) -> str:
+    """Coarse model-family key (vendor/series) for diversity checks."""
+    m = (model or "").lower()
+    for fam in ("kimi", "glm", "deepseek", "qwen", "llama", "mistral", "gemma", "gpt"):
+        if fam in m:
+            return fam
+    return m.split("-")[0] if m else ""
+
 
 def resolve_council_models(
     available: list[str] | None = None,
@@ -184,6 +204,20 @@ def resolve_council_models(
         elif chosen != COUNCIL_ROLE_PREFERENCES.get(role, [None])[0]:
             notes[role] = f"{chosen} (first available preference)"
         roles[role] = chosen
+
+    # Resolve the diverse escalation Worker: first available id from a different
+    # family than the primary Worker. Honors an explicit override; else best-effort
+    # from the live catalog. Left unset when no different-family model is available.
+    if overrides.get("worker_alt"):
+        roles["worker_alt"] = overrides["worker_alt"]
+    elif avail_set:
+        # Only from the LIVE catalog — never speculate an id that might 404 when
+        # escalation actually fires. No different-family model live → no escalation.
+        worker_fam = _model_family(roles.get("worker", ""))
+        for cand in COUNCIL_WORKER_ESCALATION:
+            if cand in avail_set and _model_family(cand) != worker_fam:
+                roles["worker_alt"] = cand
+                break
     return roles, notes
 
 
