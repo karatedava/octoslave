@@ -815,7 +815,7 @@ function populatePromptProfiles(profiles) {
 
   if (!profiles || !profiles.length) {
     // No profiles from server, use fallback list
-    const fallback = ['base', 'coder', 'analyst', 'biomedic', 'local'];
+    const fallback = ['base', 'coder', 'analyst', 'local'];
     fallback.forEach(p => {
       const o = document.createElement('option');
       o.value = p;
@@ -1346,7 +1346,7 @@ window.parallelConfig = {
   profiles: [],
 };
 
-const PARALLEL_PROFILES = ['(inherit)', 'base', 'coder', 'analyst', 'biomedic', 'local'];
+const PARALLEL_PROFILES = ['(inherit)', 'base', 'coder', 'analyst', 'local'];
 
 function modelOptionsHtml(includeBlank = true) {
   const sel = document.getElementById('chat-model-select');

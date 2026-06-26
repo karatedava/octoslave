@@ -131,7 +131,7 @@ ots
 | 🔁 **Autonomous loop** | Runs many tool-call iterations end-to-end — no hand-holding |
 | 🧠 **Upfront planning** | Writes a numbered execution plan before touching files |
 | ✅ **Self-verification** | Optional DONE / PARTIAL / FAILED grade after each task (`--verify`) |
-| 💾 **Cross-session memory** | Prior outcomes persisted and injected as context on the next run |
+| 💾 **Project memory** | Prior outcomes & insights persisted per-project in `.octo/memory.md`, injected on the next run in that folder |
 | 📦 **Smart compaction** | On overflow, oldest turns are summarised (not dropped); errors survive |
 | 🐙 **Parallel agents** | N agents on one task; Judge / vote / Merger picks the winner |
 | 🔬 **Autonomous Lab** | A Director builds a custom specialist team per task (≤10), revisable mid-run |
@@ -167,7 +167,7 @@ Common flags for `ots` and `ots run`:
 |------|-------------|
 | `-m`, `--model` | Model override |
 | `-d`, `--dir` | Working directory |
-| `-p`, `--prompt-profile` | `base` / `coder` / `analyst` / `biomedic` |
+| `-p`, `--prompt-profile` | `base` / `coder` / `analyst` |
 | `--local` / `--nim` | Force backend for this session |
 | `--permission-mode` | `autonomous` / `controlled` / `supervised` |
 | `--no-plan` / `--verify` / `--no-memory` | Toggle agentic behaviours |
@@ -270,14 +270,14 @@ to the normal single agent. The plain `ots` is unchanged. Full details:
 ### Agentic behaviour
 
 OctoSlave is deliberate by design: it **plans** before acting, can **verify** its own work,
-keeps **cross-session memory**, **nudges itself** out of repeated failures, and **compacts
+keeps **per-project memory**, **nudges itself** out of repeated failures, and **compacts
 context** automatically so long runs survive overflow.
 
 | Flag | Default | Effect |
 |------|---------|--------|
 | `--no-plan` | plan ON | Skip the upfront execution plan |
 | `--verify` | verify OFF | Grade completion (DONE / PARTIAL / FAILED) after the task |
-| `--no-memory` | memory ON | Don't load or save `~/.octoslave/session_memory.md` |
+| `--no-memory` | memory ON | Don't load or save the project's `.octo/memory.md` |
 
 TUI toggles: `/plan`, `/verify`, `/memory` (`on`/`off`), `/show-plan`, `/compact`.
 
@@ -329,7 +329,7 @@ default. Full contract: [docs/RESEARCH.md](docs/RESEARCH.md).
 ### Vault improve & batch
 
 ```bash
-ots vault-improve ~/Brain --profile biomedic --resume   # note-by-note vault improvement
+ots vault-improve ~/Brain --profile base --resume   # note-by-note vault improvement
 ots batch tasks.txt --resume                             # tasks one-per-line, '#' = comment
 ```
 
@@ -397,7 +397,7 @@ Precedence: **environment variable** → `~/.octoslave/config.json` → built-in
 modifying action), `supervised` (ask before file edits only). See
 [docs/PERMISSION_MODE.md](docs/PERMISSION_MODE.md).
 
-**Prompt profiles:** `base` (default), `coder`, `analyst`, `biomedic`. Switch with `-p NAME` or
+**Prompt profiles:** `base` (default), `coder`, `analyst`. Switch with `-p NAME` or
 `/profile NAME`. See [docs/PROMPT_PROFILES.md](docs/PROMPT_PROFILES.md).
 
 ---

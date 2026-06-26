@@ -452,9 +452,10 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": "remember",
             "description": (
-                "Save a durable insight to cross-session memory — a fact, lesson, "
-                "preference, or gotcha that will help in FUTURE sessions, not just "
-                "this one. Use it sparingly and deliberately when you learn "
+                "Save a durable insight to this PROJECT's memory — a fact, lesson, "
+                "preference, or gotcha that will help in FUTURE sessions in this "
+                "same project, not just this one. Use it sparingly and "
+                "deliberately when you learn "
                 "something worth carrying forward: a non-obvious project quirk, a "
                 "fix that took effort to find, a stable user preference, an "
                 "environment constraint (e.g. a tool that isn't installed), or a "
@@ -629,7 +630,7 @@ def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str =
         elif name == "ask_user":
             return _ask_user(working_dir=working_dir, **args)
         elif name == "remember":
-            return _remember(**args)
+            return _remember(working_dir=working_dir, **args)
         elif name == "glob":
             return _glob(working_dir=working_dir, **args)
         elif name == "grep":
@@ -1276,12 +1277,12 @@ def _ask_user(question: str, working_dir: str, options: list = None) -> tuple[st
     return f"The user answered: {answer}", True
 
 
-def _remember(content: str, tags=None) -> tuple[str, bool]:
-    """Persist an agent-authored insight to cross-session memory."""
+def _remember(content: str, working_dir: str, tags=None) -> tuple[str, bool]:
+    """Persist an agent-authored insight to this project's memory."""
     # Lazy import — agent.py imports tools.py at module load, so importing it
     # at the top here would be a circular import.
     from .agent import save_memory_insight
-    ok = save_memory_insight(content, tags)
+    ok = save_memory_insight(working_dir, content, tags)
     if not ok:
         return "Could not save the insight (empty content or write error).", False
     preview = content.strip().replace("\n", " ")

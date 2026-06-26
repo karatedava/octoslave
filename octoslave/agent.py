@@ -342,9 +342,12 @@ def list_prompt_profiles() -> list[str]:
     return sorted([f.stem for f in PROMPT_PROFILES_DIR.glob("*.md")])
 
 # ---------------------------------------------------------------------------
-# Cross-session memory
+# Project memory
 #
-# One file, two kinds of entry:
+# Memory is scoped to the PROJECT (the working directory), not the user — it
+# lives in `<working_dir>/.octo/memory.md`. Running the agent in a different
+# folder gets that folder's memory (or none); it is never bothered with another
+# project's prior sessions. One file, two kinds of entry:
 #   • "session" — task outcomes recorded automatically at the end of a run
 #                 (date / task / status / note).
 #   • "insight" — facts the agent itself decided are worth keeping, written
@@ -355,7 +358,13 @@ def list_prompt_profiles() -> list[str]:
 # the top lexical matches (plus a recency fallback) are injected.
 # ---------------------------------------------------------------------------
 
-MEMORY_FILE = Path.home() / ".octoslave" / "session_memory.md"
+PROJECT_MEMORY_DIR = ".octo"
+PROJECT_MEMORY_FILENAME = "memory.md"
+
+
+def memory_file(working_dir: str) -> Path:
+    """Path to the project-scoped memory file for ``working_dir``."""
+    return Path(working_dir) / PROJECT_MEMORY_DIR / PROJECT_MEMORY_FILENAME
 _SESSION_MAX_ENTRIES = 40   # session outcomes retained on disk
 _INSIGHT_MAX_ENTRIES = 60   # agent-authored insights retained on disk
 _RECALL_SESSIONS = 4        # session entries injected into a prompt
@@ -398,14 +407,15 @@ def _mem_relevance(query_tokens: set[str], entry: dict) -> float:
     return overlap / (len(et) ** 0.5 + 1.0)
 
 
-def _parse_memory_entries() -> list[dict]:
-    """Parse the memory file into a chronological list of entry dicts. Each has
-    a 'kind' of 'session' or 'insight'. Tolerant of missing fields and of older
-    files that predate the insight format. Never raises."""
-    if not MEMORY_FILE.exists():
+def _parse_memory_entries(working_dir: str) -> list[dict]:
+    """Parse the project memory file into a chronological list of entry dicts.
+    Each has a 'kind' of 'session' or 'insight'. Tolerant of missing fields and
+    of older files that predate the insight format. Never raises."""
+    mf = memory_file(working_dir)
+    if not mf.exists():
         return []
     try:
-        text = MEMORY_FILE.read_text(encoding="utf-8")
+        text = mf.read_text(encoding="utf-8")
     except OSError:
         return []
     entries: list[dict] = []
@@ -459,15 +469,16 @@ def _select_memory(pool: list[dict], query_tokens: set[str], k: int) -> list[dic
     return pool[-k:]
 
 
-def load_session_memory(query: str | None = None) -> str:
+def load_session_memory(working_dir: str, query: str | None = None) -> str:
     """
-    Return a formatted block of relevant prior context for system-prompt
-    injection. When `query` (the current task) is given, entries are ranked by
-    lexical relevance to it; otherwise the most recent entries are used.
-    Returns empty string when there is nothing to recall.
+    Return a formatted block of relevant prior context (for the PROJECT at
+    ``working_dir``) for system-prompt injection. When `query` (the current
+    task) is given, entries are ranked by lexical relevance to it; otherwise the
+    most recent entries are used. Returns empty string when there is nothing to
+    recall.
     """
     try:
-        entries = _parse_memory_entries()
+        entries = _parse_memory_entries(working_dir)
         if not entries:
             return ""
         insights = [e for e in entries if e["kind"] == "insight"]
@@ -521,27 +532,29 @@ def _serialize_memory_entry(e: dict) -> str:
     ])
 
 
-def _write_memory(entries: list[dict]) -> None:
-    """Trim each kind to its cap (keeping the most recent) and rewrite the file
-    in chronological order. Rewriting wholesale keeps per-kind trimming correct
-    — insights are never evicted to make room for session outcomes."""
+def _write_memory(working_dir: str, entries: list[dict]) -> None:
+    """Trim each kind to its cap (keeping the most recent) and rewrite the
+    project memory file in chronological order. Rewriting wholesale keeps
+    per-kind trimming correct — insights are never evicted to make room for
+    session outcomes."""
     sessions = [e for e in entries if e.get("kind") == "session"][-_SESSION_MAX_ENTRIES:]
     insights = [e for e in entries if e.get("kind") == "insight"][-_INSIGHT_MAX_ENTRIES:]
     keep = {id(e) for e in sessions} | {id(e) for e in insights}
     ordered = [e for e in entries if id(e) in keep]
 
-    MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    mf = memory_file(working_dir)
+    mf.parent.mkdir(parents=True, exist_ok=True)
     body = "\n".join(_serialize_memory_entry(e) for e in ordered)
-    MEMORY_FILE.write_text(
-        "# OctoSlave Session Memory\n\n" + body + ("\n" if body else ""),
+    mf.write_text(
+        "# OctoSlave Project Memory\n\n" + body + ("\n" if body else ""),
         encoding="utf-8",
     )
 
 
-def save_session_memory(task: str, status: str = "completed", note: str = "") -> None:
-    """Record one task-outcome entry, trimming session history to its cap."""
+def save_session_memory(working_dir: str, task: str, status: str = "completed", note: str = "") -> None:
+    """Record one task-outcome entry for the project, trimming history to cap."""
     try:
-        entries = _parse_memory_entries()
+        entries = _parse_memory_entries(working_dir)
         entries.append({
             "kind": "session",
             "date": _date_cls.today().isoformat(),
@@ -549,15 +562,15 @@ def save_session_memory(task: str, status: str = "completed", note: str = "") ->
             "status": status,
             "note": note[:300].replace(chr(10), " "),
         })
-        _write_memory(entries)
+        _write_memory(working_dir, entries)
     except Exception:
         pass
 
 
-def save_memory_insight(content: str, tags=None) -> bool:
-    """Persist an agent-authored insight (the `remember` tool). Returns True on
-    success. Multi-line content is allowed; a lone `---` line is defused so it
-    can't be mistaken for a block separator on the next read."""
+def save_memory_insight(working_dir: str, content: str, tags=None) -> bool:
+    """Persist an agent-authored insight (the `remember` tool) to project memory.
+    Returns True on success. Multi-line content is allowed; a lone `---` line is
+    defused so it can't be mistaken for a block separator on the next read."""
     content = (content or "").strip()
     if not content:
         return False
@@ -570,14 +583,14 @@ def save_memory_insight(content: str, tags=None) -> bool:
     else:
         tag_str = ""
     try:
-        entries = _parse_memory_entries()
+        entries = _parse_memory_entries(working_dir)
         entries.append({
             "kind": "insight",
             "date": _date_cls.today().isoformat(),
             "tags": tag_str[:120],
             "text": content,
         })
-        _write_memory(entries)
+        _write_memory(working_dir, entries)
         return True
     except Exception:
         return False
@@ -713,8 +726,9 @@ def _proactive_trim(
     if est <= soft_budget:
         return messages
     rounds = 0
+    groups = 6
     while est > soft_budget:
-        trimmed = _compact_and_trim(messages, groups=6)
+        trimmed = _compact_and_trim(messages, groups=groups)
         if len(trimmed) >= len(messages):
             # Nothing left to compact — surrender to the API and let the
             # reactive branch handle the hard failure.
@@ -722,9 +736,13 @@ def _proactive_trim(
         messages = trimmed
         rounds += 1
         est = _estimated_tokens(messages)
-        if rounds >= 5:
-            # Safety: don't loop forever even if compaction keeps "working"
-            # with diminishing returns.
+        # Each productive pass strictly shrinks the list and the number of
+        # compactable assistant-turn groups is finite, so the len() check above
+        # already guarantees termination. Escalate the group size so a history
+        # that is many multiples over budget converges in a few passes instead
+        # of nibbling 6 turns at a time; keep a generous absolute backstop.
+        groups = min(groups * 2, 64)
+        if rounds >= 50:
             break
     if rounds > 0:
         tag = f"[{label}] " if label else ""
@@ -1155,7 +1173,7 @@ def run_agent(
     # Inject session memory into system prompt when available, ranked by
     # relevance to the current task.
     if enable_memory:
-        memory_ctx = load_session_memory(query=task)
+        memory_ctx = load_session_memory(working_dir, query=task)
         if memory_ctx:
             system_prompt = system_prompt + f"\n\n{memory_ctx}"
 

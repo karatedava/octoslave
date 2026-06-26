@@ -26,6 +26,15 @@ Coordinator policy (heuristic — fast, no extra routing LLM call):
             course-correction note
 At completion a Verifier gate grades against the task and can send the Worker
 back for another round.
+
+Diversity escalation (the ensemble lever): when the Worker gets stuck — repeated
+execution errors, a verifier-deadlocked action, or rejected completion — the loop
+switches the Worker to a different model FAMILY (``worker_alt``). A block one model
+family can't clear is often trivial for another, which is where the ensemble's gain
+over any single model comes from. On rejected completion the Thinker also
+re-strategizes (the highest-value place for it). Until the first real action runs,
+the Worker is forced to call a tool, so the run can never "complete" having done
+nothing.
 """
 
 from __future__ import annotations
@@ -312,19 +321,46 @@ def _council_loop(
     permission_mode: str,
 ) -> list[dict]:
     worker = roles["worker"]
+    worker_alt = roles.get("worker_alt")  # diverse second-opinion model (may be None)
+    active_worker = worker
     retry_state = {"rate": 0, "timeout": 0, "conn": 0}
     iteration = 0
     completion_rounds = 0
     stall = 0  # consecutive non-productive worker turns (text-only / botched)
     seen_calls: dict[tuple, int] = {}
     redundant = 0
+    actions_taken = 0  # tool calls actually executed in this loop (NOT orientation)
+    empty_start = 0    # consecutive no-tool turns before any work has begun
     end_reason = "completed"
+
+    def _escalate_worker(reason: str) -> None:
+        """Switch the Worker to a different-family model when the current one is
+        stuck. Flips between the primary and the diverse alternate, so a block one
+        model can't clear is handed to another family (the core ensemble lever).
+        No-op when no alternate is available."""
+        nonlocal active_worker
+        if not worker_alt or worker_alt == worker:
+            return
+        new = worker_alt if active_worker != worker_alt else worker
+        if new == active_worker:
+            return
+        active_worker = new
+        display.print_info(
+            f"{_TAG['worker']} switching model to [bold]{active_worker}[/bold] "
+            f"[dim]({reason} — trying a different family)[/dim]"
+        )
 
     while iteration < MAX_ITERATIONS:
         iteration += 1
-        force = iteration == 1
+        # Force a tool call until the worker has actually DONE something. The
+        # orient+plan preamble ends with the worker promising to execute, and
+        # some models then narrate ("I will now…") or falsely claim completion
+        # instead of acting — which would otherwise trip the completion gate with
+        # nothing executed. Requiring a tool call until the first real action
+        # guarantees the task actually starts.
+        force = actions_taken == 0
         response, signal, messages = _robust_stream(
-            client, worker, messages, force, retry_state, iteration
+            client, active_worker, messages, force, retry_state, iteration
         )
         if signal == "retry":
             iteration -= 1
@@ -371,6 +407,28 @@ def _council_loop(
                 )})
                 continue
 
+            # Nothing has actually been executed yet — a "done" claim here is
+            # bogus (the worker only oriented/planned). Don't let it reach the
+            # completion gate; push it to start executing. Bounded so a model
+            # that genuinely refuses can't spin forever.
+            if actions_taken == 0:
+                empty_start += 1
+                if empty_start >= 4:
+                    display.print_error(
+                        "Worker never started executing after planning. Stopping."
+                    )
+                    end_reason = "no_progress"
+                    break
+                display.print_info(
+                    f"{_TAG['worker']} produced no action yet — directing it to begin execution."
+                )
+                messages.append({"role": "user", "content": (
+                    "You have not executed any step of the plan yet — no tool has run, so the task "
+                    "is NOT done. Do not summarize or claim completion. Begin now: call the first "
+                    "concrete tool (read the data, write the script, run it, …) to carry out the plan."
+                )})
+                continue
+
             # Genuine completion claim -> Verifier gate.
             completion_rounds += 1
             if completion_rounds > _MAX_COMPLETION_ROUNDS:
@@ -383,9 +441,23 @@ def _council_loop(
                 display.print_done(iteration)
                 break
             display.print_info(f"{_TAG['verifier']} requests revision: [dim]{note[:160]}[/dim]")
+            # Rejected completion means the work itself is wrong/incomplete (not a
+            # transient error) — the highest-value place for the Thinker. Turn the
+            # defect into a concrete corrective strategy and hand the retry to a
+            # different family.
+            display.print_info(f"{_TAG['thinker']} re-strategizing on the rejected work…")
+            strat = _thinker_consult(
+                client, roles["thinker"], task, plan,
+                messages + [{"role": "user", "content": f"The verifier rejected completion: {note}"}],
+            )
+            guidance = note
+            if strat:
+                display.print_plan(strat)
+                guidance = f"{note}\n\nPlanner's correction:\n{strat}"
+            _escalate_worker("completion was rejected")
             messages.append({"role": "user", "content": (
                 f"The verifier reviewed your work and it is NOT done yet. Fix this and continue:\n"
-                f"{note}\n\nMake the concrete change now using tools."
+                f"{guidance}\n\nMake the concrete change now using tools."
             )})
             continue
 
@@ -395,6 +467,7 @@ def _council_loop(
 
         if klass == "risky":
             revisions = 0
+            approved = True
             while revisions < _MAX_VERIFIER_REVISIONS:
                 display.print_info(f"{_TAG['verifier']} reviewing proposed action…")
                 approved, note = _verifier_review_action(
@@ -413,7 +486,7 @@ def _council_loop(
                     )})
                 # Re-prompt the Worker for a corrected action this same iteration.
                 response, signal, messages = _robust_stream(
-                    client, worker, messages, False, retry_state, iteration
+                    client, active_worker, messages, False, retry_state, iteration
                 )
                 if signal != "ok":
                     tool_calls = []
@@ -428,12 +501,17 @@ def _council_loop(
                 messages.append(am)
                 if not tool_calls:
                     break  # worker chose to stop / replan; fall through to next loop
+            # The verifier kept rejecting this worker's action — hand the next
+            # turn to a different family, which often clears the block.
+            if not approved:
+                _escalate_worker("verifier kept rejecting the action")
             if not tool_calls:
                 continue
 
         # ---- Execute the (approved) tool calls --------------------------------
         display.print_separator()
         turn_had_error = False
+        actions_taken += len(tool_calls)  # the task has actually begun
         for tc in tool_calls:
             name = tc["function"]["name"]
             raw_args = tc["function"]["arguments"]
@@ -475,6 +553,8 @@ def _council_loop(
                     messages.append({"role": "user", "content": (
                         "Strategic guidance from the planner — apply it:\n" + note
                     )})
+                # A different family often clears an error the current one keeps hitting.
+                _escalate_worker("repeated execution errors")
                 stall = 0
 
         if redundant >= 5:
@@ -506,6 +586,11 @@ def print_roles(roles: dict[str, str], notes: dict[str, str] | None = None) -> N
         tag = _TAG.get(role, role)
         note = f"  [dim]({notes[role]})[/dim]" if role in notes else ""
         display.console.print(f"    {tag}  [bold]{roles[role]}[/bold]{note}")
+    if roles.get("worker_alt"):
+        display.console.print(
+            f"    [dim]↳ escalation worker:[/dim] [bold]{roles['worker_alt']}[/bold] "
+            f"[dim](used when the Worker gets stuck)[/dim]"
+        )
     display.console.print()
 
 
@@ -531,7 +616,7 @@ def run_council_agent(
 
     system_prompt = load_system_prompt(prompt_profile, working_dir)
     if enable_memory:
-        mem = load_session_memory(query=task)
+        mem = load_session_memory(working_dir, query=task)
         if mem:
             system_prompt = system_prompt + f"\n\n{mem}"
 

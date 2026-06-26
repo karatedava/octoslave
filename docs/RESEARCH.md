@@ -58,13 +58,13 @@ rounds, each building on the previous.
 The active prompt profile (set with `/profile` or `-p`) is automatically passed to all agents. Set it before running:
 
 ```bash
-octoslave -p biomedic
+octoslave -p base
 /long-research "Histologie jaterní tkáně" --rounds 5
 ```
 
 Or as a one-liner from shell:
 ```bash
-octoslave -p biomedic -v
+octoslave -p base -v
 # then: /long-research "topic" --rounds 5
 ```
 

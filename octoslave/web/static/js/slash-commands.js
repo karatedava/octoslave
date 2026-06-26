@@ -163,7 +163,7 @@ export function handleSlashCommand(text) {
         const profileSelect = document.getElementById('chat-profile-select');
         const availableProfiles = profileSelect
           ? Array.from(profileSelect.options).map(o => o.value)
-          : ['base', 'coder', 'analyst', 'biomedic', 'local'];
+          : ['base', 'coder', 'analyst', 'local'];
         const profileDisplay = p => p.charAt(0).toUpperCase() + p.slice(1);
 
         if (!arg) {

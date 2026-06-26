@@ -561,7 +561,7 @@ def run_vault_improve(
     Args:
         vault_path:     Path to the Obsidian vault (or any folder of .md files).
         client:         Authenticated OpenAI client.
-        prompt_profile: Writing style profile (e.g. 'biomedic').
+        prompt_profile: Writing style profile (e.g. 'base').
         model:          Model override for all agents (uses role defaults if None).
         resume:         If True, skip batches already marked done in plan.json.
     """

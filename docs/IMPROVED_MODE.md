@@ -86,11 +86,27 @@ loop:
   repeated tool errors            ─┴─► Thinker injects a course-correction  (hard)
   Worker claims "done"             ──► Verifier completion gate
                                          DONE   → finish
-                                         REVISE → Worker does another round (≤3)
+                                         REVISE → Thinker re-strategizes,
+                                                  Worker does another round (≤3)
 ```
 
 Expensive reasoning/critic calls happen **only where they add value** (planning, risky
 writes, completion) — not on every step.
+
+### Diversity escalation (the ensemble lever)
+
+A council of one model family isn't much more than that model. When the Worker gets **stuck**
+— repeated execution errors, a verifier-deadlocked action, or a rejected completion — the loop
+switches the Worker to a **different model family** (the *escalation worker*, e.g.
+`kimi-k2.7 → deepseek-v3.2-thinking`). A block one family can't clear is often trivial for
+another; this is where an ensemble's gain over any single model actually comes from. The
+escalation worker is resolved live from the catalog (a strong model whose family differs from the
+primary Worker) and shown in the resolved roles panel; if no different-family model is available,
+escalation is simply skipped.
+
+Two guards make the loop trustworthy: the Worker is **forced to call a tool until it has actually
+done something** (so a run can never "complete" having executed nothing), and a completion claim is
+only graded by the Verifier **after** real work has happened.
 
 ---
 

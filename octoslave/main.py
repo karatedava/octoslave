@@ -14,7 +14,7 @@ from prompt_toolkit.completion import Completer, Completion
 
 from . import display
 from . import __version__
-from .agent import make_client, run_agent, continue_agent, load_session_memory, save_session_memory, MEMORY_FILE
+from .agent import make_client, run_agent, continue_agent, load_session_memory, save_session_memory, memory_file
 from .council import (
     resolve_council_roles, run_council_agent, continue_council_agent,
     council_available, print_roles as print_council_roles,
@@ -73,14 +73,14 @@ _HISTORY_FILE = Path.home() / ".octoslave" / "history"
 @click.option("--api-key", default=None, envvar="OCTOSLAVE_API_KEY")
 @click.option("--base-url", default=None, envvar="OCTOSLAVE_BASE_URL")
 @click.option("--local", is_flag=True, default=False, help="Use local Ollama models")
-@click.option("-p", "--prompt-profile", default="base", help="Prompt profile to use (default: base, options: base, coder, analyst, biomedic)")
+@click.option("-p", "--prompt-profile", default="base", help="Prompt profile to use (default: base, options: base, coder, analyst)")
 @click.option("--permission-mode", default=None,
               type=click.Choice(["autonomous", "controlled", "supervised"]),
               help="Permission mode: autonomous (default), controlled (ask before all edits), or supervised (ask before file edits only)")
 @click.option("-v", "--verbose", is_flag=True, default=False, help="Verbose mode: show full diffs, complete tool output, and bash commands live")
 @click.option("--no-plan", "disable_plan", is_flag=True, default=False, help="Skip the upfront planning step")
 @click.option("--verify", is_flag=True, default=False, help="Run a verification pass after each task to grade completion")
-@click.option("--no-memory", "disable_memory", is_flag=True, default=False, help="Do not load or save cross-session memory")
+@click.option("--no-memory", "disable_memory", is_flag=True, default=False, help="Do not load or save project memory")
 @click.pass_context
 def cli(ctx, model, working_dir, api_key, base_url, local, prompt_profile, permission_mode, verbose, disable_plan, verify, disable_memory):
     """OctoSlave — autonomous AI research & coding assistant.
@@ -121,7 +121,7 @@ def cli(ctx, model, working_dir, api_key, base_url, local, prompt_profile, permi
 @click.option("--api-key", default=None, envvar="OCTOSLAVE_API_KEY")
 @click.option("--base-url", default=None, envvar="OCTOSLAVE_BASE_URL")
 @click.option("--local", is_flag=True, default=False, help="Use local Ollama models")
-@click.option("-p", "--prompt-profile", default="base", help="Prompt profile to use (default: base, options: base, coder, analyst, biomedic)")
+@click.option("-p", "--prompt-profile", default="base", help="Prompt profile to use (default: base, options: base, coder, analyst)")
 @click.option("-i", "--interactive", is_flag=True, help="Stay interactive after task")
 @click.option("--permission-mode", default=None,
               type=click.Choice(["autonomous", "controlled", "supervised"]),
@@ -130,7 +130,7 @@ def cli(ctx, model, working_dir, api_key, base_url, local, prompt_profile, permi
 @click.option("-n", "--new-project", is_flag=True, default=False, help="Create a new project dir in ~/octoslave/projects/ for output")
 @click.option("--no-plan", "disable_plan", is_flag=True, default=False, help="Skip the upfront planning step")
 @click.option("--verify", is_flag=True, default=False, help="Run a verification pass after the task to grade completion")
-@click.option("--no-memory", "disable_memory", is_flag=True, default=False, help="Do not load or save cross-session memory")
+@click.option("--no-memory", "disable_memory", is_flag=True, default=False, help="Do not load or save project memory")
 @click.option("--parallel", "parallel_n", type=int, default=1,
               help="Run N agents on the same task in parallel and pick/merge a winner (default: 1)")
 @click.option("--strategy", default="best",
@@ -140,7 +140,7 @@ def cli(ctx, model, working_dir, api_key, base_url, local, prompt_profile, permi
               help="Comma-separated models, one per parallel candidate (e.g. 'qwen3-coder-30b,deepseek-v3.2,kimi-k2.6'). "
                    "Shorter than --parallel? remaining slots reuse the default --model.")
 @click.option("--parallel-profiles", "parallel_profiles", default=None,
-              help="Comma-separated prompt profiles, one per parallel candidate (e.g. 'coder,analyst,biomedic'). "
+              help="Comma-separated prompt profiles, one per parallel candidate (e.g. 'coder,analyst'). "
                    "Shorter than --parallel? rotates through the list.")
 @click.option("--judge-model", "judge_model", default=None,
               help="Model used for the judge / vote-tally / merge step (defaults to --model).")
@@ -163,7 +163,7 @@ def run(task, model, working_dir, api_key, base_url, local, prompt_profile, inte
       ots run "reorganize notes" -v
       ots run "refactor auth module" --no-plan   # skip planning step
       ots run "fix the bug" --verify             # grade completion after
-      ots run "quick task" --no-memory           # don't load/save session memory
+      ots run "quick task" --no-memory           # don't load/save project memory
     """
     if verbose:
         display.set_verbose(True)
@@ -257,7 +257,7 @@ def run(task, model, working_dir, api_key, base_url, local, prompt_profile, inte
         # Memory: persist as one outcome rather than one per candidate.
         if enable_memory:
             note = f"parallel({parallel_n}, {strategy}) — {result.get('reason', '')[:160]}"
-            save_session_memory(task, status="completed", note=note)
+            save_session_memory(cfg["working_dir"], task, status="completed", note=note)
         if interactive:
             _repl_loop(client, cfg, messages)
         return
@@ -283,7 +283,7 @@ def run(task, model, working_dir, api_key, base_url, local, prompt_profile, inte
             elif v.startswith("FAILED"):
                 status = "failed"
             note = verify_out[0][:200]
-        save_session_memory(task, status=status, note=note)
+        save_session_memory(cfg["working_dir"], task, status=status, note=note)
 
     if interactive:
         _repl_loop(client, cfg, messages)
@@ -414,14 +414,14 @@ def improved(ctx, model, working_dir, api_key, base_url, prompt_profile,
 @improved.command("run")
 @click.argument("task")
 @click.option("-d", "--dir", "working_dir", default=None, help="Working directory (default: current directory)")
-@click.option("-p", "--prompt-profile", default=None, help="Prompt profile (base, coder, analyst, biomedic)")
+@click.option("-p", "--prompt-profile", default=None, help="Prompt profile (base, coder, analyst)")
 @click.option("-i", "--interactive", is_flag=True, help="Stay interactive after the task")
 @click.option("--permission-mode", default=None,
               type=click.Choice(["autonomous", "controlled", "supervised"]))
 @click.option("-v", "--verbose", is_flag=True, default=False)
 @click.option("-n", "--new-project", is_flag=True, default=False, help="Create a new project dir in ~/octoslave/projects/ for output")
 @click.option("--no-plan", "disable_plan", is_flag=True, default=False, help="Skip the upfront Thinker planning step")
-@click.option("--no-memory", "disable_memory", is_flag=True, default=False, help="Do not load or save cross-session memory")
+@click.option("--no-memory", "disable_memory", is_flag=True, default=False, help="Do not load or save project memory")
 @click.option("--worker", default=None, help="Override the Worker model (executor / tool loop)")
 @click.option("--thinker", default=None, help="Override the Thinker model (planner / reasoner)")
 @click.option("--verifier", default=None, help="Override the Verifier model (critic / gate)")
@@ -500,7 +500,7 @@ def improved_run(ctx, task, working_dir, prompt_profile, interactive, permission
         )
 
     if enable_memory:
-        save_session_memory(task, status="completed", note="")
+        save_session_memory(cfg["working_dir"], task, status="completed", note="")
 
     if interactive:
         _repl_loop(client, cfg, messages)
@@ -1097,7 +1097,7 @@ def _repl_loop(client, cfg: dict, messages: list[dict]):
                         elif v.startswith("FAILED"):
                             _status = "failed"
                         _note = verify_out[0][:200]
-                    save_session_memory(user_input, status=_status, note=_note)
+                    save_session_memory(state["working_dir"], user_input, status=_status, note=_note)
         except KeyboardInterrupt:
             display.console.print("\n[dim]Interrupted.[/dim]")
             messages = []
@@ -1204,7 +1204,7 @@ def _handle_slash(cmd: str, state: dict, cfg: dict, messages: list, client) -> s
 
     if name == "/profile":
         from .agent import load_system_prompt, list_prompt_profiles
-        available = list_prompt_profiles() or ["base", "coder", "analyst", "biomedic", "local"]
+        available = list_prompt_profiles() or ["base", "coder", "analyst", "local"]
         if not arg:
             current = state.get("prompt_profile", "base")
             display.console.print(f"[dim]Current profile:[/dim] [bold #fab283]{current}[/bold #fab283]")
@@ -1270,27 +1270,28 @@ def _handle_slash(cmd: str, state: dict, cfg: dict, messages: list, client) -> s
 
     if name == "/memory":
         sub = arg.strip().lower()
+        mf = memory_file(state["working_dir"])
         if sub == "clear":
-            if MEMORY_FILE.exists():
-                MEMORY_FILE.unlink()
-                display.print_info("Session memory cleared.")
+            if mf.exists():
+                mf.unlink()
+                display.print_info(f"Project memory cleared ({mf}).")
             else:
-                display.print_info("No session memory file to clear.")
+                display.print_info("No project memory file to clear.")
         elif sub == "off":
             state["enable_memory"] = False
-            display.print_info("Session memory disabled for this session.")
+            display.print_info("Project memory disabled for this session.")
         elif sub == "on":
             state["enable_memory"] = True
-            display.print_info("Session memory enabled.")
+            display.print_info("Project memory enabled.")
         else:
             # Show current memory
-            mem = load_session_memory()
+            mem = load_session_memory(state["working_dir"])
             if mem:
                 display.console.print()
                 display.console.print(mem)
                 display.console.print()
             else:
-                display.print_info("No session memory yet.")
+                display.print_info(f"No project memory yet for {state['working_dir']}.")
         return "ok"
 
     if name == "/plan":
@@ -2671,7 +2672,7 @@ def _resolve_config(model, working_dir, api_key, base_url, local: bool = False) 
 @cli.command("vault-improve")
 @click.argument("vault_path", default=None, required=False)
 @click.option("-p", "--profile", "prompt_profile", default="base",
-              help="Prompt profile (default: base, options: base, coder, analyst, biomedic)")
+              help="Prompt profile (default: base, options: base, coder, analyst)")
 @click.option("-m", "--model", default=None, help="Model override for all vault agents")
 @click.option("--resume", is_flag=True, default=False, help="Resume interrupted run")
 @click.option("--api-key", default=None, envvar="OCTOSLAVE_API_KEY")
@@ -2681,8 +2682,8 @@ def vault_improve_cmd(vault_path, prompt_profile, model, resume, api_key, base_u
 
     \b
     Examples:
-      octoslave vault-improve ~/Brain2 --profile biomedic
-      octoslave vault-improve ~/Brain2 --profile biomedic --resume
+      octoslave vault-improve ~/Brain2 --profile base
+      octoslave vault-improve ~/Brain2 --profile base --resume
       octoslave vault-improve ~/Brain2 --model deepseek-v3.2-thinking
     """
     from .vault import run_vault_improve
@@ -2744,7 +2745,7 @@ def batch_cmd(tasks_file, model, prompt_profile, permission_mode, resume,
     \b
     Examples:
       octoslave batch tasks.txt
-      octoslave batch tasks.txt --profile biomedic --resume
+      octoslave batch tasks.txt --profile base --resume
       octoslave batch tasks.txt -m deepseek-v3.2-thinking --output-dir ~/results
     \b
     State is saved to TASKS_FILE.state.json after every completed task.
