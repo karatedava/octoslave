@@ -306,13 +306,15 @@ def _council_overrides(worker, thinker, verifier) -> dict:
 
 def _improved_setup(model, working_dir, api_key, base_url, prompt_profile,
                     permission_mode, verbose, worker, thinker, verifier,
-                    enable_plan: bool = True, enable_memory: bool = True) -> tuple[dict, object]:
+                    enable_plan: bool = True, enable_memory: bool = True,
+                    ultra: bool = False) -> tuple[dict, object]:
     """Build cfg, resolve the council roles, and make a client.
 
     Shared by the Improved TUI and `improved run` so both resolve the council
     identically. On the Ollama backend (no cloud pool) council is disabled and
     ``cfg['council']`` is False — the caller falls back to the normal agent.
-    Returns ``(cfg, client)``.
+    ``ultra`` enables the deeper best-of-N debate orchestration. Returns
+    ``(cfg, client)``.
     """
     if verbose:
         display.set_verbose(True)
@@ -321,6 +323,7 @@ def _improved_setup(model, working_dir, api_key, base_url, prompt_profile,
     cfg["verbose"] = verbose
     cfg["enable_plan"] = enable_plan
     cfg["enable_memory"] = enable_memory
+    cfg["ultra"] = ultra
     if permission_mode:
         cfg["permission_mode"] = permission_mode
     else:
@@ -367,9 +370,11 @@ def _improved_setup(model, working_dir, api_key, base_url, prompt_profile,
 @click.option("--worker", default=None, help="Override the Worker model (executor / tool loop)")
 @click.option("--thinker", default=None, help="Override the Thinker model (planner / reasoner)")
 @click.option("--verifier", default=None, help="Override the Verifier model (critic / gate)")
+@click.option("--ultra", is_flag=True, default=False,
+              help="Deeper orchestration: a diverse panel debates & synthesizes the plan (slower, stronger)")
 @click.pass_context
 def improved(ctx, model, working_dir, api_key, base_url, prompt_profile,
-             permission_mode, verbose, worker, thinker, verifier):
+             permission_mode, verbose, worker, thinker, verifier, ultra):
     """IMPROVED (council) mode — a unified single agent.
 
     One surface, but internally a coordinator routes each step between
@@ -378,10 +383,11 @@ def improved(ctx, model, working_dir, api_key, base_url, prompt_profile,
 
     \b
     With no subcommand, launches the interactive TUI (use /improved on|off to
-    toggle mid-session). For a one-shot, non-interactive run, use `run`:
+    toggle mid-session, /ultra on|off for deeper orchestration). One-shot via `run`:
 
     \b
       ots improved                              # interactive TUI
+      ots improved --ultra                      # deeper orchestration
       ots improved run "analyse this dataset"   # one-shot, then exit
     """
     # Stash the group-level options so an `improved <subcommand>` can merge them
@@ -391,7 +397,7 @@ def improved(ctx, model, working_dir, api_key, base_url, prompt_profile,
         "model": model, "working_dir": working_dir, "api_key": api_key,
         "base_url": base_url, "prompt_profile": prompt_profile,
         "permission_mode": permission_mode, "verbose": verbose,
-        "worker": worker, "thinker": thinker, "verifier": verifier,
+        "worker": worker, "thinker": thinker, "verifier": verifier, "ultra": ultra,
     }
     if ctx.invoked_subcommand is not None:
         return  # a subcommand (e.g. `run`) handles it
@@ -402,11 +408,12 @@ def improved(ctx, model, working_dir, api_key, base_url, prompt_profile,
         permission_mode, verbose, worker, thinker, verifier,
         enable_plan=ctx.obj.get("enable_plan", True),
         enable_memory=ctx.obj.get("enable_memory", True),
+        ultra=ultra,
     )
     banner_model = "🐙 council" if cfg.get("council") else cfg["model"]
     display.print_welcome(banner_model, cfg["working_dir"], backend=cfg["backend"])
     if cfg.get("council"):
-        print_council_roles(cfg["council_roles"], cfg.get("council_notes"))
+        print_council_roles(cfg["council_roles"], cfg.get("council_notes"), ultra=cfg.get("ultra", False))
     display.console.print()
     _repl_loop(client, cfg, [])
 
@@ -425,12 +432,14 @@ def improved(ctx, model, working_dir, api_key, base_url, prompt_profile,
 @click.option("--worker", default=None, help="Override the Worker model (executor / tool loop)")
 @click.option("--thinker", default=None, help="Override the Thinker model (planner / reasoner)")
 @click.option("--verifier", default=None, help="Override the Verifier model (critic / gate)")
+@click.option("--ultra", is_flag=True, default=False,
+              help="Deeper orchestration: a diverse panel debates & synthesizes the plan (slower, stronger)")
 @click.option("--api-key", default=None, envvar="OCTOSLAVE_API_KEY")
 @click.option("--base-url", default=None, envvar="OCTOSLAVE_BASE_URL")
 @click.pass_context
 def improved_run(ctx, task, working_dir, prompt_profile, interactive, permission_mode,
                  verbose, new_project, disable_plan, disable_memory,
-                 worker, thinker, verifier, api_key, base_url):
+                 worker, thinker, verifier, ultra, api_key, base_url):
     """Run a single TASK through the council and exit (or continue with -i).
 
     The Improved counterpart of `ots run` — same one-shot UX, but driven by the
@@ -455,13 +464,14 @@ def improved_run(ctx, task, working_dir, prompt_profile, interactive, permission
     worker = worker or g.get("worker")
     thinker = thinker or g.get("thinker")
     verifier = verifier or g.get("verifier")
+    ultra = ultra or g.get("ultra", False)
     enable_plan = not disable_plan
     enable_memory = not disable_memory
 
     cfg, client = _improved_setup(
         g.get("model"), working_dir, api_key, base_url, prompt_profile,
         permission_mode, verbose, worker, thinker, verifier,
-        enable_plan=enable_plan, enable_memory=enable_memory,
+        enable_plan=enable_plan, enable_memory=enable_memory, ultra=ultra,
     )
 
     if new_project and not working_dir:
@@ -478,7 +488,7 @@ def improved_run(ctx, task, working_dir, prompt_profile, interactive, permission
         mode_tag = "[bold #5c9cf5]supervised[/bold #5c9cf5]"
     display.console.print(f"[dim #7a7d86]permission mode: {mode_tag}[/dim #7a7d86]")
     if cfg.get("council"):
-        print_council_roles(cfg["council_roles"], cfg.get("council_notes"))
+        print_council_roles(cfg["council_roles"], cfg.get("council_notes"), ultra=cfg.get("ultra", False))
     display.console.print()
     display.print_task(task)
 
@@ -489,6 +499,7 @@ def improved_run(ctx, task, working_dir, prompt_profile, interactive, permission
             permission_mode=cfg["permission_mode"],
             enable_plan=enable_plan,
             enable_memory=enable_memory,
+            ultra=cfg.get("ultra", False),
         )
     else:
         # Ollama fallback — council unavailable, drive the normal single agent.
@@ -995,6 +1006,7 @@ def _repl_loop(client, cfg: dict, messages: list[dict]):
         "current_plan":  "",   # last generated plan (shown by /show-plan)
         "council":       cfg.get("council", False),         # improved (council) mode on?
         "council_roles": cfg.get("council_roles") or {},    # {worker,thinker,verifier}
+        "ultra":         cfg.get("ultra", False),            # deeper best-of-N orchestration?
     }
     if state["verbose"]:
         display.set_verbose(True)
@@ -1051,6 +1063,7 @@ def _repl_loop(client, cfg: dict, messages: list[dict]):
                     messages = continue_council_agent(
                         messages, user_input, client, state["council_roles"],
                         state["working_dir"], state["permission_mode"],
+                        ultra=state.get("ultra", False),
                     )
                 else:
                     messages = continue_agent(
@@ -1070,6 +1083,7 @@ def _repl_loop(client, cfg: dict, messages: list[dict]):
                         enable_plan=state["enable_plan"],
                         enable_memory=state["enable_memory"],
                         plan_out=plan_out,
+                        ultra=state.get("ultra", False),
                     )
                 else:
                     messages = run_agent(
@@ -1269,7 +1283,8 @@ def _handle_slash(cmd: str, state: dict, cfg: dict, messages: list, client) -> s
         return "ok"
 
     if name == "/memory":
-        sub = arg.strip().lower()
+        raw = arg.strip()
+        sub = raw.lower()
         mf = memory_file(state["working_dir"])
         if sub == "clear":
             if mf.exists():
@@ -1277,6 +1292,19 @@ def _handle_slash(cmd: str, state: dict, cfg: dict, messages: list, client) -> s
                 display.print_info(f"Project memory cleared ({mf}).")
             else:
                 display.print_info("No project memory file to clear.")
+        elif sub.startswith("forget"):
+            query = raw[len("forget"):].strip()
+            if not query:
+                display.print_info("Usage: /memory forget <description of the insight to remove>")
+            else:
+                from .agent import delete_memory_insight
+                removed = delete_memory_insight(state["working_dir"], query)
+                if removed:
+                    display.print_info("Removed from memory:")
+                    for r in removed:
+                        display.console.print(f"  • {r[:120]}")
+                else:
+                    display.print_info("No matching insight found; nothing removed.")
         elif sub == "off":
             state["enable_memory"] = False
             display.print_info("Project memory disabled for this session.")
@@ -1346,10 +1374,36 @@ def _handle_slash(cmd: str, state: dict, cfg: dict, messages: list, client) -> s
             state["council_roles"] = roles
             state["model"] = roles["worker"]  # Worker is the visible executor
             display.print_info("Improved (council) mode ON.")
-            print_council_roles(roles, notes)
+            print_council_roles(roles, notes, ultra=state.get("ultra", False))
             messages.clear()
             return "ok"
         display.print_error("Usage: /improved on|off|status")
+        return "ok"
+
+    if name == "/ultra":
+        sub = arg.strip().lower()
+        if sub == "off":
+            state["ultra"] = False
+            display.print_info("Ultra orchestration OFF.")
+            return "ok"
+        if sub in ("on", "status", ""):
+            if sub == "status" or sub == "":
+                display.print_info(
+                    f"Ultra orchestration is {'ON' if state.get('ultra') else 'OFF'}."
+                    + ("" if state.get("council") else "  (needs Improved mode — /improved on)")
+                )
+                return "ok"
+            if not state.get("council"):
+                display.print_error("Ultra needs Improved mode. Enable it first with /improved on.")
+                return "ok"
+            state["ultra"] = True
+            display.print_info(
+                "Ultra orchestration ON — a diverse panel will debate & synthesize the plan."
+            )
+            if state.get("council_roles"):
+                print_council_roles(state["council_roles"], ultra=True)
+            return "ok"
+        display.print_error("Usage: /ultra on|off|status")
         return "ok"
 
     if name == "/undo":

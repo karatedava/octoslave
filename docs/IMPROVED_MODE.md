@@ -51,8 +51,10 @@ The plain `ots` command is **unchanged** — Improved mode is purely additive.
 ots web             # http://127.0.0.1:7860
 ```
 
-The chat config bar has a **🐙 Improved** toggle, **ON by default**. Turn it off for a
-single-model chat. It is greyed out on the local Ollama backend (see *Backends* below).
+The chat config bar has a **3-position mode selector** — **Standard · 🐙 Improved · ⚡ Ultra**
+(defaults to **Improved**). Standard is a single-model chat; Improved runs the council; Ultra adds
+the multi-model debate (see *Ultra orchestration* below). Improved and Ultra are disabled on the
+local Ollama backend (it snaps back to Standard; see *Backends*).
 
 ---
 
@@ -96,17 +98,47 @@ writes, completion) — not on every step.
 ### Diversity escalation (the ensemble lever)
 
 A council of one model family isn't much more than that model. When the Worker gets **stuck**
-— repeated execution errors, a verifier-deadlocked action, or a rejected completion — the loop
-switches the Worker to a **different model family** (the *escalation worker*, e.g.
-`kimi-k2.7 → deepseek-v3.2-thinking`). A block one family can't clear is often trivial for
-another; this is where an ensemble's gain over any single model actually comes from. The
-escalation worker is resolved live from the catalog (a strong model whose family differs from the
-primary Worker) and shown in the resolved roles panel; if no different-family model is available,
-escalation is simply skipped.
+— repeated execution errors, a verifier-deadlocked action, a rejected completion, or **re-running
+the same action with no progress** — the loop switches the Worker to a **different model family**
+(the *escalation worker*, e.g. `kimi-k2.7 → deepseek-v3.2-thinking`). A block one family can't clear
+is often trivial for another; this is where an ensemble's gain over any single model actually comes
+from. The escalation worker is resolved live from the catalog (a strong model whose family differs
+from the primary Worker) and shown in the resolved roles panel; if no different-family model is
+available, escalation is simply skipped.
 
-Two guards make the loop trustworthy: the Worker is **forced to call a tool until it has actually
-done something** (so a run can never "complete" having executed nothing), and a completion claim is
-only graded by the Verifier **after** real work has happened.
+Three guards keep the loop trustworthy:
+
+- the Worker is **forced to call a tool until it has actually done something** — so a run can never
+  "complete" having executed nothing;
+- a completion claim is only graded **after** real work has happened;
+- **re-running the same action** (same tool + args) with no edit in between is detected — the loop
+  re-strategizes and switches family, and stops outright if it keeps repeating. Re-running a command
+  *after* an edit is productive and never penalized.
+
+### Ultra orchestration (`--ultra` / `/ultra on`)
+
+For the hardest tasks, Improved mode has a deeper tier. It uses a **diverse panel** (one model per
+family, e.g. `kimi-k2.7 · glm-5.2 · deepseek-v3.2-thinking`) for two debates:
+
+- **Planning** — each panelist drafts a plan **in isolation**, then the aggregator (the Verifier
+  model, a different family) **synthesizes** one stronger plan: keeps the best of each, drops what's
+  wrong, resolves disagreements.
+- **Completion** — when the Worker claims it's done, each panelist independently grades the finished
+  work, and the aggregator resolves their verdicts. A deliverable only clears when independent
+  critics from different families agree; a real defect any one spots is surfaced, while the
+  aggregator dismisses nitpicks so a lone over-strict critic can't deadlock the run.
+
+Isolated drafts/reviews preserve diversity; the synthesis harvests the union of their strengths —
+how a non-frontier pool can exceed any single model. It costs more tokens and latency, so it is
+**off by default**:
+
+```bash
+ots improved --ultra                       # interactive, ultra on
+ots improved run "hard task" --ultra        # one-shot, ultra on
+```
+
+Inside a session: `/ultra on`, `/ultra off`, `/ultra status`. The resolved panel is shown in the
+roles header.
 
 ---
 
@@ -136,10 +168,10 @@ When a role falls back, the resolved panel prints a short note (e.g.
 
 ## Backends
 
-Improved mode needs a **cloud pool** of large models — it runs on **e-INFRA CZ** (default)
-and **NVIDIA NIM**. On the **local Ollama** backend it automatically **falls back to the
-normal single agent** (three large models can't be co-resident locally); the web toggle is
-greyed out there and the TUI prints a notice.
+Improved and Ultra need a **cloud pool** of large models — they run on **e-INFRA CZ** (default)
+and **NVIDIA NIM**. On the **local Ollama** backend they automatically **fall back to the
+normal single agent** (the large models can't be co-resident locally); the web selector disables
+Improved/Ultra there (snapping back to Standard) and the TUI prints a notice.
 
 ---
 
@@ -147,9 +179,10 @@ greyed out there and the TUI prints a notice.
 
 A council turn can call the Thinker and/or Verifier in addition to the Worker, so it uses
 **more tokens** and is somewhat slower than a single model — in exchange for stronger,
-better-checked results. Read-only steps stay single-model, and the gates are bounded
-(≤2 action revisions, ≤3 completion rounds) to avoid runaway loops. Turn it off
-(`/improved off` or the web toggle) for quick, cheap chats.
+better-checked results. **Ultra** costs the most (a model panel debates the plan and completion).
+Read-only steps stay single-model, and the gates are bounded (≤2 action revisions, ≤3 completion
+rounds, with an automatic stop on a repeated-action loop) to avoid runaway loops. Switch to
+**Standard** (`/improved off`, or the web selector) for quick, cheap chats.
 
 ---
 
@@ -161,7 +194,11 @@ better-checked results. Read-only steps stay single-model, and the gates are bou
 - The council loop reuses the normal agent's hardened primitives via the shared
   `agent._robust_stream` helper (identical retry / context-compaction / connection-drop
   handling), so Improved mode inherits the same robustness as normal mode.
-- Wiring: `ots improved` and `/improved` in [`octoslave/main.py`](../octoslave/main.py);
-  the web toggle in [`octoslave/web/app.py`](../octoslave/web/app.py) and the static UI.
+- Wiring: `ots improved` / `--ultra`, `/improved`, and `/ultra` in
+  [`octoslave/main.py`](../octoslave/main.py); the **Standard · Improved · Ultra** selector in
+  [`octoslave/web/app.py`](../octoslave/web/app.py) and the static UI.
+- Ultra debate: `_debate_drafts` (isolated panel) + `_aggregate` / `_debate_completion`
+  (synthesis) in [`octoslave/council.py`](../octoslave/council.py); panel resolved by
+  `resolve_debate_panel` in [`octoslave/config.py`](../octoslave/config.py).
 - The coordinator is a fast heuristic (no extra routing LLM call): role specialization,
-  dynamic per-step routing, and verifier-driven iteration, with no training pipeline.
+  dynamic per-step routing, verifier-driven iteration, and best-of-N debate, with no training pipeline.

@@ -315,9 +315,11 @@ function sendChat() {
   const dir   = document.getElementById('chat-dir-input').value.trim();
   const profile = document.getElementById('chat-profile-select').value;
   const permMode = document.getElementById('chat-permission-select').value;
-  // Improved (council) mode — on by default; backend auto-falls back
-  // to the single agent on local/Ollama.
-  const council = !!document.getElementById('chat-council-toggle')?.checked;
+  // Agent mode — standard | improved | ultra (default improved). Improved/Ultra
+  // run the council; backend auto-falls back to the single agent on local/Ollama.
+  const mode = document.getElementById('mode-seg')?.dataset.mode || 'improved';
+  const council = mode === 'improved' || mode === 'ultra';
+  const ultra = mode === 'ultra';
 
   // Parallel mode short-circuit: when the popover toggle is on, route to the
   // multi-agent handler with per-candidate model/profile selections.
@@ -345,7 +347,7 @@ function sendChat() {
   const type = window.appState.chatIsFirst ? 'chat' : 'chat_continue';
   window.appState.chatIsFirst = false;
 
-  sendMsg({ type, message: fullText, model, working_dir: dir, prompt_profile: profile, permission_mode: permMode, council });
+  sendMsg({ type, message: fullText, model, working_dir: dir, prompt_profile: profile, permission_mode: permMode, council, ultra, mode });
 }
 
 function appendUserMessage(text) {
@@ -916,19 +918,36 @@ function initApp() {
     refreshHistory();
   });
 
+  // Mode selector (Standard · Improved · Ultra) — set active button + data-mode.
+  function _setMode(mode) {
+    const seg = document.getElementById('mode-seg');
+    if (!seg) return;
+    seg.dataset.mode = mode;
+    seg.querySelectorAll('.mode-seg-btn').forEach((b) => {
+      const on = b.dataset.mode === mode;
+      b.classList.toggle('active', on);
+      b.setAttribute('aria-checked', on ? 'true' : 'false');
+    });
+  }
+  document.getElementById('mode-seg')?.querySelectorAll('.mode-seg-btn').forEach((btn) => {
+    btn.addEventListener('click', () => { if (!btn.disabled) _setMode(btn.dataset.mode); });
+  });
+
   // Backend select change handler — send switch_backend and refresh model list.
-  // Improved (council) mode needs a cloud pool — grey out the toggle on Ollama
-  // so the user sees it won't apply there (backend also falls back gracefully).
+  // Improved/Ultra need a cloud pool — disable them on Ollama and snap back to
+  // Standard (the backend also falls back gracefully).
   function _updateCouncilAvailability(backend) {
-    const label = document.getElementById('council-switch-label');
-    const toggle = document.getElementById('chat-council-toggle');
-    if (!label || !toggle) return;
+    const seg = document.getElementById('mode-seg');
+    if (!seg) return;
     const ok = backend !== 'ollama';
-    label.classList.toggle('disabled', !ok);
-    toggle.disabled = !ok;
-    label.title = ok
-      ? 'Improved mode — a model council (Thinker · Worker · Verifier) behind one agent. Stronger results; uses more tokens.'
-      : 'Improved mode needs a cloud backend (e-INFRA / NIM). Not available on local Ollama.';
+    seg.classList.toggle('disabled', !ok);
+    seg.querySelectorAll('.mode-seg-btn').forEach((b) => {
+      if (b.dataset.mode !== 'standard') b.disabled = !ok;
+    });
+    if (!ok && seg.dataset.mode !== 'standard') _setMode('standard');
+    seg.title = ok
+      ? 'Agent mode — Standard: one model. Improved: a council (Thinker · Worker · Verifier). Ultra: council + multi-model debate on the plan and completion (strongest, more tokens).'
+      : 'Improved / Ultra need a cloud backend (e-INFRA / NIM). Not available on local Ollama.';
   }
   window._updateCouncilAvailability = _updateCouncilAvailability;
 

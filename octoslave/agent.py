@@ -365,10 +365,13 @@ PROJECT_MEMORY_FILENAME = "memory.md"
 def memory_file(working_dir: str) -> Path:
     """Path to the project-scoped memory file for ``working_dir``."""
     return Path(working_dir) / PROJECT_MEMORY_DIR / PROJECT_MEMORY_FILENAME
-_SESSION_MAX_ENTRIES = 40   # session outcomes retained on disk
-_INSIGHT_MAX_ENTRIES = 60   # agent-authored insights retained on disk
+_SESSION_MAX_ENTRIES = 20   # session outcomes retained on disk
+_INSIGHT_MAX_ENTRIES = 40   # agent-authored insights retained on disk
 _RECALL_SESSIONS = 4        # session entries injected into a prompt
 _RECALL_INSIGHTS = 6        # insight entries injected into a prompt
+# Token-overlap (Jaccard) at/above which a new insight is treated as the same
+# fact as an existing one — the old copy is superseded rather than piling up.
+_INSIGHT_DUP_THRESHOLD = 0.5
 
 _MEMORY_STOPWORDS = frozenset(
     "the a an and or but for to of in on at by with from into is are was were be "
@@ -384,6 +387,15 @@ def _mem_tokenize(text: str) -> set[str]:
     tiktoken, consistent with how _estimated_tokens approximates token counts."""
     toks = re.findall(r"[a-z0-9_]{3,}", (text or "").lower())
     return {t for t in toks if t not in _MEMORY_STOPWORDS}
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    """Symmetric token-set similarity in [0, 1]. Used to detect near-duplicate
+    insights so re-stating a fact supersedes the old copy instead of bloating."""
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    return inter / len(a | b) if inter else 0.0
 
 
 def _entry_match_text(e: dict) -> str:
@@ -584,16 +596,60 @@ def save_memory_insight(working_dir: str, content: str, tags=None) -> bool:
         tag_str = ""
     try:
         entries = _parse_memory_entries(working_dir)
-        entries.append({
+        # Supersede near-duplicate insights instead of appending, so re-stating
+        # or updating a fact keeps memory concise rather than bloating it.
+        new_tok = _mem_tokenize(content)
+        kept = []
+        for e in entries:
+            if e.get("kind") == "insight" and _jaccard(new_tok, _mem_tokenize(e.get("text", ""))) >= _INSIGHT_DUP_THRESHOLD:
+                continue  # drop the stale/duplicate copy
+            kept.append(e)
+        kept.append({
             "kind": "insight",
             "date": _date_cls.today().isoformat(),
             "tags": tag_str[:120],
             "text": content,
         })
-        _write_memory(working_dir, entries)
+        _write_memory(working_dir, kept)
         return True
     except Exception:
         return False
+
+
+def delete_memory_insight(working_dir: str, query: str, max_remove: int = 3) -> list[str]:
+    """Remove agent insights that match ``query`` (the `forget` tool / `/memory
+    forget`). Returns the texts of removed insights (empty if none matched).
+
+    Matches lexically against insight text+tags; removes up to ``max_remove`` of
+    the strongest matches above a small relevance floor. Sessions are untouched."""
+    query = (query or "").strip()
+    if not query:
+        return []
+    try:
+        entries = _parse_memory_entries(working_dir)
+    except Exception:
+        return []
+    qtok = _mem_tokenize(query)
+    if not qtok:
+        return []
+    scored = []
+    for i, e in enumerate(entries):
+        if e.get("kind") != "insight":
+            continue
+        score = _mem_relevance(qtok, e)
+        if score > 0.0:
+            scored.append((score, i, e))
+    if not scored:
+        return []
+    scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
+    drop_ids = {id(e) for _, _, e in scored[:max_remove]}
+    removed = [e.get("text", "").strip() for _, _, e in scored[:max_remove]]
+    kept = [e for e in entries if id(e) not in drop_ids]
+    try:
+        _write_memory(working_dir, kept)
+    except Exception:
+        return []
+    return removed
 
 
 def load_system_prompt(profile: str = "base", working_dir: str = None) -> str:
@@ -1152,7 +1208,7 @@ def run_agent(
 
     # Connect any user-configured MCP servers (idempotent across calls).
     from .tools import init_mcp
-    init_mcp()
+    init_mcp(working_dir=working_dir)
 
     # Adapt context/tool knobs to the backend (small-model accommodations for
     # local Ollama; no-op for e-INFRA / NIM / custom).
@@ -1235,7 +1291,7 @@ def continue_agent(
         permission_mode = cfg.get("permission_mode", "autonomous")
 
     from .tools import init_mcp
-    init_mcp()
+    init_mcp(working_dir=working_dir)
 
     # Re-apply backend-adaptive knobs (per-thread state may be stale/unset on a
     # fresh follow-up turn or a different thread).

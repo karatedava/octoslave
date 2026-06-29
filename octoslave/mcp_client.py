@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import threading
 import atexit
+from pathlib import Path
 from typing import Any
 
 # requests is already a hard dependency (used by tools.py); import lazily so a
@@ -74,6 +75,27 @@ def sanitize_server_name(raw: str) -> str:
     """Make a config server name safe to embed in a tool name (model-facing)."""
     cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", (raw or "").strip()).strip("_")
     return cleaned or "server"
+
+
+def _path_to_file_uri(path: str) -> str:
+    """Absolute filesystem path → ``file://`` URI (what MCP roots expect)."""
+    ap = os.path.abspath(os.path.expanduser(str(path)))
+    try:
+        return Path(ap).as_uri()
+    except Exception:
+        return "file://" + ap
+
+
+def _norm_roots(paths) -> list[str]:
+    """De-duplicated list of absolute paths from a roots spec."""
+    out: list[str] = []
+    for p in paths or []:
+        if not p:
+            continue
+        ap = os.path.abspath(os.path.expanduser(str(p)))
+        if ap not in out:
+            out.append(ap)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +144,15 @@ class MCPServer:
         self._reader: threading.Thread | None = None
         self._pending: dict[int, queue.Queue] = {}
         self._lock = threading.Lock()
+        self._io_lock = threading.Lock()  # serialize stdin writes across threads
         self._id = 0
+
+        # MCP roots — directories this client exposes to the server. Tracks
+        # octoslave's active working dir so filesystem-style servers stay
+        # sandboxed to the task the user is actually running.
+        self._roots: list[str] = []
+        self._roots_listed = threading.Event()  # set when we answer roots/list
+        self._server_queries_roots = False       # server actually pulls roots?
 
         # http state
         self._session_id: str | None = None
@@ -171,6 +201,34 @@ class MCPServer:
     def original_tool_for(self, namespaced: str) -> str | None:
         return self._tool_index.get(namespaced)
 
+    def seed_roots(self, paths) -> None:
+        """Set initial roots *before* ``start()`` so the handshake advertises
+        them and the server's first ``roots/list`` gets the right directory."""
+        self._roots = _norm_roots(paths)
+
+    def set_roots(self, paths, wait: bool = True, timeout: float = 2.0) -> bool:
+        """Update the exposed roots on a live connection. No-op if unchanged.
+
+        On a real change we send ``notifications/roots/list_changed``; if the
+        server actually re-reads roots we block briefly until it has, so the
+        next tool call sees the new sandbox rather than the old one.
+        """
+        new = _norm_roots(paths)
+        with self._lock:
+            if new == self._roots:
+                return False
+            self._roots = new
+        if not (self.connected and self.transport == "stdio"):
+            return True
+        self._roots_listed.clear()
+        try:
+            self._notify("notifications/roots/list_changed", {})
+        except Exception:
+            return True
+        if wait and self._server_queries_roots:
+            self._roots_listed.wait(timeout)
+        return True
+
     def stop(self) -> None:
         self.connected = False
         self._cleanup_process()
@@ -182,7 +240,9 @@ class MCPServer:
             "initialize",
             {
                 "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
+                # Advertise the `roots` capability so servers can sandbox to the
+                # directories we expose (and re-read them on list_changed).
+                "capabilities": {"roots": {"listChanged": True}},
                 "clientInfo": _CLIENT_INFO,
             },
             timeout=timeout,
@@ -291,9 +351,14 @@ class MCPServer:
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 continue  # server log noise on stdout — ignore
+            # Server→client request or notification (carries `method`); a
+            # response to one of our calls never does.
+            if msg.get("method") is not None:
+                self._handle_inbound(msg)
+                continue
             mid = msg.get("id")
             if mid is None:
-                continue  # a notification from the server — nothing to await
+                continue  # stray message — nothing to await
             with self._lock:
                 q = self._pending.pop(mid, None)
             if q is not None:
@@ -309,8 +374,47 @@ class MCPServer:
         proc = self._proc
         if proc is None or proc.stdin is None or proc.poll() is not None:
             raise MCPError("MCP server process is not running.")
-        proc.stdin.write(json.dumps(msg) + "\n")
-        proc.stdin.flush()
+        line = json.dumps(msg) + "\n"
+        # Both request threads and the reader thread (servicing inbound
+        # requests) write here — serialize so JSON lines never interleave.
+        with self._io_lock:
+            proc.stdin.write(line)
+            proc.stdin.flush()
+
+    def _handle_inbound(self, msg: dict) -> None:
+        """Service a server→client request/notification.
+
+        The only request we implement is ``roots/list`` (lets filesystem-style
+        servers sandbox to the active working dir). Any other inbound *request*
+        gets a method-not-found reply so the server isn't left waiting;
+        notifications we don't recognise are ignored.
+        """
+        method = msg.get("method")
+        mid = msg.get("id")
+        if method == "roots/list":
+            self._server_queries_roots = True
+            with self._lock:
+                roots = list(self._roots)
+            result = {"roots": [
+                {"uri": _path_to_file_uri(p),
+                 "name": os.path.basename(p.rstrip("/")) or p}
+                for p in roots
+            ]}
+            if mid is not None:
+                try:
+                    self._write_stdio({"jsonrpc": "2.0", "id": mid, "result": result})
+                except Exception:
+                    pass
+            self._roots_listed.set()
+            return
+        if mid is not None:
+            try:
+                self._write_stdio({
+                    "jsonrpc": "2.0", "id": mid,
+                    "error": {"code": -32601, "message": f"method not found: {method}"},
+                })
+            except Exception:
+                pass
 
     def _request_stdio(self, method: str, params: dict, timeout: float) -> dict:
         mid = self._next_id()
@@ -473,11 +577,19 @@ class MCPManager:
         self.servers: dict[str, MCPServer] = {}  # sanitized name → server
         self._initialized = False
         self._lock = threading.Lock()
+        self._roots: list[str] = []  # directories exposed to every server
 
-    def init_from_config(self, cfg: dict | None = None, force: bool = False) -> None:
+    def init_from_config(self, cfg: dict | None = None, force: bool = False,
+                         roots=None) -> None:
         """Connect to all enabled MCP servers in config. Idempotent unless
-        ``force`` is passed (used by ``/mcp reconnect``)."""
+        ``force`` is passed (used by ``/mcp reconnect``).
+
+        ``roots`` seeds the directories exposed to each server (typically the
+        active working dir) so the handshake advertises them from the start.
+        """
         with self._lock:
+            if roots is not None:
+                self._roots = _norm_roots(roots)
             if self._initialized and not force:
                 return
             if force:
@@ -496,6 +608,7 @@ class MCPManager:
                 server = MCPServer(entry)
                 if server.name in self.servers:
                     continue  # duplicate name — keep the first
+                server.seed_roots(self._roots)
                 ok = server.start()
                 self.servers[server.name] = server
                 if ok:
@@ -506,6 +619,21 @@ class MCPManager:
                     _log(msg)
                 else:
                     _log(f"MCP: failed to connect '{server.raw_name}': {server.error}")
+
+    def set_roots(self, paths) -> None:
+        """Point every connected server at ``paths`` (octoslave's active
+        working dir). Cheap + idempotent — a no-op when nothing changed."""
+        norm = _norm_roots(paths)
+        with self._lock:
+            if norm == self._roots:
+                return
+            self._roots = norm
+            servers = list(self.servers.values())
+        for server in servers:
+            try:
+                server.set_roots(norm)
+            except Exception:
+                pass
 
     def tool_definitions(self) -> list[dict]:
         defs: list[dict] = []

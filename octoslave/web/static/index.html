@@ -108,12 +108,12 @@
         <option value="supervised">Supervised</option>
       </select>
       <div class="config-divider"></div>
-      <label class="council-switch" id="council-switch-label"
-             title="Improved mode — a model council (Thinker · Worker · Verifier) behind one agent. Stronger results; uses more tokens. Cloud backends only.">
-        <input type="checkbox" id="chat-council-toggle" checked>
-        <span class="council-switch-track"><span class="council-switch-thumb"></span></span>
-        <span class="council-switch-text">🐙 Improved</span>
-      </label>
+      <div class="mode-seg" id="mode-seg" role="radiogroup" data-mode="improved"
+           title="Agent mode — Standard: one model. Improved: a council (Thinker · Worker · Verifier) behind one agent. Ultra: the council plus a multi-model debate on the plan and completion (strongest, more tokens). Improved/Ultra need a cloud backend.">
+        <button type="button" class="mode-seg-btn" data-mode="standard" role="radio" aria-checked="false">Standard</button>
+        <button type="button" class="mode-seg-btn active" data-mode="improved" role="radio" aria-checked="true">🐙 Improved</button>
+        <button type="button" class="mode-seg-btn" data-mode="ultra" role="radio" aria-checked="false">⚡ Ultra</button>
+      </div>
       <div class="config-divider" style="display:none;"></div>
       <div class="dir-field">
         <svg class="dir-field-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
