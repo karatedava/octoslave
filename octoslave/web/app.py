@@ -871,20 +871,27 @@ async def ws_endpoint(websocket: WebSocket):
                 _resolved = resolve_backend(cfg)
                 client = make_client(_resolved["api_key"], _resolved["base_url"])
 
-                # Improved (council) mode — opt-in per message; the web
-                # UI ships it ON by default. Needs a cloud pool, so it auto-falls
-                # back to the normal single agent on the Ollama backend.
-                use_council = bool(msg.get("council", False))
+                # Agent mode — standard | improved | ultra, opt-in per message
+                # (web UI defaults to improved). Improved/Ultra run the council and
+                # need a cloud pool, so they auto-fall back to the single agent on
+                # Ollama. Ultra adds the multi-model debate on plan + completion.
+                mode = msg.get("mode") or ("improved" if msg.get("council") else "standard")
+                use_council = mode in ("improved", "ultra")
+                use_ultra = mode == "ultra" or bool(msg.get("ultra", False))
                 council_roles = None
                 if use_council and council_available(cfg):
                     try:
                         council_roles, council_notes = resolve_council_roles(client, cfg, {})
+                        tag = "⚡ ultra council" if use_ultra else "🐙 council"
+                        extra = ""
+                        if use_ultra and council_roles.get("debate"):
+                            extra = " · debate: " + ", ".join(council_roles["debate"])
                         await send({
                             "type": "info",
                             "text": (
-                                "🐙 council — Worker: " + council_roles["worker"]
+                                tag + " — Worker: " + council_roles["worker"]
                                 + " · Thinker: " + council_roles["thinker"]
-                                + " · Verifier: " + council_roles["verifier"]
+                                + " · Verifier: " + council_roles["verifier"] + extra
                             ),
                         })
                     except Exception as exc:
@@ -893,20 +900,20 @@ async def ws_endpoint(websocket: WebSocket):
                 elif use_council and not council_available(cfg):
                     await send({
                         "type": "info",
-                        "text": "Improved mode needs a cloud pool (e-INFRA / NIM); using the single local agent.",
+                        "text": "Improved / Ultra need a cloud pool (e-INFRA / NIM); using the single local agent.",
                     })
 
                 def chat_fn(txt=message_text, mdl=model, wd=working_dir, new=new_conv,
-                           pp=prompt_profile, pm=permission_mode, roles=council_roles):
+                           pp=prompt_profile, pm=permission_mode, roles=council_roles, ultra=use_ultra):
                     display.set_event_callback(make_emit())
                     try:
                         if roles:
                             if new:
                                 result = run_council_agent(txt, wd, client, roles,
-                                                           prompt_profile=pp, permission_mode=pm)
+                                                           prompt_profile=pp, permission_mode=pm, ultra=ultra)
                             else:
                                 result = continue_council_agent(state["messages"], txt, client,
-                                                                roles, wd, pm)
+                                                                roles, wd, pm, ultra=ultra)
                         elif new:
                             result = run_agent(txt, mdl, wd, client, pp, pm)
                         else:

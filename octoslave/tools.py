@@ -462,7 +462,9 @@ TOOL_DEFINITIONS = [
                 "dead end worth avoiding next time. Write the insight so it makes "
                 "sense out of context, with specifics. Do NOT use it for routine "
                 "progress, transient state, or things already obvious from the code "
-                "or the task. These notes are recalled automatically when relevant."
+                "or the task. These notes are recalled automatically when relevant. "
+                "Re-stating an existing fact UPDATES it (the old version is replaced) "
+                "— keep memory concise."
             ),
             "parameters": {
                 "type": "object",
@@ -478,6 +480,26 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget",
+            "description": (
+                "Remove an insight from this project's memory that is no longer true "
+                "or relevant (e.g. a fact that changed, a quirk that was fixed, advice "
+                "that proved wrong). Describe the insight to drop; the closest "
+                "matching remembered insight(s) are removed. Use this to keep memory "
+                "accurate and lean — don't let stale notes accumulate."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "A description of the insight to remove (matched against stored insights)."},
+                },
+                "required": ["content"],
+            },
+        },
+    },
 ] + BIO_TOOL_DEFINITIONS
 
 
@@ -485,12 +507,18 @@ TOOL_DEFINITIONS = [
 # MCP (Model Context Protocol) — user-wired external tools
 # ---------------------------------------------------------------------------
 
-def init_mcp(cfg: dict | None = None, force: bool = False) -> None:
+def init_mcp(cfg: dict | None = None, force: bool = False,
+             working_dir: str | None = None) -> None:
     """Connect to configured MCP servers (idempotent). Safe to call from every
-    entry point — single-agent REPL, research pipeline, web UI."""
+    entry point — single-agent REPL, research pipeline, web UI.
+
+    ``working_dir`` seeds the MCP roots so filesystem-style servers start out
+    sandboxed to the task's directory (kept in sync per-call in ``execute_tool``).
+    """
     try:
         from .mcp_client import manager
-        manager.init_from_config(cfg, force=force)
+        roots = [working_dir] if working_dir else None
+        manager.init_from_config(cfg, force=force, roots=roots)
     except Exception:
         # MCP is strictly additive — never let it break the core toolbox.
         pass
@@ -631,6 +659,8 @@ def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str =
             return _ask_user(working_dir=working_dir, **args)
         elif name == "remember":
             return _remember(working_dir=working_dir, **args)
+        elif name == "forget":
+            return _forget(working_dir=working_dir, **args)
         elif name == "glob":
             return _glob(working_dir=working_dir, **args)
         elif name == "grep":
@@ -653,6 +683,14 @@ def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str =
             mgr = _mcp_manager()
             if mgr is None:
                 return f"MCP is unavailable; cannot run {name}", False
+            # Keep filesystem-style MCP servers sandboxed to the *current* task
+            # workdir (users pick workdirs per task/message). Idempotent + cheap
+            # when unchanged; pushes roots/list_changed when it actually moves.
+            if working_dir:
+                try:
+                    mgr.set_roots([working_dir])
+                except Exception:
+                    pass
             return mgr.call(name, args)
         elif name in _DYNAMIC_TOOLS:
             _def, func = _DYNAMIC_TOOLS[name]
@@ -678,6 +716,7 @@ _REQUIRED_STR_ARGS: dict[str, tuple[str, ...]] = {
     "stop_process": ("id",),
     "ask_user": ("question",),
     "remember": ("content",),
+    "forget": ("content",),
     "glob": ("pattern",),
     "grep": ("pattern",),
     "web_search": ("query",),
@@ -741,6 +780,7 @@ _ARG_HINTS: dict[str, str] = {
     "stop_process": "Pass `id` as the process id returned by run_background (e.g. \"bg1\").",
     "ask_user": "Pass `question` as a clear, specific question string.",
     "remember": "Pass `content` as a self-contained insight string (e.g. {\"content\": \"This repo uses uv, not pip.\"}).",
+    "forget": "Pass `content` describing the stale insight to remove (e.g. {\"content\": \"repo uses uv not pip\"}).",
     "glob": "Pass `pattern` (e.g. {\"pattern\": \"**/*.py\"}).",
     "grep": "Pass `pattern` as a regex (e.g. {\"pattern\": \"def \\\\w+\"}).",
     "web_search": "Pass `query`.",
@@ -1291,7 +1331,62 @@ def _remember(content: str, working_dir: str, tags=None) -> tuple[str, bool]:
     return f"Saved to memory: {preview}", True
 
 
+def _forget(content: str, working_dir: str) -> tuple[str, bool]:
+    """Remove stale insight(s) from this project's memory matching ``content``."""
+    from .agent import delete_memory_insight
+    removed = delete_memory_insight(working_dir, content)
+    if not removed:
+        return "No matching insight found in memory; nothing removed.", True
+    previews = []
+    for r in removed:
+        r = r.replace("\n", " ")
+        previews.append(r if len(r) <= 80 else r[:77] + "…")
+    return "Removed from memory:\n- " + "\n- ".join(previews), True
+
+
+# Commands that essentially never exit on their own — dev servers, watchers,
+# REPLs, log tails. Running these through bash blocks the whole agent (and, in a
+# team run, the whole lab) until the timeout fires. We intercept them up front
+# and redirect to run_background instead of executing. Kept tight to
+# unambiguous patterns so ordinary one-shot commands are never caught; the model
+# can still force a foreground run by prefixing `OTS_FOREGROUND=1 ` (e.g. a
+# server invoked only for `--help`).
+_BLOCKING_CMD_PATTERNS = (
+    r"\bflask\s+run\b",
+    r"\b(uvicorn|gunicorn|hypercorn|daphne|waitress-serve)\b",
+    r"\bmanage\.py\s+runserver\b",
+    r"\bstreamlit\s+run\b",
+    r"\bjupyter\s+(notebook|lab)\b",
+    r"\bhttp\.server\b",
+    r"\b(nodemon|webpack-dev-server|next\s+dev|vite(\s+dev)?)\b",
+    r"\b(npm|yarn|pnpm)\s+(run\s+)?(dev|start|serve)\b",
+    r"\btail\s+-[a-zA-Z]*f",
+    r"--watch\b",
+)
+
+
+def _looks_blocking(command: str) -> bool:
+    import re
+    if "OTS_FOREGROUND=1" in command:
+        return False
+    return any(re.search(p, command) for p in _BLOCKING_CMD_PATTERNS)
+
+
 def _bash(command: str, working_dir: str, timeout: int = 300) -> tuple[str, bool]:
+    # Redirect commands that never return on their own to run_background, so a
+    # single blocking call can't freeze the agent until the timeout fires.
+    if _looks_blocking(command):
+        return (
+            f"This looks like a long-running / blocking process (dev server, watcher, "
+            f"or log tail) that won't exit on its own — running it through bash would "
+            f"block everything until the {timeout}s timeout.\n"
+            f"Start it with run_background instead: "
+            f"run_background(command={command!r}), then poll it with check_process and "
+            f"stop it with stop_process when done.\n"
+            f"If you genuinely need it in the foreground (e.g. a `--help`/version check), "
+            f"prefix the command with `OTS_FOREGROUND=1 ` to bypass this guard.",
+            False,
+        )
     # Unset VIRTUAL_ENV so uv doesn't emit a mismatch warning when the conda/system
     # venv doesn't match the project's .venv.
     env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
@@ -1322,7 +1417,15 @@ def _bash(command: str, working_dir: str, timeout: int = 300) -> tuple[str, bool
             output = output[:2000] + "\n\n... [output truncated] ...\n\n" + output[-5000:]
         return output, result.returncode == 0
     except subprocess.TimeoutExpired:
-        return f"Command timed out after {timeout}s", False
+        return (
+            f"Command timed out after {timeout}s and was killed. If this job is "
+            f"genuinely long-running (training, simulation, big data job, a server), "
+            f"do NOT just re-run with a bigger timeout — that blocks the agent the "
+            f"whole time. Re-launch it with run_background(command=...) and poll it "
+            f"with check_process. Only raise the bash timeout for a bounded one-off "
+            f"(a big install or full test suite) that you expect to finish.",
+            False,
+        )
 
 
 def _find_codag() -> str | None:

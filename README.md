@@ -103,9 +103,10 @@ ots                                            # interactive TUI (default backen
 ots run "build a todo API"                     # one-shot task, then exit
 ots improved                                   # Improved TUI — a unified model council (see below)
 ots improved run "analyse this dataset"        # one-shot through the council
+ots improved run "hard task" --ultra           # Ultra — multi-model debate (strongest)
 ots --local                                    # local Ollama
 ots --nim                                       # NVIDIA NIM
-ots web                                          # browser UI at http://127.0.0.1:7860 (Improved toggle ON by default)
+ots web                                          # browser UI at http://127.0.0.1:7860 (Standard · Improved · Ultra selector)
 ots run "build a Flask REST API for a todo app"
 ots run "summarise this paper" -i                # one-shot, then stay interactive
 
@@ -128,6 +129,7 @@ ots
 | | |
 |---|---|
 | 🐙 **Improved mode** | A unified model council — Thinker · Worker · Verifier behind one agent (`ots improved`) |
+| ⚡ **Ultra mode** | Deeper tier — a diverse panel debates the plan & completion, synthesized into one (`ots improved --ultra`) |
 | 🔁 **Autonomous loop** | Runs many tool-call iterations end-to-end — no hand-holding |
 | 🧠 **Upfront planning** | Writes a numbered execution plan before touching files |
 | ✅ **Self-verification** | Optional DONE / PARTIAL / FAILED grade after each task (`--verify`) |
@@ -185,6 +187,7 @@ Common flags for `ots` and `ots run`:
 | `/permission [mode]` | Show or change permission mode |
 | `/plan` · `/verify` · `/memory` | Toggle agentic behaviours (`on`/`off`) |
 | `/improved [on\|off\|status]` | Toggle Improved (council) mode and show the resolved roles |
+| `/ultra [on\|off\|status]` | Toggle Ultra (multi-model debate) on top of Improved mode |
 | `/parallel N [strategy] task` | Run N agents on one task |
 | `/long-research TASK [flags]` | Launch the autonomous Lab (dynamic team) |
 | `/vault-improve [path]` | Launch vault-wide note improvement |
@@ -241,8 +244,9 @@ single model.
 ```bash
 ots improved                                   # Improved TUI (interactive)
 ots improved run "analyse this dataset" -p analyst -d ~/data   # one-shot (mirrors `ots run`)
+ots improved --ultra                           # deeper tier (multi-model debate)
 ots improved --thinker glm-5.2                 # override a role
-ots web                                         # web UI ships the "🐙 Improved" toggle ON by default
+ots web                                         # web UI: Standard · Improved · Ultra selector (Improved default)
 ```
 
 Three roles, drawn from the best of the e-INFRA offer:
@@ -261,10 +265,23 @@ A **heuristic coordinator** routes each step (no extra routing call, so it stays
 - repeated errors pull in the Thinker for a course correction;
 - when the Worker claims done, the Verifier grades the result and can send it back for another round.
 
+**Diversity escalation:** when the Worker gets stuck — repeated errors, a verifier-deadlocked action,
+a rejected completion, or **re-running the same action with no progress** — the loop switches it to a
+different model *family* (a block one family can't clear is often trivial for another) and, on a
+rejected completion, the Thinker re-strategizes. Two trust guards: the Worker is **forced to act
+before it can ever "complete"**, and a run that loops on an identical action is stopped automatically.
+
+**⚡ Ultra** (`ots improved --ultra`, `/ultra on`, or the web selector): for the hardest tasks, a
+**diverse panel** (one model per family, e.g. `kimi-k2.7 · glm-5.2 · deepseek-v3.2-thinking`) each
+drafts the **plan** in isolation and the aggregator synthesizes one stronger plan; at **completion**
+the panel independently grades the work and the aggregator resolves their verdicts. Isolated
+drafts/reviews preserve diversity; the synthesis harvests their combined strengths — how a
+non-frontier pool can exceed any single model. More tokens/latency, so it's **off by default**.
+
 Models are **probed live** at startup and resolved down a fallback chain; override any role with
 `--worker/--thinker/--verifier` or `OCTOSLAVE_COUNCIL_{WORKER,THINKER,VERIFIER}`. Toggle mid-session
-with `/improved on|off|status`. Needs a cloud backend (e-INFRA / NIM); on local Ollama it falls back
-to the normal single agent. The plain `ots` is unchanged. Full details:
+with `/improved on|off|status` and `/ultra on|off|status`. Needs a cloud backend (e-INFRA / NIM); on
+local Ollama it falls back to the normal single agent. The plain `ots` is unchanged. Full details:
 [docs/IMPROVED_MODE.md](docs/IMPROVED_MODE.md).
 
 ### Agentic behaviour

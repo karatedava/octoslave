@@ -733,6 +733,7 @@ def print_help():
         "  [cyan]/verify on|off[/cyan]          Enable/disable post-task verification grade (default: off)\n"
         "  [cyan]/improved on|off|status[/cyan] Toggle council mode (Thinker/Worker/Verifier model pool)\n"
         "  [cyan]/memory[/cyan]                 Show this project's memory (remembered insights + prior task outcomes)\n"
+        "  [cyan]/memory forget <text>[/cyan]  Remove stale insight(s) matching <text>\n"
         "  [cyan]/memory clear[/cyan]           Erase this project's memory file (.octo/memory.md)\n"
         "  [cyan]/memory on|off[/cyan]          Enable/disable memory loading/saving (default: on)\n\n"
         "[bold white]Backend switching:[/bold white]\n"

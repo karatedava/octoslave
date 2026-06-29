@@ -156,6 +156,45 @@ COUNCIL_WORKER_ESCALATION: list[str] = [
     "kimi-k2.6","glm-5.2","deepseek-v3.2-thinking"
 ]
 
+# ---------------------------------------------------------------------------
+# Ultra tier — multi-model best-of-N debate (deeper orchestration)
+# ---------------------------------------------------------------------------
+# A diverse, isolated panel that independently drafts a candidate (e.g. a plan or
+# a critical solution), which an aggregator then synthesizes into one stronger
+# answer. Isolation between panelists preserves diversity (prevents "orchestration
+# collapse"); the synthesis harvests the union of their strengths — the mechanism
+# that lets a non-frontier pool exceed any single model. kimi/glm prioritized,
+# with one different-family reasoner for genuine diversity. Resolved against the
+# live catalog; deduped by family so the panel is actually diverse.
+COUNCIL_DEBATE_MODELS: list[str] = [
+    "kimi-k2.7", "glm-5.2", "deepseek-v3.2-thinking",
+]
+# How many panelists to actually use (kept small for latency/cost).
+COUNCIL_DEBATE_PANEL = 3
+
+
+def resolve_debate_panel(available: list[str] | None, worker: str = "") -> list[str]:
+    """Pick up to COUNCIL_DEBATE_PANEL debate models, one per family, from the
+    live catalog (prioritizing the configured order). Falls back to the configured
+    ids when the catalog is unknown. The primary worker is included first so the
+    panel always contains the main model plus diverse second opinions."""
+    avail = {m for m in (available or [])}
+    picked: list[str] = []
+    seen_fam: set[str] = set()
+    for cand in ([worker] if worker else []) + COUNCIL_DEBATE_MODELS:
+        if not cand:
+            continue
+        if avail and cand not in avail:
+            continue
+        fam = _model_family(cand)
+        if fam in seen_fam or cand in picked:
+            continue
+        picked.append(cand)
+        seen_fam.add(fam)
+        if len(picked) >= COUNCIL_DEBATE_PANEL:
+            break
+    return picked
+
 
 def _model_family(model: str) -> str:
     """Coarse model-family key (vendor/series) for diversity checks."""
@@ -218,6 +257,13 @@ def resolve_council_models(
             if cand in avail_set and _model_family(cand) != worker_fam:
                 roles["worker_alt"] = cand
                 break
+
+    # Ultra-tier debate panel (diverse, one model per family). Stored as a list
+    # under a non-standard key — print_roles / the loop only read the three string
+    # roles, so the extra entry is inert unless ultra mode pulls it.
+    panel = resolve_debate_panel(list(avail_set) if avail_set else None, roles.get("worker", ""))
+    if len(panel) >= 2:
+        roles["debate"] = panel  # type: ignore[assignment]
     return roles, notes
 
 
