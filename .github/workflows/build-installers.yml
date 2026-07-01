@@ -212,14 +212,22 @@ jobs:
         with:
           path: artifacts
 
+      - name: Normalize installer filenames
+        # README download buttons point at releases/latest/download/<stable-name>,
+        # so release assets must use version-less names on every release.
+        run: |
+          mv artifacts/OctoSlave-macOS/*.dmg       artifacts/OctoSlave-macOS/OctoSlave-macOS.dmg
+          mv artifacts/OctoSlave-Windows/*.exe     artifacts/OctoSlave-Windows/OctoSlave-Windows-Installer.exe
+          mv artifacts/OctoSlave-Linux/*.AppImage  artifacts/OctoSlave-Linux/OctoSlave-x86_64.AppImage
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/OctoSlave-macOS/*.dmg
-            artifacts/OctoSlave-Windows/*.exe
-            artifacts/OctoSlave-Linux/*.AppImage
-          draft: true
+            artifacts/OctoSlave-macOS/OctoSlave-macOS.dmg
+            artifacts/OctoSlave-Windows/OctoSlave-Windows-Installer.exe
+            artifacts/OctoSlave-Linux/OctoSlave-x86_64.AppImage
+          draft: false
           prerelease: false
           generate_release_notes: true
         env:
