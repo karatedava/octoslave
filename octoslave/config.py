@@ -579,6 +579,7 @@ def load_config() -> dict:
         "role_models_ollama": {},
         "custom_providers": [],     # list of {id, name, base_url, api_key, default_model, models?}
         "mcp_servers": [],          # list of {name, enabled, command/args/env | url/headers}
+        "remotes": [],              # list of {id, name, host, user, port, remote_dir, identity_file}
     }
     # Env vars override config file
     if os.environ.get("OCTOSLAVE_API_KEY"):
@@ -626,6 +627,12 @@ def load_config() -> dict:
             if isinstance(mcp, list):
                 config["mcp_servers"] = [
                     s for s in mcp if isinstance(s, dict) and s.get("name")
+                ]
+            # Remote (SSH) targets — only loaded from file
+            remotes = saved.get("remotes")
+            if isinstance(remotes, list):
+                config["remotes"] = [
+                    r for r in remotes if isinstance(r, dict) and r.get("id")
                 ]
             # role_models_* are dicts — no env-var override, just load from file.
             # We also pick up role_models_<custom-id> dynamically.
@@ -811,6 +818,104 @@ def remove_custom_provider(provider_id: str) -> bool:
         cfg["backend"] = "einfra"
     # Drop any role_models_<id> entries for the removed provider
     cfg.pop(f"role_models_{provider_id}", None)
+    _write_config_file(cfg)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Remote (SSH) targets CRUD
+# ---------------------------------------------------------------------------
+
+def _normalize_remote(r: dict) -> dict:
+    """Return a clean remote-target dict from raw user input."""
+    rid = _normalize_provider_id(r.get("id") or r.get("name") or r.get("host") or "")
+    name = (r.get("name") or rid or "").strip() or rid
+    host = (r.get("host") or "").strip()
+    user = (r.get("user") or "").strip()
+    # Optional: unset ("") means "start in the remote home directory", resolved
+    # on connect. The working dir is then chosen by browsing the remote host.
+    remote_dir = (r.get("remote_dir") or "").strip()
+    identity_file = (r.get("identity_file") or "").strip()
+    try:
+        port = int(r.get("port") or 22)
+    except (ValueError, TypeError):
+        port = 22
+    return {
+        "id": rid,
+        "name": name,
+        "host": host,
+        "user": user,
+        "port": port,
+        "remote_dir": remote_dir,
+        "identity_file": identity_file,
+    }
+
+
+def _validate_remote(r: dict) -> str | None:
+    """Return an error message if the remote is invalid, else None."""
+    if not r.get("id"):
+        return "Remote id is required."
+    if not r.get("host"):
+        return "Host is required."
+    return None
+
+
+def get_remotes(cfg: dict | None = None) -> list[dict]:
+    """Return the list of user-defined remote (SSH) targets."""
+    if cfg is None:
+        cfg = load_config()
+    remotes = cfg.get("remotes") or []
+    return [r for r in remotes if isinstance(r, dict) and r.get("id")]
+
+
+def get_remote(cfg: dict | None, remote_id: str) -> dict | None:
+    """Return the remote target with this id, or None."""
+    if not remote_id:
+        return None
+    for r in get_remotes(cfg):
+        if r.get("id") == remote_id:
+            return r
+    return None
+
+
+def add_remote(remote: dict) -> dict:
+    """Add a new remote target. Raises ValueError on validation errors."""
+    r = _normalize_remote(remote)
+    err = _validate_remote(r)
+    if err:
+        raise ValueError(err)
+    cfg = load_config()
+    existing = cfg.get("remotes") or []
+    if any(e.get("id") == r["id"] for e in existing):
+        raise ValueError(f"Remote id '{r['id']}' already exists.")
+    existing.append(r)
+    cfg["remotes"] = existing
+    _write_config_file(cfg)
+    return r
+
+
+def update_remote(remote_id: str, fields: dict) -> dict:
+    """Patch an existing remote target. id is immutable."""
+    cfg = load_config()
+    existing = cfg.get("remotes") or []
+    for i, e in enumerate(existing):
+        if e.get("id") == remote_id:
+            merged = {**e, **fields, "id": remote_id}
+            existing[i] = _normalize_remote(merged)
+            cfg["remotes"] = existing
+            _write_config_file(cfg)
+            return existing[i]
+    raise ValueError(f"Remote '{remote_id}' not found.")
+
+
+def remove_remote(remote_id: str) -> bool:
+    """Remove a remote target. Returns True if removed."""
+    cfg = load_config()
+    existing = cfg.get("remotes") or []
+    new_list = [e for e in existing if e.get("id") != remote_id]
+    if len(new_list) == len(existing):
+        return False
+    cfg["remotes"] = new_list
     _write_config_file(cfg)
     return True
 

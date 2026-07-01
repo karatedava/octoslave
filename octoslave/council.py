@@ -45,6 +45,7 @@ from openai import OpenAI
 
 from . import display
 from . import logger
+from . import interrupt
 from .agent import (
     MAX_ITERATIONS,
     _robust_stream,
@@ -59,7 +60,7 @@ from .agent import (
     load_session_memory,
     _rt,
 )
-from .tools import execute_tool, all_tool_definitions, valid_tool_names, init_mcp
+from .tools import execute_tool, all_tool_definitions, valid_tool_names, init_mcp, configure_execution
 from .config import (
     load_config,
     resolve_backend,
@@ -504,6 +505,12 @@ def _council_loop(
 
     while iteration < MAX_ITERATIONS:
         iteration += 1
+        # User-requested stop (web UI) — caught between turns; the mid-stream
+        # check in _stream_completion handles aborts during generation.
+        if interrupt.should_stop():
+            display.print_interrupted(iteration - 1)
+            logger.log_session_end(iteration, reason="interrupted")
+            return messages
         # Force a tool call until the worker has actually DONE something. The
         # orient+plan preamble ends with the worker promising to execute, and
         # some models then narrate ("I will now…") or falsely claim completion
@@ -519,7 +526,7 @@ def _council_loop(
             continue
         if signal == "interrupt":
             display.stream_end(False)
-            display.console.print("\n[dim]Interrupted.[/dim]")
+            display.print_interrupted(iteration)
             logger.log_session_end(iteration, reason="interrupted")
             return messages
         if signal == "fatal":
@@ -809,6 +816,7 @@ def run_council_agent(
     enable_memory: bool = True,
     plan_out: list | None = None,
     ultra: bool = False,
+    remote: dict | None = None,
 ) -> list[dict]:
     """Run one task through the council. Same return shape as ``agent.run_agent``.
 
@@ -817,6 +825,7 @@ def run_council_agent(
     if permission_mode is None:
         permission_mode = load_config().get("permission_mode", "autonomous")
 
+    configure_execution(remote)
     init_mcp(working_dir=working_dir)
     # Worker model drives tool knobs; council only runs on cloud backends so this
     # is a no-op for context sizing but keeps _rt() consistent.
@@ -845,14 +854,17 @@ def run_council_agent(
     ]
 
     plan_text = ""
-    if enable_plan:
-        messages, plan_text = _thinker_plan(
-            client, roles, task, messages, working_dir, permission_mode, ultra=ultra
-        )
-        if plan_text and plan_out is not None:
-            plan_out.append(plan_text)
+    try:
+        if enable_plan:
+            messages, plan_text = _thinker_plan(
+                client, roles, task, messages, working_dir, permission_mode, ultra=ultra
+            )
+            if plan_text and plan_out is not None:
+                plan_out.append(plan_text)
 
-    return _council_loop(messages, roles, task, plan_text, working_dir, client, permission_mode, ultra=ultra)
+        return _council_loop(messages, roles, task, plan_text, working_dir, client, permission_mode, ultra=ultra)
+    finally:
+        configure_execution(None)
 
 
 def continue_council_agent(
@@ -863,11 +875,16 @@ def continue_council_agent(
     working_dir: str,
     permission_mode: str | None = None,
     ultra: bool = False,
+    remote: dict | None = None,
 ) -> list[dict]:
     """Follow-up turn in council mode (no re-plan; Worker continues with gating)."""
     if permission_mode is None:
         permission_mode = load_config().get("permission_mode", "autonomous")
+    configure_execution(remote)
     init_mcp(working_dir=working_dir)
     configure_runtime(client, roles["worker"], "base")
     messages.append({"role": "user", "content": follow_up})
-    return _council_loop(messages, roles, follow_up, "", working_dir, client, permission_mode, ultra=ultra)
+    try:
+        return _council_loop(messages, roles, follow_up, "", working_dir, client, permission_mode, ultra=ultra)
+    finally:
+        configure_execution(None)

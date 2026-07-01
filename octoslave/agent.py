@@ -24,6 +24,7 @@ _STREAM_READ_TIMEOUT = httpx.Timeout(300.0, connect=30.0)
 
 from . import display
 from . import logger
+from . import interrupt
 from .tools import TOOL_DEFINITIONS, execute_tool, all_tool_definitions, valid_tool_names
 from .config import load_config, OLLAMA_BASE_URL
 
@@ -1135,6 +1136,13 @@ def _stream_completion(client: OpenAI, model: str, messages: list, force_tool: b
         **extra,
     ) as stream:
         for chunk in stream:
+            # User-requested stop (web UI): abort the stream promptly. Inside the
+            # main loop this is caught by _robust_stream (StopRequested subclasses
+            # KeyboardInterrupt) and surfaced as the existing "interrupt" signal;
+            # when _stream_completion is called directly (orientation / planning
+            # phases) it propagates to the top-level handler in the web layer.
+            if interrupt.should_stop():
+                raise interrupt.StopRequested
             if not chunk.choices:
                 continue
             choice = chunk.choices[0]
@@ -1201,13 +1209,19 @@ def run_agent(
     enable_memory: bool = True,
     plan_out: list | None = None,
     verify_out: list | None = None,
+    remote: dict | None = None,
 ) -> list[dict]:
     if permission_mode is None:
         cfg = load_config()
         permission_mode = cfg.get("permission_mode", "autonomous")
 
+    # Route filesystem/bash tools to a remote host over SSH for this thread, or
+    # keep them local (default). Reset in the finally so a later local task on
+    # the same thread is unaffected.
+    from .tools import init_mcp, configure_execution
+    configure_execution(remote)
+
     # Connect any user-configured MCP servers (idempotent across calls).
-    from .tools import init_mcp
     init_mcp(working_dir=working_dir)
 
     # Adapt context/tool knobs to the backend (small-model accommodations for
@@ -1262,18 +1276,21 @@ def run_agent(
     elif enable_plan and is_local:
         display.print_info("Local model: skipping separate planning step (plans inline).")
 
-    # Main agent loop
-    messages = _agent_loop(messages, model, working_dir, client, permission_mode)
+    try:
+        # Main agent loop
+        messages = _agent_loop(messages, model, working_dir, client, permission_mode)
 
-    # Post-loop verification pass
-    if enable_verify:
-        display.print_info("Verifying…")
-        verdict = _verify_completion(messages, task, client, model)
-        if verdict:
-            logger.log_verify(verdict)
-            display.print_verify(verdict)
-            if verify_out is not None:
-                verify_out.append(verdict)
+        # Post-loop verification pass
+        if enable_verify:
+            display.print_info("Verifying…")
+            verdict = _verify_completion(messages, task, client, model)
+            if verdict:
+                logger.log_verify(verdict)
+                display.print_verify(verdict)
+                if verify_out is not None:
+                    verify_out.append(verdict)
+    finally:
+        configure_execution(None)
 
     return messages
 
@@ -1285,12 +1302,14 @@ def continue_agent(
     working_dir: str,
     client: OpenAI,
     permission_mode: str = None,
+    remote: dict | None = None,
 ) -> list[dict]:
     if permission_mode is None:
         cfg = load_config()
         permission_mode = cfg.get("permission_mode", "autonomous")
 
-    from .tools import init_mcp
+    from .tools import init_mcp, configure_execution
+    configure_execution(remote)
     init_mcp(working_dir=working_dir)
 
     # Re-apply backend-adaptive knobs (per-thread state may be stale/unset on a
@@ -1299,7 +1318,10 @@ def continue_agent(
     configure_runtime(client, model, prompt_profile)
 
     messages.append({"role": "user", "content": follow_up})
-    return _agent_loop(messages, model, working_dir, client, permission_mode)
+    try:
+        return _agent_loop(messages, model, working_dir, client, permission_mode)
+    finally:
+        configure_execution(None)
 
 
 def _robust_stream(
@@ -1458,6 +1480,12 @@ def _agent_loop(
 
     while iteration < MAX_ITERATIONS:
         iteration += 1
+        # User-requested stop (web UI) — caught here between turns (e.g. while a
+        # tool was running) in addition to the mid-stream check.
+        if interrupt.should_stop():
+            display.print_interrupted(iteration - 1)
+            logger.log_session_end(iteration, reason="interrupted")
+            return messages
         # Force a tool call only on the very first turn — kick-starts models that
         # would otherwise reply with chit-chat. After that, leave tool_choice="auto"
         # so a model that has finished can naturally return a text-only "done"
@@ -1471,7 +1499,7 @@ def _agent_loop(
             continue
         if _signal == "interrupt":
             display.stream_end(False)
-            display.console.print("\n[dim]Interrupted.[/dim]")
+            display.print_interrupted(iteration)
             logger.log_session_end(iteration, reason="interrupted")
             return messages
         if _signal == "fatal":

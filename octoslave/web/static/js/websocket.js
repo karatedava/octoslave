@@ -221,16 +221,22 @@ export function applyConfig(data) {
   if (model && sel.querySelector(`option[value="${safeCssEscape(model)}"]`)) {
     sel.value = model;
   }
-  document.getElementById('chat-dir-input').value     = dir;
+  // Working dir → canonical appState; reflects into the hero picker + Settings.
+  if (typeof window.setWorkingDir === 'function') window.setWorkingDir(dir);
 
   document.getElementById('settings-api-key').value     = data?.has_api_key ? '••••••••' : '';
   document.getElementById('settings-nim-api-key').value = data?.has_nim_key  ? '••••••••' : '';
   document.getElementById('settings-base-url').value    = url;
   document.getElementById('settings-model').value       = model;
-  document.getElementById('settings-working-dir').value = dir;
   document.getElementById('settings-backend').value     = backend;
 
   applyBackend(backend);
+
+  // Remote (SSH) targets — populate the exec toggle + Settings card.
+  if (Array.isArray(data?.remotes)) state.remotes = data.remotes;
+  if ('remote_id' in (data || {})) state.remoteId = data.remote_id || null;
+  window.renderExecToggle?.();
+  window.renderRemotesCard?.();
 
   window.appState = state;
 }

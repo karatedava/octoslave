@@ -25,6 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from .. import display
+from .. import interrupt
 from ..display import resolve_permission, resolve_user_response
 from ..agent import continue_agent, make_client, run_agent, list_prompt_profiles
 from ..council import (
@@ -37,6 +38,7 @@ from ..config import (
     get_custom_provider,
     add_custom_provider, update_custom_provider, remove_custom_provider,
     get_mcp_servers, add_mcp_server, remove_mcp_server, set_mcp_server_enabled,
+    get_remotes, get_remote, add_remote, remove_remote,
 )
 
 # ---------------------------------------------------------------------------
@@ -358,6 +360,78 @@ async def pick_directory():
     return {"path": path}
 
 
+@app.get("/api/remotes")
+async def list_remotes():
+    """Return configured remote (SSH) targets (secrets are just file paths)."""
+    return {"remotes": get_remotes()}
+
+
+@app.post("/api/remotes")
+async def create_remote(payload: dict):
+    """Add a new remote SSH target."""
+    try:
+        r = add_remote(payload or {})
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "remote": r}
+
+
+@app.delete("/api/remotes/{remote_id}")
+async def delete_remote(remote_id: str):
+    ok = remove_remote(remote_id)
+    return {"ok": ok}
+
+
+@app.post("/api/remotes/test")
+async def test_remote(payload: dict):
+    """Probe SSH reachability for an existing (id) or ad-hoc remote config."""
+    import asyncio
+    import concurrent.futures
+    from ..remote import RemoteSession
+
+    remote = None
+    if payload.get("id"):
+        remote = get_remote(None, payload["id"])
+    if remote is None:
+        remote = payload or {}
+    if not remote.get("host"):
+        return {"ok": False, "message": "host is required"}
+
+    def _check():
+        try:
+            return RemoteSession.get(remote).check()
+        except Exception as exc:  # pragma: no cover - defensive
+            return False, str(exc)
+
+    loop = asyncio.get_running_loop()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        ok, message = await loop.run_in_executor(pool, _check)
+    return {"ok": ok, "message": message}
+
+
+@app.get("/api/remote-dirs")
+async def remote_dirs(remote_id: str, path: str = ""):
+    """Browse directories on a remote host (for the working-dir picker)."""
+    import asyncio
+    import concurrent.futures
+    from ..remote import RemoteSession
+
+    remote = get_remote(None, remote_id)
+    if not remote:
+        return {"ok": False, "error": f"No remote with id '{remote_id}'."}
+
+    def _ls():
+        try:
+            ok, cwd, dirs, err = RemoteSession.get(remote).list_dirs(path)
+            return {"ok": ok, "path": cwd, "dirs": dirs, "error": err}
+        except Exception as exc:  # pragma: no cover - defensive
+            return {"ok": False, "error": str(exc)}
+
+    loop = asyncio.get_running_loop()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return await loop.run_in_executor(pool, _ls)
+
+
 @app.get("/api/files/view/{file_path:path}")
 async def view_file(file_path: str):
     """Serve a file for inline viewing in the browser."""
@@ -396,6 +470,7 @@ async def ws_endpoint(websocket: WebSocket):
         "working_dir": ".",
         "model": None,
         "running": False,
+        "remote_id": None,    # active remote (SSH) target id, or None = local
     }
 
     # Async queue bridged from sync threads via loop.call_soon_threadsafe
@@ -429,6 +504,11 @@ async def ws_endpoint(websocket: WebSocket):
                         resolve_permission(bool(msg.get("allow", False)))
                     elif mt == "user_response":
                         resolve_user_response(str(msg.get("answer", "")))
+                    # ---- stop the running chat/council agent ----
+                    elif mt in ("stop", "stop_chat"):
+                        ident = state.get("agent_ident")
+                        if ident and interrupt.request_stop(ident):
+                            event_q.put_nowait({"type": "info", "text": "⏹ Stopping…"})
                     # ---- live lab controls (handled while a lab is running) ----
                     elif mt == "inject":
                         sess = state.get("lab_session")
@@ -482,6 +562,8 @@ async def ws_endpoint(websocket: WebSocket):
             "has_nim_key": bool(cfg.get("nim_api_key", "")),
             "working_dir": ".",
             "prompt_profile": cfg.get("prompt_profile", "base"),
+            "remotes": get_remotes(cfg),
+            "remote_id": state.get("remote_id"),
         }})
     except Exception as exc:
         await send({"type": "error", "text": f"Config load error: {exc}"})
@@ -511,6 +593,8 @@ async def ws_endpoint(websocket: WebSocket):
                         "has_nim_key": bool(cfg.get("nim_api_key", "")),
                         "working_dir": state["working_dir"],
                         "prompt_profile": cfg.get("prompt_profile", "base"),
+                        "remotes": get_remotes(cfg),
+                        "remote_id": state.get("remote_id"),
                     }})
                 except Exception as exc:
                     await send({"type": "error", "text": str(exc)})
@@ -532,6 +616,27 @@ async def ws_endpoint(websocket: WebSocket):
                 wd = msg.get("working_dir", ".")
                 state["working_dir"] = wd
                 await send({"type": "ok", "working_dir": wd})
+
+            elif mtype == "set_remote":
+                # remote_id "" / null → back to local execution.
+                rid = msg.get("remote_id") or None
+                if rid and get_remote(None, rid) is None:
+                    await send({"type": "error", "text": f"No remote with id '{rid}'."})
+                else:
+                    state["remote_id"] = rid
+                    remote = get_remote(None, rid) if rid else None
+                    # Switching to a remote → start in its home directory (or the
+                    # optional configured dir). Resolved over SSH off the loop.
+                    if remote and msg.get("adopt_dir", True):
+                        import asyncio as _asyncio
+                        import concurrent.futures as _cf
+                        from ..remote import resolve_start_dir
+                        _loop = _asyncio.get_running_loop()
+                        with _cf.ThreadPoolExecutor(max_workers=1) as _pool:
+                            state["working_dir"] = await _loop.run_in_executor(
+                                _pool, resolve_start_dir, remote)
+                    await send({"type": "ok", "remote_id": rid, "set_remote": True,
+                                "working_dir": state["working_dir"]})
 
             elif mtype == "switch_backend":
                 """Handle backend switching (ollama / einfra / nim / <custom-id>)."""
@@ -865,6 +970,14 @@ async def ws_endpoint(websocket: WebSocket):
                 new_conv = (mtype in ("chat", "chat_new")) or (not state["messages"])
                 state["model"] = model
                 state["working_dir"] = working_dir
+                # Remote execution target: explicit per-message id wins, else the
+                # session's current selection. None → local (default).
+                remote_id = msg.get("remote_id") if "remote_id" in msg else state.get("remote_id")
+                state["remote_id"] = remote_id
+                remote = get_remote(None, remote_id) if remote_id else None
+                if remote:
+                    await send({"type": "info",
+                                "text": f"⇅ remote: {remote.get('name')} ({remote.get('host')}:{working_dir})"})
                 state["running"] = True
                 if state.get("backend"):
                     cfg["backend"] = state["backend"]
@@ -904,26 +1017,42 @@ async def ws_endpoint(websocket: WebSocket):
                     })
 
                 def chat_fn(txt=message_text, mdl=model, wd=working_dir, new=new_conv,
-                           pp=prompt_profile, pm=permission_mode, roles=council_roles, ultra=use_ultra):
+                           pp=prompt_profile, pm=permission_mode, roles=council_roles, ultra=use_ultra,
+                           rmt=remote):
                     display.set_event_callback(make_emit())
+                    # Allow this run to be interrupted from the UI (Stop button).
+                    interrupt.register()
+                    state["agent_ident"] = threading.get_ident()
                     try:
                         if roles:
                             if new:
                                 result = run_council_agent(txt, wd, client, roles,
-                                                           prompt_profile=pp, permission_mode=pm, ultra=ultra)
+                                                           prompt_profile=pp, permission_mode=pm, ultra=ultra,
+                                                           remote=rmt)
                             else:
                                 result = continue_council_agent(state["messages"], txt, client,
-                                                                roles, wd, pm, ultra=ultra)
+                                                                roles, wd, pm, ultra=ultra, remote=rmt)
                         elif new:
-                            result = run_agent(txt, mdl, wd, client, pp, pm)
+                            result = run_agent(txt, mdl, wd, client, pp, pm, remote=rmt)
                         else:
-                            result = continue_agent(state["messages"], txt, mdl, wd, client, pm)
+                            result = continue_agent(state["messages"], txt, mdl, wd, client, pm, remote=rmt)
                         state["messages"] = result
+                    except interrupt.StopRequested:
+                        # Stop requested during a phase that calls the model
+                        # directly (orientation / planning). The main loop handles
+                        # its own stop and never reaches here. Emit a stopped-done
+                        # so the UI resets; prior history (if any) is preserved.
+                        loop.call_soon_threadsafe(
+                            event_q.put_nowait,
+                            {"type": "done", "iterations": 0, "stopped": True},
+                        )
                     except Exception as exc:
                         loop.call_soon_threadsafe(
                             event_q.put_nowait, {"type": "error", "text": str(exc)}
                         )
                     finally:
+                        interrupt.unregister()
+                        state["agent_ident"] = None
                         display.clear_event_callback()
                         loop.call_soon_threadsafe(event_q.put_nowait, {"type": "_sentinel"})
 

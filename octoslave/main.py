@@ -34,6 +34,7 @@ from .config import (
     get_custom_providers, get_custom_provider,
     add_custom_provider, update_custom_provider, remove_custom_provider,
     get_mcp_servers, add_mcp_server, remove_mcp_server, set_mcp_server_enabled,
+    get_remotes, get_remote, add_remote, remove_remote,
 )
 
 # ---------------------------------------------------------------------------
@@ -81,14 +82,16 @@ _HISTORY_FILE = Path.home() / ".octoslave" / "history"
 @click.option("--no-plan", "disable_plan", is_flag=True, default=False, help="Skip the upfront planning step")
 @click.option("--verify", is_flag=True, default=False, help="Run a verification pass after each task to grade completion")
 @click.option("--no-memory", "disable_memory", is_flag=True, default=False, help="Do not load or save project memory")
+@click.option("--remote", "remote_id", default=None, help="Run tools on a configured remote host over SSH (see `/remote`)")
 @click.pass_context
-def cli(ctx, model, working_dir, api_key, base_url, local, prompt_profile, permission_mode, verbose, disable_plan, verify, disable_memory):
+def cli(ctx, model, working_dir, api_key, base_url, local, prompt_profile, permission_mode, verbose, disable_plan, verify, disable_memory, remote_id):
     """OctoSlave — autonomous AI research & coding assistant.
 
     Run without arguments to enter interactive mode.
     """
     ctx.ensure_object(dict)
     ctx.obj["model"] = model
+    ctx.obj["remote_id"] = remote_id
     ctx.obj["working_dir"] = working_dir
     ctx.obj["api_key"] = api_key
     ctx.obj["base_url"] = base_url
@@ -144,7 +147,9 @@ def cli(ctx, model, working_dir, api_key, base_url, local, prompt_profile, permi
                    "Shorter than --parallel? rotates through the list.")
 @click.option("--judge-model", "judge_model", default=None,
               help="Model used for the judge / vote-tally / merge step (defaults to --model).")
-def run(task, model, working_dir, api_key, base_url, local, prompt_profile, interactive, permission_mode, verbose, new_project, disable_plan, verify, disable_memory, parallel_n, strategy, parallel_models, parallel_profiles, judge_model):
+@click.option("--remote", "remote_id", default=None,
+              help="Run tools on a configured remote host over SSH (see `/remote`).")
+def run(task, model, working_dir, api_key, base_url, local, prompt_profile, interactive, permission_mode, verbose, new_project, disable_plan, verify, disable_memory, parallel_n, strategy, parallel_models, parallel_profiles, judge_model, remote_id):
     """Run a single TASK and exit (or continue interactively with -i).
 
     \b
@@ -177,6 +182,22 @@ def run(task, model, working_dir, api_key, base_url, local, prompt_profile, inte
     enable_verify = verify
     enable_memory = not disable_memory
 
+    # Resolve a --remote target: tools run on the remote host, starting in its dir.
+    remote = None
+    if remote_id:
+        remote = get_remote(None, remote_id)
+        if not remote:
+            display.print_error(f"No remote with id '{remote_id}'. See `ots` then /remote list.")
+            sys.exit(1)
+        cfg["remote"] = remote
+        # A remote path must NOT be resolved against the local filesystem
+        # (_resolve_config already did that); use the raw path, or the remote home.
+        if working_dir:
+            cfg["working_dir"] = working_dir
+        else:
+            from .remote import resolve_start_dir
+            cfg["working_dir"] = resolve_start_dir(remote)
+
     # Only create project dir if explicitly requested with -n
     if new_project and not working_dir:
         cfg["working_dir"] = _make_project_dir(task)
@@ -190,6 +211,11 @@ def run(task, model, working_dir, api_key, base_url, local, prompt_profile, inte
         cfg["permission_mode"] = saved_cfg.get("permission_mode", "autonomous")
 
     display.print_header(cfg["model"], cfg["working_dir"], backend=cfg["backend"])
+    if remote:
+        display.console.print(
+            f"[dim]⇅ remote:[/dim] [bold]{remote.get('name')}[/bold] "
+            f"[dim]({remote.get('user','') + '@' if remote.get('user') else ''}{remote.get('host')}:{cfg['working_dir']})[/dim]"
+        )
 
     # Show permission mode in header
     if cfg["permission_mode"] == "autonomous":
@@ -269,6 +295,7 @@ def run(task, model, working_dir, api_key, base_url, local, prompt_profile, inte
         enable_verify=enable_verify,
         enable_memory=enable_memory,
         verify_out=verify_out,
+        remote=remote,
     )
 
     if enable_memory:
@@ -294,6 +321,26 @@ def run(task, model, working_dir, api_key, base_url, local, prompt_profile, inte
 #   ots improved              → interactive TUI
 #   ots improved run "task"   → one-shot, non-interactive (mirrors `ots run`)
 # ---------------------------------------------------------------------------
+
+def _apply_remote_id(cfg: dict, remote_id: str | None, raw_dir: str | None = None) -> None:
+    """Resolve a --remote id onto cfg (sets cfg['remote'] + remote working dir).
+
+    ``raw_dir`` is the un-resolved ``-d`` path — a remote path must not be run
+    through the local ``Path.resolve()`` that ``_resolve_config`` applies.
+    """
+    if not remote_id:
+        return
+    remote = get_remote(None, remote_id)
+    if not remote:
+        display.print_error(f"No remote with id '{remote_id}'. See `ots` then /remote list.")
+        return
+    from .remote import resolve_start_dir
+    cfg["remote"] = remote
+    if raw_dir:
+        cfg["working_dir"] = raw_dir
+    else:
+        cfg["working_dir"] = resolve_start_dir(remote)
+
 
 def _council_overrides(worker, thinker, verifier) -> dict:
     """Merge CLI flags with OCTOSLAVE_COUNCIL_* env into a role-override dict."""
@@ -410,8 +457,11 @@ def improved(ctx, model, working_dir, api_key, base_url, prompt_profile,
         enable_memory=ctx.obj.get("enable_memory", True),
         ultra=ultra,
     )
+    _apply_remote_id(cfg, ctx.obj.get("remote_id"), raw_dir=working_dir)
     banner_model = "🐙 council" if cfg.get("council") else cfg["model"]
     display.print_welcome(banner_model, cfg["working_dir"], backend=cfg["backend"])
+    if cfg.get("remote"):
+        display.console.print(f"[dim]⇅ remote:[/dim] [bold]{cfg['remote'].get('name')}[/bold] [dim]({cfg['working_dir']})[/dim]")
     if cfg.get("council"):
         print_council_roles(cfg["council_roles"], cfg.get("council_notes"), ultra=cfg.get("ultra", False))
     display.console.print()
@@ -474,12 +524,18 @@ def improved_run(ctx, task, working_dir, prompt_profile, interactive, permission
         enable_plan=enable_plan, enable_memory=enable_memory, ultra=ultra,
     )
 
+    if working_dir:
+        cfg["explicit_dir"] = True
+    _apply_remote_id(cfg, (ctx.obj or {}).get("remote_id"), raw_dir=working_dir)
+
     if new_project and not working_dir:
         cfg["working_dir"] = _make_project_dir(task)
         display.console.print(f"[dim]📁 project dir:[/dim] [bold]{cfg['working_dir']}[/bold]")
 
     banner_model = "🐙 council" if cfg.get("council") else cfg["model"]
     display.print_header(banner_model, cfg["working_dir"], backend=cfg["backend"])
+    if cfg.get("remote"):
+        display.console.print(f"[dim]⇅ remote:[/dim] [bold]{cfg['remote'].get('name')}[/bold] [dim]({cfg['working_dir']})[/dim]")
     if cfg["permission_mode"] == "autonomous":
         mode_tag = "[bold #7fd88f]autonomous[/bold #7fd88f]"
     elif cfg["permission_mode"] == "controlled":
@@ -500,6 +556,7 @@ def improved_run(ctx, task, working_dir, prompt_profile, interactive, permission
             enable_plan=enable_plan,
             enable_memory=enable_memory,
             ultra=cfg.get("ultra", False),
+            remote=cfg.get("remote"),
         )
     else:
         # Ollama fallback — council unavailable, drive the normal single agent.
@@ -508,6 +565,7 @@ def improved_run(ctx, task, working_dir, prompt_profile, interactive, permission
             cfg["prompt_profile"], cfg["permission_mode"],
             enable_plan=enable_plan, enable_verify=False,
             enable_memory=enable_memory,
+            remote=cfg.get("remote"),
         )
 
     if enable_memory:
@@ -950,6 +1008,21 @@ def _interactive(ctx_obj: dict):
     cfg["enable_verify"] = ctx_obj.get("enable_verify", False)
     cfg["enable_memory"] = ctx_obj.get("enable_memory", True)
 
+    # Resolve a --remote target: execute tools on the remote host and start in
+    # its configured directory.
+    if ctx_obj.get("remote_id"):
+        remote = get_remote(None, ctx_obj["remote_id"])
+        if remote:
+            from .remote import resolve_start_dir
+            cfg["remote"] = remote
+            if cfg.get("explicit_dir"):
+                # Raw remote path — don't use the locally-resolved value.
+                cfg["working_dir"] = ctx_obj.get("working_dir")
+            else:
+                cfg["working_dir"] = resolve_start_dir(remote)
+        else:
+            display.print_error(f"No remote with id '{ctx_obj['remote_id']}'. See `ots` then /remote list.")
+
     # Handle permission mode from CLI or config
     if ctx_obj.get("permission_mode"):
         cfg["permission_mode"] = ctx_obj["permission_mode"]
@@ -968,7 +1041,13 @@ def _interactive(ctx_obj: dict):
         sys.exit(1)
 
     display.print_welcome(cfg["model"], cfg["working_dir"], backend=cfg["backend"])
-    
+    if cfg.get("remote"):
+        _r = cfg["remote"]
+        display.console.print(
+            f"[dim]⇅ remote:[/dim] [bold]{_r.get('name')}[/bold] "
+            f"[dim]({_r.get('user','') + '@' if _r.get('user') else ''}{_r.get('host')}:{cfg['working_dir']})[/dim]"
+        )
+
     # Show permission mode
     if cfg["permission_mode"] == "autonomous":
         mode_tag = "[bold #7fd88f]autonomous[/bold #7fd88f]"
@@ -1007,6 +1086,7 @@ def _repl_loop(client, cfg: dict, messages: list[dict]):
         "council":       cfg.get("council", False),         # improved (council) mode on?
         "council_roles": cfg.get("council_roles") or {},    # {worker,thinker,verifier}
         "ultra":         cfg.get("ultra", False),            # deeper best-of-N orchestration?
+        "remote":        cfg.get("remote") or None,          # remote SSH target dict, or None=local
     }
     if state["verbose"]:
         display.set_verbose(True)
@@ -1064,12 +1144,14 @@ def _repl_loop(client, cfg: dict, messages: list[dict]):
                         messages, user_input, client, state["council_roles"],
                         state["working_dir"], state["permission_mode"],
                         ultra=state.get("ultra", False),
+                        remote=state.get("remote"),
                     )
                 else:
                     messages = continue_agent(
                         messages, user_input, state["model"],
                         state["working_dir"], client,
-                        state["permission_mode"]
+                        state["permission_mode"],
+                        remote=state.get("remote"),
                     )
             else:
                 plan_out: list[str] = []
@@ -1084,6 +1166,7 @@ def _repl_loop(client, cfg: dict, messages: list[dict]):
                         enable_memory=state["enable_memory"],
                         plan_out=plan_out,
                         ultra=state.get("ultra", False),
+                        remote=state.get("remote"),
                     )
                 else:
                     messages = run_agent(
@@ -1096,6 +1179,7 @@ def _repl_loop(client, cfg: dict, messages: list[dict]):
                         enable_memory=state["enable_memory"],
                         plan_out=plan_out,
                         verify_out=verify_out,
+                        remote=state.get("remote"),
                     )
                 if plan_out:
                     state["current_plan"] = plan_out[0]
@@ -1197,7 +1281,15 @@ def _handle_slash(cmd: str, state: dict, cfg: dict, messages: list, client) -> s
 
     if name == "/dir":
         if not arg:
-            display.console.print(f"[dim]Working dir:[/dim] {state['working_dir']}")
+            where = "remote dir" if state.get("remote") else "Working dir"
+            display.console.print(f"[dim]{where}:[/dim] {state['working_dir']}")
+        elif state.get("remote"):
+            # Remote mode: the path lives on the remote host — no local validation.
+            import posixpath as _pp
+            new_dir = arg if _pp.isabs(arg) else _pp.normpath(_pp.join(state["working_dir"], arg))
+            state["working_dir"] = new_dir
+            display.console.print(f"[dim]Remote dir set to[/dim] {new_dir}")
+            messages.clear()
         else:
             new_dir = str(Path(arg).expanduser().resolve())
             if not Path(new_dir).is_dir():
@@ -1207,6 +1299,9 @@ def _handle_slash(cmd: str, state: dict, cfg: dict, messages: list, client) -> s
                 display.console.print(f"[dim]Dir set to[/dim] {new_dir}")
                 messages.clear()
         return "ok"
+
+    if name == "/remote":
+        return _handle_remote_command(arg, state, messages)
 
     if name == "/new-project":
         task_hint = arg if arg else "project"
@@ -1818,6 +1913,139 @@ def _handle_provider_command(arg: str, state: dict, messages: list) -> str:
     return "ok"
 
 
+def _remote_add_wizard() -> dict | None:
+    """Interactive prompts to register a new remote SSH target."""
+    display.console.print("[bold]Add remote SSH target[/bold]")
+    try:
+        host = click.prompt("Host (e.g. gpu.example.org)").strip()
+        rid = click.prompt("Id (short handle)", default=host.split(".")[0]).strip().lower()
+        name = click.prompt("Display name", default=rid).strip() or rid
+        user = click.prompt("SSH user (blank = ssh default)", default="", show_default=False).strip()
+        port = click.prompt("Port", default=22, type=int)
+        identity = click.prompt("Identity file (private key path, optional)",
+                                default="", show_default=False).strip()
+    except click.Abort:
+        display.console.print("[dim]Cancelled.[/dim]")
+        return None
+    try:
+        r = add_remote({
+            "id": rid, "name": name, "host": host, "user": user,
+            "port": port, "identity_file": identity,
+        })
+    except ValueError as exc:
+        display.print_error(str(exc))
+        return None
+    display.console.print(f"[bold green]✓ Remote '{r['id']}' added.[/bold green]")
+    return r
+
+
+def _handle_remote_command(arg: str, state: dict, messages: list) -> str:
+    """Switch execution between the local machine and a remote host over SSH.
+
+    /remote                  — show the current target + reachability
+    /remote list             — list configured remotes
+    /remote local            — switch back to local (default)
+    /remote <id>             — switch to a configured remote (SSH)
+    /remote add              — register a new remote (wizard)
+    /remote remove <id>      — delete a remote
+    """
+    from .remote import RemoteSession, resolve_start_dir
+
+    tokens = arg.split() if arg else []
+    sub = tokens[0].lower() if tokens else ""
+
+    if not sub:
+        cur = state.get("remote")
+        if cur:
+            display.console.print(
+                f"[dim]Execution:[/dim] [bold]remote[/bold] → {cur.get('name')} "
+                f"({cur.get('user','') + '@' if cur.get('user') else ''}{cur.get('host')}:{state['working_dir']})"
+            )
+            ok, msg = RemoteSession.get(cur).check()
+            display.console.print(("[green]✓ [/green]" if ok else "[red]✗ [/red]") + f"[dim]{msg}[/dim]")
+        else:
+            display.console.print("[dim]Execution:[/dim] [bold]local[/bold] (this machine)")
+        display.console.print("[dim]Switch: /remote <id> · /remote local · /remote add · /remote list[/dim]")
+        return "ok"
+
+    if sub in ("list", "ls"):
+        remotes = get_remotes()
+        if not remotes:
+            display.console.print("[dim]No remotes configured. Add one with /remote add.[/dim]")
+            return "ok"
+        active = (state.get("remote") or {}).get("id")
+        display.console.print("[bold]Remotes[/bold]")
+        for r in remotes:
+            mark = " [green]←[/green]" if r["id"] == active else ""
+            display.console.print(
+                f"  [bold]{r['id']}[/bold]  {r.get('name','')}  "
+                f"[dim]{r.get('user','') + '@' if r.get('user') else ''}{r.get('host')}:{r.get('remote_dir')}[/dim]{mark}"
+            )
+        return "ok"
+
+    if sub == "local":
+        state["remote"] = None
+        if state.get("_local_dir"):
+            state["working_dir"] = state.pop("_local_dir")
+        display.console.print("[dim]Switched to[/dim] [bold]local[/bold] execution.")
+        messages.clear()
+        return "ok"
+
+    if sub == "add":
+        r = _remote_add_wizard()
+        if r:
+            display.console.print(f"[dim]Activate with[/dim] [bold]/remote {r['id']}[/bold].")
+        return "ok"
+
+    if sub in ("remove", "rm", "delete"):
+        if len(tokens) < 2:
+            display.print_error("Usage: /remote remove <id>")
+            return "ok"
+        rid = tokens[1].lower()
+        if remove_remote(rid):
+            display.console.print(f"[dim]Remote '{rid}' removed.[/dim]")
+            if (state.get("remote") or {}).get("id") == rid:
+                state["remote"] = None
+                if state.get("_local_dir"):
+                    state["working_dir"] = state.pop("_local_dir")
+        else:
+            display.print_error(f"No remote with id '{rid}'.")
+        return "ok"
+
+    # Otherwise treat the token as a remote id to switch to.
+    rid = sub
+    remote = get_remote(None, rid)
+    if not remote:
+        if not get_remotes():
+            display.console.print(
+                f"[yellow]No remotes configured yet.[/yellow] Let's add one now."
+            )
+            remote = _remote_add_wizard()
+            if not remote:
+                return "ok"
+        else:
+            display.print_error(f"No remote with id '{rid}'. See /remote list.")
+            return "ok"
+
+    ok, msg = RemoteSession.get(remote).check()
+    if ok:
+        display.console.print(f"[green]✓[/green] [dim]{msg}[/dim]")
+    else:
+        display.console.print(f"[yellow]⚠ could not verify:[/yellow] [dim]{msg}[/dim] (activating anyway)")
+    # Remember the local dir so /remote local can restore it, then switch the
+    # working dir to the remote home (or configured dir). Navigate with /dir.
+    if not state.get("remote"):
+        state["_local_dir"] = state["working_dir"]
+    state["remote"] = remote
+    state["working_dir"] = resolve_start_dir(remote)
+    display.console.print(
+        f"[dim]Switched to[/dim] [bold]remote[/bold] → {remote.get('name')} "
+        f"[dim]({state['working_dir']})[/dim]  ·  change folder with [bold]/dir <path>[/bold]"
+    )
+    messages.clear()
+    return "ok"
+
+
 def _handle_mcp_command(arg: str, state: dict, messages: list) -> str:
     """Manage MCP (Model Context Protocol) servers — wire in custom tools.
 
@@ -2367,6 +2595,9 @@ def _make_toolbar(state: dict):
     wd = state["working_dir"]
     if len(wd) > 50:
         wd = "…" + wd[-48:]
+    remote = state.get("remote")
+    dir_icon = "🌐" if remote else "📁"
+    remote_tag = f' ⇅{remote.get("name")}' if remote else ""
     backend = state.get("backend", "einfra")
     if backend == "ollama":
         toolbar_cls = "bottom-toolbar-local"
@@ -2397,9 +2628,9 @@ def _make_toolbar(state: dict):
     else:
         council_tag = ""
     return HTML(
-        f'<{toolbar_cls}>  📁 {wd}{backend_tag}{council_tag}  ●{profile}  🛡{perm_short}'
+        f'<{toolbar_cls}>  {dir_icon} {wd}{remote_tag}{backend_tag}{council_tag}  ●{profile}  🛡{perm_short}'
         f'  {plan_short}  {verify_short}  {mem_short}'
-        f'   /help · /improved · /model · /plan · /memory · /clear · /exit</{toolbar_cls}>'
+        f'   /help · /improved · /remote · /model · /clear · /exit</{toolbar_cls}>'
     )
 
 

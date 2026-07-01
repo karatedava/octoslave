@@ -2,7 +2,7 @@
  * OctoSlave Web UI - Slash Command Handling
  */
 
-import { sendMsg } from './websocket.js?v=20260429';
+import { sendMsg } from './websocket.js?v=20260630c';
 import { scrollToBottom } from './utils.js?v=20260429';
 
 /**
@@ -118,7 +118,7 @@ export function handleSlashCommand(text) {
           profiles,
           judge_model: judge,
           model: document.getElementById('chat-model-select')?.value || '',
-          working_dir: document.getElementById('chat-dir-input')?.value || '.',
+          working_dir: window.getWorkingDir(),
           permission_mode: document.getElementById('chat-permission-select')?.value || 'autonomous',
         });
         if (window.setChatRunningExternal) window.setChatRunningExternal(true);
@@ -148,12 +148,10 @@ export function handleSlashCommand(text) {
       
     case '/dir':
       if (!arg) {
-        const currentDir = document.getElementById('chat-dir-input')?.value;
-        appendChatInfo(`📂 Current working directory: [bold]${currentDir}[/bold]`);
+        appendChatInfo(`📂 Current working directory: [bold]${window.getWorkingDir()}[/bold]`);
       } else {
         sendMsg({ type: 'set_working_dir', working_dir: arg });
-        const dirInput = document.getElementById('chat-dir-input');
-        if (dirInput) dirInput.value = arg;
+        window.setWorkingDir(arg);
         appendChatInfo(`📂 Working directory set to: [bold]${arg}[/bold]`);
       }
       return true;
@@ -217,9 +215,9 @@ export function handleSlashCommand(text) {
       appendChatInfo('📦 Compacting conversation history...');
       sendMsg({ 
         type: 'chat_continue', 
-        message: '/compact', 
+        message: '/compact',
         model: document.getElementById('chat-model-select')?.value || '',
-        working_dir: document.getElementById('chat-dir-input')?.value || '.',
+        working_dir: window.getWorkingDir(),
         prompt_profile: document.getElementById('chat-profile-select')?.value || 'base',
         permission_mode: document.getElementById('chat-permission-select')?.value || 'autonomous'
       });

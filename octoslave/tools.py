@@ -1,6 +1,7 @@
 import atexit
 import json
 import os
+import posixpath
 import shutil
 import signal
 import subprocess
@@ -600,6 +601,320 @@ def valid_tool_names() -> set[str]:
 
 
 # ---------------------------------------------------------------------------
+# Execution backend (local by default, or a remote host over SSH)
+#
+# A per-thread flag mirrors agent._RT: when a remote target is configured for the
+# current agent thread, the filesystem/bash helpers route their work over an SSH
+# session instead of the local machine. The default (no remote) path is byte-for-
+# byte unchanged, so Local mode carries zero behavior change.
+# ---------------------------------------------------------------------------
+
+_EXEC = threading.local()
+
+# Bio/OCR tools that read a `path` input and/or write output files. In remote
+# mode these run against a local temp mirror (input staged in, new outputs
+# pushed back) — they need local Python libs (rdkit/pymupdf/pandas) that we do
+# not assume exist on the remote host.
+_STAGED_TOOLS = frozenset(BIO_TOOL_NAMES) | {"image_ocr"}
+
+
+def configure_execution(remote_cfg: dict | None) -> None:
+    """Point this thread's tools at a remote host (dict) or back to local (None)."""
+    _EXEC.remote_cfg = remote_cfg
+
+
+def _remote():
+    """Return the RemoteSession for this thread, or None for local execution."""
+    # While a staged remote file is being processed with the LOCAL helpers
+    # (read_file / bio / OCR on a pulled temp copy), routing is forced off so
+    # those helpers don't re-route back to the remote and recurse.
+    if getattr(_EXEC, "force_local", False):
+        return None
+    cfg = getattr(_EXEC, "remote_cfg", None)
+    if not cfg:
+        return None
+    try:
+        from .remote import RemoteSession
+        return RemoteSession.get(cfg)
+    except Exception:
+        return None
+
+
+def remote_label() -> str | None:
+    """Human label for the active remote target, or None when local."""
+    cfg = getattr(_EXEC, "remote_cfg", None)
+    if not cfg:
+        return None
+    return cfg.get("name") or cfg.get("host") or cfg.get("id")
+
+
+def _remote_resolve(path: str, working_dir: str) -> str:
+    """Resolve ``path`` against the remote working dir using POSIX semantics.
+
+    Never uses local ``Path.resolve`` (which would mangle a remote path on a
+    machine where it does not exist).
+    """
+    if not path:
+        return posixpath.normpath(working_dir)
+    if posixpath.isabs(path):
+        return posixpath.normpath(path)
+    return posixpath.normpath(posixpath.join(working_dir, path))
+
+
+def _format_bash_output(stdout: str, stderr: str, returncode: int) -> str:
+    """Shared stdout/stderr/exit-code formatting for local + remote bash."""
+    stdout = stdout or ""
+    stderr = stderr or ""
+    if stdout and stderr:
+        output = f"--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    else:
+        output = stdout or stderr
+    if not output:
+        output = f"(exit code {returncode})"
+    elif returncode != 0:
+        output += f"\n(exit code {returncode})"
+    if len(output) > 8000:
+        output = output[:2000] + "\n\n... [output truncated] ...\n\n" + output[-5000:]
+    return output
+
+
+# ---- remote tool implementations ------------------------------------------
+
+def _remote_read_file(sess, path, working_dir, offset=None, limit=None) -> tuple[str, bool]:
+    rp = _remote_resolve(path, working_dir)
+    if not sess.exists(rp):
+        return f"File not found: {path}", False
+    if not sess.is_file(rp):
+        return f"Not a file: {path}", False
+    suffix = posixpath.splitext(rp)[1].lower()
+    size = sess.size(rp)
+    # Large plain-text file with no window → preview head remotely (no full pull).
+    if (offset is None and limit is None and size > _LARGE_TEXT_BYTES
+            and suffix not in (".pdf", ".xlsx", ".xls", ".xlsm", ".ods", ".docx", ".doc")):
+        import shlex
+        head_out, _, _ = sess.run(f"head -n {_LARGE_TEXT_PREVIEW_LINES} {shlex.quote(rp)}", None, timeout=60)
+        preview_lines = head_out.splitlines()
+        numbered = "\n".join(f"{i + 1}\t{ln}" for i, ln in enumerate(preview_lines))
+        if suffix in (".csv", ".tsv", ".tab", ".parquet", ".pq", ".jsonl", ".ndjson"):
+            tip = f"This is a data table — call bio_inspect(path='{path}') for a schema-aware preview."
+        else:
+            tip = "Use bash (head/grep/awk) or read_file with offset/limit to page through it; do not read it whole."
+        return (
+            f"File: {path} ({size:,} bytes — too large to read whole; showing first "
+            f"{len(preview_lines)} lines).\n{numbered}\n\n[LARGE FILE] {tip}",
+            True,
+        )
+    # Stage the file locally and reuse the full local reader (PDF/Excel/docx/binary).
+    try:
+        local = sess.pull(rp, suffix=suffix)
+    except Exception as e:
+        return f"Could not read remote file {path}: {e}", False
+    _EXEC.force_local = True
+    try:
+        res, ok = _read_file(local, os.path.dirname(local), offset, limit)
+    finally:
+        _EXEC.force_local = False
+        try:
+            os.unlink(local)
+        except OSError:
+            pass
+    # The local reader labels output with the temp path — restore the real path.
+    res = res.replace(f"File: {local}", f"File: {path}", 1)
+    res = res.replace(local, path)
+    return res, ok
+
+
+def _remote_write_file(sess, path, content, working_dir) -> tuple[str, bool]:
+    rp = _remote_resolve(path, working_dir)
+    size = len(content.encode("utf-8"))
+    if size > _MAX_DOWNLOAD_BYTES:
+        return (f"Refused to write {path} — content is {size / (1024 ** 3):.2f} GB, "
+                f"exceeds the 1 GB limit.", False)
+    try:
+        sess.write_text(rp, content)
+    except Exception as e:
+        return f"Could not write remote file {path}: {e}", False
+    lines = content.count("\n") + 1
+    return f"Written {lines} lines to {path}", True
+
+
+def _remote_edit_file(sess, path, old_string, new_string, working_dir, replace_all=False) -> tuple[str, bool]:
+    rp = _remote_resolve(path, working_dir)
+    if not sess.is_file(rp):
+        return f"File not found: {path}", False
+    if old_string == "":
+        return "old_string must not be empty. To create a file, use write_file.", False
+    if old_string == new_string:
+        return "old_string and new_string are identical — no change needed.", False
+    try:
+        content = sess.read_text(rp)
+    except Exception as e:
+        return f"Could not read remote file {path}: {e}", False
+    count = content.count(old_string)
+    if count == 0:
+        return f"String not found in {path}:\n{old_string[:200]}", False
+    if count > 1 and not replace_all:
+        return (f"old_string appears {count} times in {path} — make it more specific to "
+                f"ensure uniqueness, or pass replace_all=true to replace every occurrence.", False)
+    new_content = content.replace(old_string, new_string)
+    try:
+        sess.write_text(rp, new_content)
+    except Exception as e:
+        return f"Could not write remote file {path}: {e}", False
+    if replace_all and count > 1:
+        return f"Edited {path} ({count} occurrences replaced)", True
+    return f"Edited {path}", True
+
+
+def _remote_apply_patch(sess, path, edits, working_dir) -> tuple[str, bool]:
+    rp = _remote_resolve(path, working_dir)
+    if not sess.is_file(rp):
+        return f"File not found: {path}", False
+    if not isinstance(edits, list) or not edits:
+        return "apply_patch requires a non-empty `edits` list of {old_string, new_string}.", False
+    try:
+        content = sess.read_text(rp)
+    except Exception as e:
+        return f"Could not read remote file {path}: {e}", False
+    applied = 0
+    notes: list[str] = []
+    for i, e in enumerate(edits, 1):
+        if not isinstance(e, dict):
+            return f"Edit #{i} is not an object — expected {{old_string, new_string}}.", False
+        old = e.get("old_string", "")
+        new = e.get("new_string", "")
+        replace_all = bool(e.get("replace_all", False))
+        if old == "":
+            return f"Edit #{i}: old_string must not be empty. (no changes written)", False
+        if old == new:
+            return f"Edit #{i}: old_string and new_string are identical. (no changes written)", False
+        count = content.count(old)
+        if count == 0:
+            return (f"Edit #{i}: string not found:\n{old[:200]}\n"
+                    f"(applied {applied}/{len(edits)} so far — file left UNCHANGED)", False)
+        if count > 1 and not replace_all:
+            return (f"Edit #{i}: old_string appears {count} times — make it unique or set "
+                    f"replace_all=true for this edit. (file left UNCHANGED)", False)
+        content = content.replace(old, new)
+        applied += 1
+        if replace_all and count > 1:
+            notes.append(f"#{i}×{count}")
+    try:
+        sess.write_text(rp, content)
+    except Exception as e:
+        return f"Could not write remote file {path}: {e}", False
+    suffix = f" ({', '.join(notes)} replace_all)" if notes else ""
+    return f"Applied {applied} edit(s) to {path}{suffix}", True
+
+
+def _remote_bash(sess, command, working_dir, timeout=300) -> tuple[str, bool]:
+    stdout, stderr, rc = sess.run(command, cwd=working_dir, timeout=timeout)
+    return _format_bash_output(stdout, stderr, rc), rc == 0
+
+
+def _remote_glob(sess, pattern, working_dir, path=None) -> tuple[str, bool]:
+    import shlex
+    if posixpath.isabs(pattern):
+        root = posixpath.dirname(pattern) or "/"
+        name = posixpath.basename(pattern)
+    else:
+        root = _remote_resolve(path, working_dir) if path else working_dir
+        name = pattern
+    recursive = name.startswith("**/")
+    leaf = name[3:] if recursive else name
+    if "/" in leaf or recursive:
+        cmd = f"find {shlex.quote(root)} -name {shlex.quote(posixpath.basename(leaf))} -print 2>/dev/null | head -200"
+    else:
+        cmd = f"find {shlex.quote(root)} -maxdepth 1 -name {shlex.quote(leaf)} -print 2>/dev/null | head -200"
+    out, _, _ = sess.run(cmd, None, timeout=60)
+    matches = [m for m in out.splitlines() if m.strip()]
+    if not matches:
+        return f"No files matching '{pattern}'", True
+    result = []
+    for m in matches:
+        result.append(m[len(working_dir):].lstrip("/") if m.startswith(working_dir) else m)
+    output = "\n".join(result)
+    if len(matches) >= 200:
+        output += "\n... (showing first 200)"
+    return output, True
+
+
+def _remote_grep(sess, pattern, working_dir, path=None, glob=None, case_insensitive=False) -> tuple[str, bool]:
+    import shlex
+    flags = "-rn"
+    if case_insensitive:
+        flags += "i"
+    inc = f"--include={shlex.quote(glob)} " if glob else ""
+    target = _remote_resolve(path, working_dir) if path else working_dir
+    cmd = f"grep {flags} {inc}-e {shlex.quote(pattern)} {shlex.quote(target)}"
+    out, err, _ = sess.run(cmd, None, timeout=60)
+    output = out or err or "No matches found"
+    if len(output) > 8000:
+        lines = output.splitlines()
+        output = "\n".join(lines[:150]) + f"\n... ({len(lines)} total matches, showing first 150)"
+    return output, True
+
+
+def _remote_list_dir(sess, working_dir, path=None) -> tuple[str, bool]:
+    import shlex
+    target = _remote_resolve(path, working_dir) if path else working_dir
+    if not sess.exists(target):
+        return f"Directory not found: {path}", False
+    if not sess.is_dir(target):
+        return f"Not a directory: {path}", False
+    out, _, _ = sess.run(f"ls -1Ap {shlex.quote(target)}", None, timeout=60)
+    entries = [e for e in out.splitlines() if e.strip()]
+    dirs = sorted(e for e in entries if e.endswith("/"))
+    files = sorted(e for e in entries if not e.endswith("/"))
+    lines = [f"  {d}" for d in dirs] + [f"  {f}" for f in files]
+    return f"{target}/\n" + "\n".join(lines), True
+
+
+def _run_staged_tool(name, args, sess, working_dir) -> tuple[str, bool]:
+    """Run a bio/OCR tool against a local temp mirror of the remote workdir.
+
+    Input file (``path``) is pulled in; any new files the tool writes are pushed
+    back to the remote working dir. Lets tools that need local Python libs work
+    even though the data lives remotely.
+    """
+    tmp = tempfile.mkdtemp(prefix="ots_stage_")
+    try:
+        local_args = dict(args)
+        val = args.get("path")
+        if isinstance(val, str) and val:
+            rp = _remote_resolve(val, working_dir)
+            if sess.is_file(rp):
+                base = posixpath.basename(rp)
+                try:
+                    sess.pull(rp, dest=os.path.join(tmp, base))
+                    local_args["path"] = base
+                except Exception as e:
+                    return f"Could not stage remote file {val}: {e}", False
+        before = set(os.listdir(tmp))
+        _EXEC.force_local = True
+        try:
+            if name == "image_ocr":
+                result, ok = _image_ocr(working_dir=tmp, **local_args)
+            else:
+                result, ok = execute_bio_tool(name, local_args, tmp)
+        finally:
+            _EXEC.force_local = False
+        # Push back any new top-level files the tool produced.
+        for fn in os.listdir(tmp):
+            if fn in before:
+                continue
+            full = os.path.join(tmp, fn)
+            if os.path.isfile(full):
+                try:
+                    sess.push(full, _remote_resolve(fn, working_dir))
+                except Exception:
+                    pass
+        return result, ok
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # Tool execution
 # ---------------------------------------------------------------------------
 
@@ -676,8 +991,14 @@ def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str =
         elif name == "compress_log":
             return _compress_log(working_dir=working_dir, **args)
         elif name == "image_ocr":
+            _sess = _remote()
+            if _sess is not None:
+                return _run_staged_tool("image_ocr", args, _sess, working_dir)
             return _image_ocr(working_dir=working_dir, **args)
         elif name in BIO_TOOL_NAMES:
+            _sess = _remote()
+            if _sess is not None:
+                return _run_staged_tool(name, args, _sess, working_dir)
             return execute_bio_tool(name, args, working_dir)
         elif _is_mcp:
             mgr = _mcp_manager()
@@ -686,7 +1007,9 @@ def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str =
             # Keep filesystem-style MCP servers sandboxed to the *current* task
             # workdir (users pick workdirs per task/message). Idempotent + cheap
             # when unchanged; pushes roots/list_changed when it actually moves.
-            if working_dir:
+            # Skip when executing remotely — the local MCP server can't see the
+            # remote working dir, so pinning a root to a remote path is meaningless.
+            if working_dir and _remote() is None:
                 try:
                     mgr.set_roots([working_dir])
                 except Exception:
@@ -934,6 +1257,9 @@ _LARGE_TEXT_PREVIEW_LINES = 50
 
 
 def _read_file(path: str, working_dir: str, offset: int = None, limit: int = None) -> tuple[str, bool]:
+    _sess = _remote()
+    if _sess is not None:
+        return _remote_read_file(_sess, path, working_dir, offset, limit)
     resolved = _resolve(path, working_dir)
     if not resolved.exists():
         return f"File not found: {path}", False
@@ -1002,6 +1328,9 @@ def _read_file(path: str, working_dir: str, offset: int = None, limit: int = Non
 
 
 def _write_file(path: str, content: str, working_dir: str) -> tuple[str, bool]:
+    _sess = _remote()
+    if _sess is not None:
+        return _remote_write_file(_sess, path, content, working_dir)
     resolved = _resolve(path, working_dir)
     size = len(content.encode("utf-8"))
     if size > _MAX_DOWNLOAD_BYTES:
@@ -1024,6 +1353,9 @@ def _edit_file(
     working_dir: str,
     replace_all: bool = False,
 ) -> tuple[str, bool]:
+    _sess = _remote()
+    if _sess is not None:
+        return _remote_edit_file(_sess, path, old_string, new_string, working_dir, replace_all)
     resolved = _resolve(path, working_dir)
     if not resolved.exists():
         return f"File not found: {path}", False
@@ -1061,6 +1393,9 @@ def _apply_patch(path: str, edits: list, working_dir: str) -> tuple[str, bool]:
     The file is written only after every edit has matched, so a failure
     mid-list leaves the file untouched.
     """
+    _sess = _remote()
+    if _sess is not None:
+        return _remote_apply_patch(_sess, path, edits, working_dir)
     resolved = _resolve(path, working_dir)
     if not resolved.exists():
         return f"File not found: {path}", False
@@ -1162,8 +1497,43 @@ _bg_counter = 0
 _bg_lock = threading.Lock()
 
 
+def _remote_run_background(sess, command: str, working_dir: str, cwd: str = None) -> tuple[str, bool]:
+    import shlex
+    global _bg_counter
+    run_dir = cwd or working_dir
+    with _bg_lock:
+        _bg_counter += 1
+        proc_id = f"bg{_bg_counter}"
+    log_path = _remote_resolve(f".ots_bg_{proc_id}.log", run_dir)
+    launch = (f"nohup sh -c {shlex.quote(command)} > {shlex.quote(log_path)} 2>&1 "
+              f"< /dev/null & echo $!")
+    out, err, rc = sess.run(launch, cwd=run_dir, timeout=60)
+    pid = out.strip().splitlines()[-1] if out.strip() else ""
+    if rc != 0 or not pid.isdigit():
+        return f"Failed to start remote background process: {(err or out).strip()}", False
+    with _bg_lock:
+        _BG_PROCS[proc_id] = {
+            "remote": True,
+            "sess": sess,
+            "pid": pid,
+            "command": command,
+            "log": log_path,
+            "started": _time.time(),
+            "cwd": run_dir,
+        }
+    return (
+        f"Started background process {proc_id} (pid {pid}) on remote: {command}\n"
+        f"Use check_process(id=\"{proc_id}\") to read output, "
+        f"stop_process(id=\"{proc_id}\") to stop it.",
+        True,
+    )
+
+
 def _run_background(command: str, working_dir: str, cwd: str = None) -> tuple[str, bool]:
     global _bg_counter
+    _sess = _remote()
+    if _sess is not None:
+        return _remote_run_background(_sess, command, working_dir, cwd)
     run_dir = cwd or working_dir
     try:
         log_fd, log_path = tempfile.mkstemp(prefix="ots_bg_", suffix=".log")
@@ -1224,6 +1594,20 @@ def _read_bg_log(info: dict, tail_lines: int) -> str:
     return "\n".join(lines) if lines else "(no output yet)"
 
 
+def _remote_bg_alive(info: dict) -> bool:
+    return info["sess"].run(f"kill -0 {info['pid']} 2>/dev/null", None, timeout=30)[2] == 0
+
+
+def _read_remote_bg_log(info: dict, tail_lines: int) -> str:
+    import shlex
+    n = tail_lines or 200
+    out, _, rc = info["sess"].run(
+        f"tail -n {n} {shlex.quote(info['log'])} 2>/dev/null", None, timeout=60)
+    if rc != 0:
+        return "(could not read output)"
+    return out.rstrip("\n") if out.strip() else "(no output yet)"
+
+
 def _check_process(working_dir: str, id: str = None, tail_lines: int = 50) -> tuple[str, bool]:
     if not id:
         with _bg_lock:
@@ -1232,14 +1616,22 @@ def _check_process(working_dir: str, id: str = None, tail_lines: int = 50) -> tu
             return "No background processes have been started.", True
         lines = ["Background processes:"]
         for pid_id, info in items:
-            rc = info["proc"].poll()
-            status = "running" if rc is None else f"exited ({rc})"
+            if info.get("remote"):
+                status = "running" if _remote_bg_alive(info) else "exited"
+            else:
+                rc = info["proc"].poll()
+                status = "running" if rc is None else f"exited ({rc})"
             lines.append(f"  {pid_id}: {status} — {info['command'][:70]}")
         return "\n".join(lines), True
 
     info = _BG_PROCS.get(id)
     if not info:
         return f"No background process with id '{id}'. Use check_process() to list them.", False
+    if info.get("remote"):
+        status = "running" if _remote_bg_alive(info) else "exited"
+        elapsed = int(_time.time() - info["started"])
+        header = f"Process {id} — {status} (running {elapsed}s): {info['command'][:80]}\n"
+        return header + _read_remote_bg_log(info, tail_lines), True
     rc = info["proc"].poll()
     status = "running" if rc is None else f"exited with code {rc}"
     elapsed = int(_time.time() - info["started"])
@@ -1251,6 +1643,13 @@ def _stop_process(id: str, working_dir: str) -> tuple[str, bool]:
     info = _BG_PROCS.get(id)
     if not info:
         return f"No background process with id '{id}'.", False
+    if info.get("remote"):
+        if not _remote_bg_alive(info):
+            return f"Process {id} already exited.", True
+        pid = info["pid"]
+        info["sess"].run(f"kill {pid} 2>/dev/null; sleep 1; kill -9 {pid} 2>/dev/null || true",
+                         None, timeout=30)
+        return f"Stopped background process {id}.", True
     proc = info["proc"]
     if proc.poll() is not None:
         return f"Process {id} already exited (code {proc.poll()}).", True
@@ -1284,8 +1683,14 @@ def _terminate_proc(proc: subprocess.Popen) -> None:
 
 
 def _shutdown_bg_procs() -> None:
-    """Kill any still-running background processes on interpreter exit."""
+    """Kill any still-running local background processes on interpreter exit.
+
+    Remote background jobs are detached (nohup) and intentionally survive; the
+    agent stops them explicitly via stop_process.
+    """
     for info in list(_BG_PROCS.values()):
+        if info.get("remote"):
+            continue
         try:
             if info["proc"].poll() is None:
                 _terminate_proc(info["proc"])
@@ -1387,6 +1792,9 @@ def _bash(command: str, working_dir: str, timeout: int = 300) -> tuple[str, bool
             f"prefix the command with `OTS_FOREGROUND=1 ` to bypass this guard.",
             False,
         )
+    _sess = _remote()
+    if _sess is not None:
+        return _remote_bash(_sess, command, working_dir, timeout)
     # Unset VIRTUAL_ENV so uv doesn't emit a mismatch warning when the conda/system
     # venv doesn't match the project's .venv.
     env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
@@ -1764,6 +2172,9 @@ def _image_ocr(
 
 
 def _glob(pattern: str, working_dir: str, path: str = None) -> tuple[str, bool]:
+    _sess = _remote()
+    if _sess is not None:
+        return _remote_glob(_sess, pattern, working_dir, path)
     # If pattern is an absolute path, split into root + relative pattern
     p = Path(pattern)
     if p.is_absolute():
@@ -1799,6 +2210,9 @@ def _glob(pattern: str, working_dir: str, path: str = None) -> tuple[str, bool]:
 
 
 def _grep(pattern: str, working_dir: str, path: str = None, glob: str = None, case_insensitive: bool = False) -> tuple[str, bool]:
+    _sess = _remote()
+    if _sess is not None:
+        return _remote_grep(_sess, pattern, working_dir, path, glob, case_insensitive)
     cmd = ["grep", "-rn", "--include=" + (glob or "*")]
     if case_insensitive:
         cmd.append("-i")
@@ -1817,6 +2231,9 @@ def _grep(pattern: str, working_dir: str, path: str = None, glob: str = None, ca
 
 
 def _list_dir(working_dir: str, path: str = None) -> tuple[str, bool]:
+    _sess = _remote()
+    if _sess is not None:
+        return _remote_list_dir(_sess, working_dir, path)
     target = _resolve(path, working_dir) if path else Path(working_dir)
     if not target.exists():
         return f"Directory not found: {path}", False

@@ -183,6 +183,7 @@ Common flags for `ots` and `ots run`:
 | `/help` | Show all commands |
 | `/model [name]` | Switch model (lists available if no name) |
 | `/dir [path]` · `/new-project [hint]` | Change or create a working directory |
+| `/remote [id\|local\|add]` | Run tools locally or on a remote host over SSH |
 | `/profile [name]` | Switch prompt profile |
 | `/permission [mode]` | Show or change permission mode |
 | `/plan` · `/verify` · `/memory` | Toggle agentic behaviours (`on`/`off`) |
@@ -353,6 +354,47 @@ ots batch tasks.txt --resume                             # tasks one-per-line, '
 Both persist state to disk and resume exactly where they left off. See
 [docs/VAULT_IMPROVE.md](docs/VAULT_IMPROVE.md).
 
+### Remote execution (SSH)
+
+By default the agent operates on your local machine. Switch to a **remote host**
+and its `bash` and file tools (read / write / edit, glob, grep, list, background
+jobs) run over SSH on that host instead — for remote compute, GPUs, or data that
+lives on a server. Path-based bio/OCR tools still work: the remote file is staged
+to a local temp copy, processed, and any output pushed back. **Local is always the
+default**; you opt in per session, and switching back is instant.
+
+**Add a host once**, then switch between hosts freely — the toggle/`/remote`
+command lists every configured remote so you can pick which one to connect to.
+
+```bash
+# TUI
+ots
+  /remote add            # register a host (id, name, host, user, port, optional key)
+  /remote list           # show every configured remote
+  /remote <id>           # connect to one over SSH (starts in its home dir)
+  /remote local          # back to local execution
+  /dir <path>            # change the remote folder
+
+# One-shot
+ots run "train the model" --remote gpu01
+```
+
+**Web UI.** Next to the working-directory picker there's a **💻 Local | 🌐 Remote**
+toggle (a dropdown lets you choose *which* remote when several are configured).
+Choosing *Remote* with nothing set up opens the **Remote hosts (SSH)** card in
+Settings — add / test connection / delete. Once connected you start in the remote
+home directory, and the **Browse…** button navigates folders **on the remote host**
+(no working directory is entered up front). The toggle is on the start screen and
+after every **New Chat**.
+
+**Transport & auth.** OctoSlave shells out to your system `ssh`/`scp`, so it honors
+`~/.ssh/config`, keys, ssh-agent and `ProxyJump`, with connection multiplexing for
+speed. Auth is **key/agent based** (no interactive password prompts), so a
+passphrase-protected key must be loaded once with `ssh-add` first. Remotes are
+stored in `~/.octoslave/config.json`; MCP servers stay local.
+
+See [docs/REMOTE_EXECUTION.md](docs/REMOTE_EXECUTION.md) for the full guide.
+
 ---
 
 ## MCP — custom tools
@@ -427,6 +469,7 @@ modifying action), `supervised` (ask before file edits only). See
 | [docs/USAGE.md](docs/USAGE.md) | Extended usage examples and install reference |
 | [docs/RESEARCH.md](docs/RESEARCH.md) | Long-research pipeline contract and per-role models |
 | [docs/VAULT_IMPROVE.md](docs/VAULT_IMPROVE.md) | Vault-improve pipeline |
+| [docs/REMOTE_EXECUTION.md](docs/REMOTE_EXECUTION.md) | Run the agent on a remote host over SSH |
 | [docs/PERMISSION_MODE.md](docs/PERMISSION_MODE.md) | Permission mode reference |
 | [docs/PROMPT_PROFILES.md](docs/PROMPT_PROFILES.md) | Prompt profile reference |
 | [docs/SCRAPING.md](docs/SCRAPING.md) | Web scraping / `crawl_tree` details |
