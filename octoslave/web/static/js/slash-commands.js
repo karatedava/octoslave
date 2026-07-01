@@ -23,7 +23,7 @@ export function handleSlashCommand(text) {
         '  /clear                   Clear chat and reset conversation\n' +
         '  /model [name]            List or switch model\n' +
         '  /dir [path]              Show or change working directory\n' +
-        '  /profile [name]          Show or set prompt profile (base/coder/analyst)\n' +
+        '  /profile [name]          Show or set prompt profile (base/coder/analyst/cryouncle)\n' +
         '  /permission [mode]       Show or set permission mode\n' +
         '  /compact                 Summarize conversation history to save tokens\n' +
         '  /share                   Create a shareable read-only link to this chat\n' +

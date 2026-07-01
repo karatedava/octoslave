@@ -49,14 +49,22 @@ SHARED_DIR = Path.home() / ".octoslave" / "shared"
 
 app = FastAPI(title="OctoSlave Web UI", docs_url=None, redoc_url=None)
 
-class _NoCacheJS(BaseHTTPMiddleware):
+class _NoCacheAssets(BaseHTTPMiddleware):
+    """Force browsers to revalidate JS/CSS instead of serving stale copies.
+
+    ES-module imports (import './components.js') don't carry the ?v= cache-buster
+    on the entry point, and CSS edits can ship without a version bump — so without
+    this, an edit can be invisible until a hard refresh. ``no-cache`` still allows
+    304s via StaticFiles' ETag/Last-Modified, so it's cheap.
+    """
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
-        if request.url.path.endswith('.js'):
+        path = request.url.path
+        if path.endswith('.js') or path.endswith('.css'):
             response.headers['Cache-Control'] = 'no-cache'
         return response
 
-app.add_middleware(_NoCacheJS)
+app.add_middleware(_NoCacheAssets)
 
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

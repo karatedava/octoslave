@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "octoslave"
-version = "1.0.2"
+version = "2.0.0"
 description = "Autonomous AI research & coding assistant — terminal + web UI, multi-agent parallel mode, e-INFRA CZ / NVIDIA NIM / Ollama backends"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -69,6 +69,12 @@ bio = [
     "pillow>=10.0.0",
     "pytesseract>=0.3.10",
 ]
+# CryoUncle — CryoSPARC companion (cryo-EM). Optional: the tools degrade
+# gracefully with a "pip install cryosparc-tools" message when absent.
+cryo = [
+    "cryosparc-tools>=4.4.0",
+    "numpy>=1.24.0",
+]
 all = [
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.27.0",
@@ -79,6 +85,7 @@ all = [
     "pymupdf>=1.24.0",
     "pillow>=10.0.0",
     "pytesseract>=0.3.10",
+    "cryosparc-tools>=4.4.0",
 ]
 
 [project.scripts]

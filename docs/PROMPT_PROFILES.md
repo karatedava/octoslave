@@ -52,6 +52,42 @@ octoslave run "analyze sales_data.csv and create summary plots" -p analyst -d ~/
 
 ---
 
+### `cryouncle`
+
+Cryo-EM companion for structural biologists. Connects directly to a
+[CryoSPARC](https://cryosparc.com/) instance and acts as a hands-on
+bioinformatician driving the single-particle workflow toward the best possible
+3D protein structure.
+
+- Browses projects / workspaces / jobs, inspects result datasets (particle
+  counts, CTF fit, defocus, pose distributions), reads job logs.
+- Creates and queues processing jobs (motion correction, CTF, picking, 2D/3D
+  classification, ab-initio, refinements), downloads maps for local analysis.
+- Diagnoses stalled/low-resolution refinements and proposes concrete next
+  experiments.
+- **Interactive first-run setup:** the agent asks for the CryoSPARC connection
+  details (license ID, host, base port, email, password), stores them locally
+  (`~/.octoslave/cryosparc.json`, chmod 600), verifies the connection, and does
+  all backend wiring — you only answer a few questions once.
+- Works identically in the terminal and the web UI.
+
+Requires the CryoSPARC Python client (installed on demand):
+
+```bash
+pip install cryosparc-tools        # or: octoslave install ".[cryo]"
+octoslave -p cryouncle
+octoslave run "connect to my CryoSPARC and suggest how to push J42 past 3 Å" -p cryouncle
+```
+
+The CryoSPARC toolbox (`cryo_connect`, `cryo_status`, `cryo_projects`,
+`cryo_workspaces`, `cryo_jobs`, `cryo_job`, `cryo_job_types`, `cryo_dataset`,
+`cryo_create_job`, `cryo_queue_job`, `cryo_control_job`, `cryo_download`) is
+exposed **only** under this profile, so other profiles aren't handed cryo-EM
+schemas. Jobs are *built* (not run) by default; queueing compute asks for
+confirmation unless you run autonomously.
+
+---
+
 ## Switching profiles
 
 ```bash

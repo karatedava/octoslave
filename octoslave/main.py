@@ -74,7 +74,7 @@ _HISTORY_FILE = Path.home() / ".octoslave" / "history"
 @click.option("--api-key", default=None, envvar="OCTOSLAVE_API_KEY")
 @click.option("--base-url", default=None, envvar="OCTOSLAVE_BASE_URL")
 @click.option("--local", is_flag=True, default=False, help="Use local Ollama models")
-@click.option("-p", "--prompt-profile", default="base", help="Prompt profile to use (default: base, options: base, coder, analyst)")
+@click.option("-p", "--prompt-profile", default="base", help="Prompt profile to use (default: base, options: base, coder, analyst, cryouncle)")
 @click.option("--permission-mode", default=None,
               type=click.Choice(["autonomous", "controlled", "supervised"]),
               help="Permission mode: autonomous (default), controlled (ask before all edits), or supervised (ask before file edits only)")
@@ -124,7 +124,7 @@ def cli(ctx, model, working_dir, api_key, base_url, local, prompt_profile, permi
 @click.option("--api-key", default=None, envvar="OCTOSLAVE_API_KEY")
 @click.option("--base-url", default=None, envvar="OCTOSLAVE_BASE_URL")
 @click.option("--local", is_flag=True, default=False, help="Use local Ollama models")
-@click.option("-p", "--prompt-profile", default="base", help="Prompt profile to use (default: base, options: base, coder, analyst)")
+@click.option("-p", "--prompt-profile", default="base", help="Prompt profile to use (default: base, options: base, coder, analyst, cryouncle)")
 @click.option("-i", "--interactive", is_flag=True, help="Stay interactive after task")
 @click.option("--permission-mode", default=None,
               type=click.Choice(["autonomous", "controlled", "supervised"]),
@@ -471,7 +471,7 @@ def improved(ctx, model, working_dir, api_key, base_url, prompt_profile,
 @improved.command("run")
 @click.argument("task")
 @click.option("-d", "--dir", "working_dir", default=None, help="Working directory (default: current directory)")
-@click.option("-p", "--prompt-profile", default=None, help="Prompt profile (base, coder, analyst)")
+@click.option("-p", "--prompt-profile", default=None, help="Prompt profile (base, coder, analyst, cryouncle)")
 @click.option("-i", "--interactive", is_flag=True, help="Stay interactive after the task")
 @click.option("--permission-mode", default=None,
               type=click.Choice(["autonomous", "controlled", "supervised"]))
@@ -1313,7 +1313,7 @@ def _handle_slash(cmd: str, state: dict, cfg: dict, messages: list, client) -> s
 
     if name == "/profile":
         from .agent import load_system_prompt, list_prompt_profiles
-        available = list_prompt_profiles() or ["base", "coder", "analyst", "local"]
+        available = list_prompt_profiles() or ["base", "coder", "analyst", "cryouncle", "local"]
         if not arg:
             current = state.get("prompt_profile", "base")
             display.console.print(f"[dim]Current profile:[/dim] [bold #fab283]{current}[/bold #fab283]")
@@ -2957,7 +2957,7 @@ def _resolve_config(model, working_dir, api_key, base_url, local: bool = False) 
 @cli.command("vault-improve")
 @click.argument("vault_path", default=None, required=False)
 @click.option("-p", "--profile", "prompt_profile", default="base",
-              help="Prompt profile (default: base, options: base, coder, analyst)")
+              help="Prompt profile (default: base, options: base, coder, analyst, cryouncle)")
 @click.option("-m", "--model", default=None, help="Model override for all vault agents")
 @click.option("--resume", is_flag=True, default=False, help="Resume interrupted run")
 @click.option("--api-key", default=None, envvar="OCTOSLAVE_API_KEY")

@@ -332,7 +332,10 @@ export function dismissChatEmptyState() {
 export function appendChatInfo(text) {
   const container = document.getElementById('chat-messages');
   if (!container) return;
-  dismissChatEmptyState();
+  // NOTE: do NOT dismiss the empty-state hero here. Config notices (profile /
+  // permission / remote changes) are emitted before any conversation starts, and
+  // removing the hero would take the working-directory + Local/Remote controls
+  // with it. The hero is dismissed when a real message is sent (appendUserMessage).
 
   const div = document.createElement('div');
   div.className = 'msg msg-info';
@@ -353,7 +356,8 @@ export function appendChatInfo(text) {
 export function appendChatError(text) {
   const container = document.getElementById('chat-messages');
   if (!container) return;
-  dismissChatEmptyState();
+  // Keep the empty-state hero (see appendChatInfo) — the working-dir + Local/Remote
+  // controls live there; a real message dismisses it via appendUserMessage.
 
   const div = document.createElement('div');
   div.className = 'msg msg-error';

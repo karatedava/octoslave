@@ -25,7 +25,7 @@ _STREAM_READ_TIMEOUT = httpx.Timeout(300.0, connect=30.0)
 from . import display
 from . import logger
 from . import interrupt
-from .tools import TOOL_DEFINITIONS, execute_tool, all_tool_definitions, valid_tool_names
+from .tools import TOOL_DEFINITIONS, execute_tool, all_tool_definitions, valid_tool_names, set_tool_profile
 from .config import load_config, OLLAMA_BASE_URL
 
 
@@ -327,12 +327,18 @@ def configure_runtime(client, model: str, prompt_profile: str) -> bool:
         # profile name — the auto-"local" switch lives in a config dict that may
         # not reach this function, so we key off the backend, not the name.
         _RT.tool_profile = "local"
+        set_tool_profile("local")
         return True
     _RT.num_ctx = None
     _RT.soft_budget = _SOFT_CONTEXT_BUDGET
     _RT.tool_result_chars = MAX_TOOL_RESULT_CHARS
     _RT.ollama_thinking = False
-    _RT.tool_profile = None
+    # Non-local runs keep the full tool surface. We propagate the prompt-profile
+    # name so profile-scoped toolboxes (e.g. "cryouncle" → CryoSPARC tools) are
+    # exposed. all_tool_definitions treats every name except "local"/"cryouncle"
+    # identically, so base/coder/analyst are unaffected.
+    _RT.tool_profile = prompt_profile
+    set_tool_profile(prompt_profile)
     return False
 
 

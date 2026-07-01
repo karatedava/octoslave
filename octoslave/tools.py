@@ -12,6 +12,12 @@ import glob as glob_module
 from pathlib import Path
 
 from .tools_bio import BIO_TOOL_DEFINITIONS, BIO_TOOL_NAMES, execute_bio_tool
+from .tools_cryo import (
+    CRYO_TOOL_DEFINITIONS,
+    CRYO_TOOL_NAMES,
+    CRYO_MODIFYING_TOOLS,
+    execute_cryo_tool,
+)
 
 # Optional web deps — imported lazily inside functions
 try:
@@ -44,7 +50,7 @@ except ImportError:
 
 # Tools that require permission in controlled mode
 MODIFYING_TOOLS = {"write_file", "edit_file", "apply_patch", "bash",
-                   "run_background", "stop_process"}
+                   "run_background", "stop_process"} | set(CRYO_MODIFYING_TOOLS)
 
 # Tools that require permission only in controlled mode (not supervised)
 FILE_MODIFYING_TOOLS = {"write_file", "edit_file", "apply_patch"}
@@ -582,6 +588,11 @@ def all_tool_definitions(profile: str | None = None) -> list[dict]:
         return [td for td in TOOL_DEFINITIONS
                 if td["function"]["name"] in LOCAL_TOOL_ALLOWLIST]
     defs = list(TOOL_DEFINITIONS)
+    # CryoUncle: the CryoSPARC toolbox is exposed ONLY for the cryouncle profile
+    # so other profiles aren't handed a dozen extra cryo-EM schemas. When called
+    # without an explicit profile, fall back to this thread's active profile.
+    if _cryo_enabled(profile if profile is not None else current_tool_profile()):
+        defs += CRYO_TOOL_DEFINITIONS
     mgr = _mcp_manager()
     if mgr is not None:
         defs += mgr.tool_definitions()
@@ -593,6 +604,10 @@ def valid_tool_names() -> set[str]:
     """Names of all callable tools (built-in + MCP + dynamic). Used by the
     text-format tool-call fallback parser."""
     names = {td["function"]["name"] for td in TOOL_DEFINITIONS}
+    # Cryo tool names only enter the (fallback-parser) namespace under cryouncle,
+    # so no other profile is contaminated by them.
+    if _cryo_enabled():
+        names |= set(CRYO_TOOL_NAMES)
     mgr = _mcp_manager()
     if mgr is not None:
         names |= mgr.tool_names()
@@ -621,6 +636,26 @@ _STAGED_TOOLS = frozenset(BIO_TOOL_NAMES) | {"image_ocr"}
 def configure_execution(remote_cfg: dict | None) -> None:
     """Point this thread's tools at a remote host (dict) or back to local (None)."""
     _EXEC.remote_cfg = remote_cfg
+
+
+def set_tool_profile(profile: str | None) -> None:
+    """Record the active prompt profile for THIS agent thread. Profile-scoped
+    toolboxes (currently the CryoSPARC / cryouncle tools) key off this so they
+    are both invisible AND inert for every other profile. Set by
+    agent.configure_runtime at the start of each run; defaults to None (no
+    profile-scoped tools) for any entry point that never sets it."""
+    _EXEC.tool_profile = profile
+
+
+def current_tool_profile() -> str | None:
+    return getattr(_EXEC, "tool_profile", None)
+
+
+def _cryo_enabled(profile: str | None = None) -> bool:
+    """CryoSPARC tools are available only under the cryouncle profile."""
+    if profile is None:
+        profile = current_tool_profile()
+    return profile == "cryouncle"
 
 
 def _remote():
@@ -1000,6 +1035,16 @@ def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str =
             if _sess is not None:
                 return _run_staged_tool(name, args, _sess, working_dir)
             return execute_bio_tool(name, args, working_dir)
+        elif name in CRYO_TOOL_NAMES:
+            # Hard isolation: cryo tools only run under the cryouncle profile, so
+            # no other profile can invoke them even via a hallucinated call.
+            if not _cryo_enabled():
+                return (f"{name} is only available under the 'cryouncle' prompt "
+                        f"profile (CryoSPARC companion). Switch with /profile "
+                        f"cryouncle or -p cryouncle.", False)
+            # CryoSPARC tools talk to the user's instance over the network, so
+            # they run locally (no remote staging) and reuse the cached client.
+            return execute_cryo_tool(name, args, working_dir)
         elif _is_mcp:
             mgr = _mcp_manager()
             if mgr is None:
@@ -1053,6 +1098,15 @@ _REQUIRED_STR_ARGS: dict[str, tuple[str, ...]] = {
     "alphafold_fetch": ("uniprot_id",),
     "ena_fetch": ("accession",),
     "pdf_ocr": ("path",),
+    # CryoUncle / CryoSPARC tools
+    "cryo_workspaces": ("project_uid",),
+    "cryo_jobs": ("project_uid",),
+    "cryo_job": ("project_uid", "job_uid"),
+    "cryo_dataset": ("project_uid", "job_uid"),
+    "cryo_create_job": ("project_uid", "workspace_uid", "type"),
+    "cryo_queue_job": ("project_uid", "job_uid"),
+    "cryo_control_job": ("project_uid", "job_uid", "action"),
+    "cryo_download": ("project_uid", "path"),
 }
 
 
