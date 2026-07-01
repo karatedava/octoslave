@@ -430,26 +430,6 @@ button {
 
 .dir-field input:focus { box-shadow: none; border: none; }
 
-.btn-browse {
-  background: transparent;
-  border: none;
-  color: var(--text-dim);
-  width: 28px;
-  height: 28px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-  border-radius: 5px;
-  flex-shrink: 0;
-  transition: color 0.12s, background 0.12s;
-}
-
-.btn-browse:hover {
-  color: var(--primary);
-  background: var(--primary-glow);
-}
-
 /* ════════════════════════════════════════════════════════════
    CHAT TAB
 ══════════════════════════════════════════════════════════ */
@@ -478,51 +458,45 @@ button {
 .config-spacer { flex: 1; }
 
 /* ── Improved (council) toggle switch ─────────────────────────── */
-.council-switch {
+/* 3-position mode selector: Standard · Improved · Ultra */
+.mode-seg {
   display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  cursor: pointer;
-  user-select: none;
+  align-items: stretch;
   flex-shrink: 0;
   white-space: nowrap;
-}
-.council-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
-.council-switch-track {
-  position: relative;
-  width: 34px;
-  height: 18px;
-  border-radius: 9px;
   background: var(--border);
   border: 1px solid var(--border-light);
-  transition: background .15s ease, border-color .15s ease;
-  flex-shrink: 0;
+  border-radius: 9px;
+  padding: 2px;
+  gap: 2px;
 }
-.council-switch-thumb {
-  position: absolute;
-  top: 1px;
-  left: 1px;
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  background: var(--text-muted);
-  transition: transform .15s ease, background .15s ease;
-}
-.council-switch input:checked + .council-switch-track {
-  background: var(--accent-glow);
-  border-color: var(--accent);
-}
-.council-switch input:checked + .council-switch-track .council-switch-thumb {
-  transform: translateX(16px);
-  background: var(--accent);
-}
-.council-switch-text {
-  font-size: 12px;
+.mode-seg-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
   color: var(--text-muted);
-  transition: color .15s ease;
+  font-size: 12px;
+  font-weight: 500;
+  padding: 4px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+  user-select: none;
+  transition: background .15s ease, color .15s ease;
 }
-.council-switch input:checked ~ .council-switch-text { color: var(--accent); }
-.council-switch.disabled { opacity: .4; cursor: not-allowed; }
+.mode-seg-btn:hover:not(.active) { color: var(--text); }
+.mode-seg-btn.active {
+  background: var(--accent-glow);
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+/* Ultra gets a distinct accent when active */
+.mode-seg-btn[data-mode="ultra"].active {
+  background: color-mix(in srgb, #fab283 22%, transparent);
+  color: #fab283;
+  box-shadow: inset 0 0 0 1px #fab283;
+}
+.mode-seg.disabled { opacity: .5; }
+.mode-seg-btn:disabled { cursor: not-allowed; }
 
 #backend-select {
   width: 130px;
@@ -551,11 +525,6 @@ button {
   width: 140px;
   font-size: 13.5px;
   height: 38px;
-}
-
-.chat-config-bar .dir-field {
-  width: 280px;
-  font-size: 13.5px;
 }
 
 /* Chat messages */
@@ -612,6 +581,90 @@ button {
   border-radius: 5px;
   font-family: var(--mono);
   font-size: 13.5px;
+}
+
+/* ── Hero working-directory picker (empty state) ─────────────── */
+.empty-dir {
+  pointer-events: auto;           /* parent empty-state disables clicks */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  max-width: 480px;
+  margin: 8px 0 6px;
+}
+
+.empty-dir-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+.empty-dir-label svg { color: var(--primary); }
+
+.dir-field-hero {
+  width: 100%;
+  height: 54px;
+  padding: 0 8px 0 16px;
+  gap: 10px;
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+}
+.dir-field-hero .dir-field-icon { color: var(--primary); }
+.dir-field-hero input {
+  font-size: 15px;
+  color: var(--text);
+}
+.dir-field-hero input::placeholder { color: var(--text-muted); }
+
+.btn-browse-hero {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 40px;
+  padding: 0 18px;
+  flex-shrink: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: var(--primary);
+  color: #1a1208;
+  font-family: var(--font);
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s, transform 0.12s;
+}
+.btn-browse-hero:hover { background: var(--primary-dim); transform: translateY(-1px); }
+.btn-browse-hero:active { transform: translateY(0); }
+
+.empty-dir-hint {
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+.empty-dir-hint code {
+  background: var(--surface);
+  color: var(--text-muted);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+
+/* Highlight + gentle pulse until a directory is chosen */
+.empty-dir.needs-dir .dir-field-hero {
+  border-color: var(--primary);
+  animation: dir-pulse 2.2s ease-in-out infinite;
+}
+.empty-dir:not(.needs-dir) .empty-dir-label { color: var(--success); }
+.empty-dir:not(.needs-dir) .empty-dir-label svg,
+.empty-dir:not(.needs-dir) .dir-field-hero .dir-field-icon { color: var(--success); }
+
+@keyframes dir-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(250, 178, 131, 0.45); }
+  50%      { box-shadow: 0 0 0 7px rgba(250, 178, 131, 0); }
 }
 
 /* Message bubbles */
@@ -1329,6 +1382,13 @@ details.tool-block.tool-block-fail {
 .btn-send:hover:not(:disabled) { background: var(--primary-dim); }
 .btn-send:active:not(:disabled) { transform: scale(0.94); }
 .btn-send:disabled { opacity: 0.3; cursor: not-allowed; }
+
+/* Icon swap: send by default, stop while the agent is working */
+.btn-send .icon-stop { display: none; }
+.btn-send.running { background: var(--error); color: #fff; cursor: pointer; }
+.btn-send.running:hover { background: #c5505a; }
+.btn-send.running .icon-send { display: none; }
+.btn-send.running .icon-stop { display: block; }
 
 /* ════════════════════════════════════════════════════════════
    RESEARCH TAB
@@ -2587,3 +2647,139 @@ details.tool-block.tool-block-fail {
 .mcp-badge { font-size: 0.68rem; color: var(--text-muted); background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px; }
 .mcp-badge-on { color: var(--success); border-color: rgba(127,216,143,0.4); }
 .mcp-badge-warn { color: var(--warning); border-color: rgba(245,167,66,0.4); }
+
+/* ── Local ⇄ Remote (SSH) execution toggle + Remotes card ───────────── */
+.exec-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+.exec-seg {
+  display: inline-flex;
+  background: var(--border);
+  border: 1px solid var(--border-light);
+  border-radius: 9px;
+  padding: 2px;
+  gap: 2px;
+}
+.exec-seg-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 4px 12px;
+  border-radius: 7px;
+  cursor: pointer;
+  user-select: none;
+  transition: background .15s ease, color .15s ease;
+}
+.exec-seg-btn:hover:not(.active) { color: var(--text); }
+.exec-seg-btn.active {
+  background: var(--accent-glow);
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.exec-remote-select {
+  background: var(--bg);
+  border: 1px solid var(--border-light);
+  border-radius: 7px;
+  color: var(--text);
+  font-size: 12px;
+  padding: 4px 8px;
+}
+.exec-config-btn {
+  appearance: none;
+  border: 1px solid var(--border-light);
+  background: var(--bg);
+  color: var(--text-muted);
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 13px;
+  padding: 3px 8px;
+}
+.exec-config-btn:hover { color: var(--accent); border-color: var(--accent); }
+
+.remotes-list { display: flex; flex-direction: column; gap: 6px; margin: 10px 0; }
+.remotes-empty { color: var(--text-muted); font-size: 13px; padding: 6px 0; }
+.remote-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.remote-row.remote-active { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent-glow); }
+.remote-name { font-weight: 600; color: var(--text); font-size: 13px; }
+.remote-target { color: var(--text-muted); font-size: 12px; font-family: var(--mono, monospace); }
+.remote-dir { color: var(--accent); }
+.remote-actions { margin-left: auto; display: flex; gap: 8px; }
+
+.remotes-form { margin-top: 12px; }
+.settings-field-row { display: flex; gap: 12px; flex-wrap: wrap; }
+.settings-field-row .settings-field { flex: 1 1 140px; }
+.settings-field-narrow { flex: 0 0 90px !important; }
+.remotes-form-actions { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.remote-test-status { font-size: 12px; color: var(--text-muted); }
+.remote-test-status.status-ok { color: var(--success); }
+.remote-test-status.status-fail { color: var(--warning); }
+
+.card-flash { animation: cardFlash 1.2s ease; }
+@keyframes cardFlash {
+  0%, 100% { box-shadow: none; }
+  30% { box-shadow: 0 0 0 2px var(--accent); }
+}
+
+/* ── Remote directory picker modal ─────────────────────────────────── */
+.settings-note-sub { margin-top: 8px; font-size: 12px; opacity: .85; }
+.remote-picker-overlay {
+  position: fixed; inset: 0; z-index: 1000;
+  background: rgba(0,0,0,0.55);
+  display: flex; align-items: center; justify-content: center;
+}
+.remote-picker {
+  width: min(520px, 92vw); max-height: 76vh;
+  display: flex; flex-direction: column;
+  background: var(--bg-elevated, var(--panel, #1b1b22));
+  border: 1px solid var(--border-light);
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+  overflow: hidden;
+}
+.remote-picker-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px; border-bottom: 1px solid var(--border);
+}
+.remote-picker-title { font-weight: 600; color: var(--text); }
+.remote-picker-close {
+  appearance: none; border: none; background: transparent;
+  color: var(--text-muted); font-size: 15px; cursor: pointer;
+}
+.remote-picker-close:hover { color: var(--text); }
+.remote-picker-path {
+  padding: 8px 16px; font-family: var(--mono, monospace); font-size: 12px;
+  color: var(--accent); border-bottom: 1px solid var(--border);
+  overflow-x: auto; white-space: nowrap;
+}
+.remote-picker-list { overflow-y: auto; padding: 6px; flex: 1; }
+.remote-picker-row {
+  display: block; width: 100%; text-align: left;
+  appearance: none; border: none; background: transparent;
+  color: var(--text); font-size: 13px; padding: 7px 10px;
+  border-radius: 7px; cursor: pointer;
+}
+.remote-picker-row:hover { background: var(--accent-glow); color: var(--accent); }
+.remote-picker-up { color: var(--text-muted); }
+.remote-picker-loading, .remote-picker-empty, .remote-picker-error {
+  padding: 14px; color: var(--text-muted); font-size: 13px;
+}
+.remote-picker-error { color: var(--warning); }
+.remote-picker-foot {
+  display: flex; justify-content: flex-end; gap: 10px;
+  padding: 12px 16px; border-top: 1px solid var(--border);
+}

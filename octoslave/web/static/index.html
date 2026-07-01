@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/css/styles.css?v=20260509b">
+  <link rel="stylesheet" href="/static/css/styles.css?v=20260630c">
 </head>
 <body>
 
@@ -108,23 +108,11 @@
         <option value="supervised">Supervised</option>
       </select>
       <div class="config-divider"></div>
-      <label class="council-switch" id="council-switch-label"
-             title="Improved mode — a model council (Thinker · Worker · Verifier) behind one agent. Stronger results; uses more tokens. Cloud backends only.">
-        <input type="checkbox" id="chat-council-toggle" checked>
-        <span class="council-switch-track"><span class="council-switch-thumb"></span></span>
-        <span class="council-switch-text">🐙 Improved</span>
-      </label>
-      <div class="config-divider" style="display:none;"></div>
-      <div class="dir-field">
-        <svg class="dir-field-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-        </svg>
-        <input type="text" id="chat-dir-input" placeholder="Working directory" title="Working directory">
-        <button class="btn-browse" onclick="browseDir('chat-dir-input')" title="Browse for folder">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="6 9 12 15 18 9"/>
-          </svg>
-        </button>
+      <div class="mode-seg" id="mode-seg" role="radiogroup" data-mode="improved"
+           title="Agent mode — Standard: one model. Improved: a council (Thinker · Worker · Verifier) behind one agent. Ultra: the council plus a multi-model debate on the plan and completion (strongest, more tokens). Improved/Ultra need a cloud backend.">
+        <button type="button" class="mode-seg-btn" data-mode="standard" role="radio" aria-checked="false">Standard</button>
+        <button type="button" class="mode-seg-btn active" data-mode="improved" role="radio" aria-checked="true">🐙 Improved</button>
+        <button type="button" class="mode-seg-btn" data-mode="ultra" role="radio" aria-checked="false">⚡ Ultra</button>
       </div>
       <div class="config-spacer"></div>
       <button class="btn-secondary btn-sm" id="chat-new-btn">New Chat</button>
@@ -135,8 +123,34 @@
       <div class="chat-empty-state" id="chat-empty-state">
         <img src="/static/logo.png?v=3" alt="OctoSlave" class="empty-logo">
         <p class="empty-title">OctoSlave</p>
+
+        <!-- Hero working-directory picker — the first thing a new user is nudged toward -->
+        <div class="empty-dir needs-dir" id="empty-dir">
+          <div class="empty-dir-label">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+            </svg>
+            <span>Pick a working directory to get started</span>
+          </div>
+          <div class="dir-field dir-field-hero" id="empty-dir-field">
+            <svg class="dir-field-icon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+            </svg>
+            <input type="text" id="empty-dir-input" placeholder="No folder selected yet…" title="Working directory">
+            <button class="btn-browse-hero" onclick="browseDir('empty-dir-input')" title="Browse for folder">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+              </svg>
+              <span>Browse…</span>
+            </button>
+          </div>
+          <!-- Local ⇄ Remote (SSH) execution toggle — built by renderExecToggle() -->
+          <div class="exec-toggle" id="exec-toggle"></div>
+          <div class="empty-dir-hint">OctoSlave reads &amp; writes files here. Change it later with <code>/dir &lt;path&gt;</code>, or run on a remote host with the Remote toggle.</div>
+        </div>
+
         <p class="empty-sub">
-          Ask anything. Run code. Research topics.<br>
+          Then ask anything. Run code. Research topics.<br>
           Type <code>@</code> to attach a file, <code>/help</code> for commands,
           or use the <code>•••</code> button to spin up a multi-agent committee.
         </p>
@@ -167,9 +181,12 @@
         <input type="file" id="chat-file-input" multiple style="display:none">
         <textarea id="chat-textarea" rows="1" placeholder="Ask OctoSlave anything…   Shift+Enter for newline"></textarea>
         <button class="btn-send" id="chat-send-btn" title="Send message">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <svg class="icon-send" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
             <line x1="22" y1="2" x2="11" y2="13"/>
             <polygon points="22 2 15 22 11 13 2 9 22 2" fill="currentColor" stroke="none"/>
+          </svg>
+          <svg class="icon-stop" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+            <rect x="6" y="6" width="12" height="12" rx="2"/>
           </svg>
         </button>
       </div>
@@ -257,6 +274,51 @@
       </div>
 
       <button class="btn-primary" id="settings-refresh-btn">Refresh Config</button>
+    </div>
+
+    <!-- ── Remote hosts (SSH) card ───────────────────────────── -->
+    <div class="settings-card settings-card-wide" id="remotes-card">
+      <div class="settings-card-header">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2" y="3" width="20" height="14" rx="2"/>
+          <path d="M8 21h8M12 17v4"/>
+        </svg>
+        <h2>Remote hosts (SSH)</h2>
+      </div>
+
+      <div class="settings-note">
+        Run the agent's tools on a remote machine over SSH — bash and file
+        operations execute on the host you configure here. Uses your system
+        <code>ssh</code> (keys / <code>~/.ssh/config</code> / agent). Pick
+        <strong>Remote</strong> next to the working-directory selector to switch.
+      </div>
+
+      <div id="remotes-list" class="remotes-list"></div>
+
+      <div class="remotes-form">
+        <div class="settings-field-row">
+          <div class="settings-field"><label>Id</label><input type="text" id="remote-id" placeholder="gpu01"></div>
+          <div class="settings-field"><label>Name</label><input type="text" id="remote-name" placeholder="GPU box"></div>
+        </div>
+        <div class="settings-field-row">
+          <div class="settings-field"><label>Host</label><input type="text" id="remote-host" placeholder="gpu.example.org"></div>
+          <div class="settings-field"><label>User</label><input type="text" id="remote-user" placeholder="(ssh default)"></div>
+          <div class="settings-field settings-field-narrow"><label>Port</label><input type="number" id="remote-port" value="22"></div>
+        </div>
+        <div class="settings-field">
+          <label>Identity file (private key, optional)</label>
+          <input type="text" id="remote-identity" placeholder="~/.ssh/id_ed25519">
+        </div>
+        <div class="settings-note settings-note-sub">
+          After connecting, pick the working folder with the <strong>Browse…</strong>
+          button next to the working-directory selector — it navigates the remote host.
+        </div>
+        <div class="remotes-form-actions">
+          <button class="btn-secondary btn-sm" id="remote-test-btn">Test connection</button>
+          <button class="btn-primary btn-sm" id="remote-add-btn">Add remote</button>
+          <span class="remote-test-status" id="remote-test-status"></span>
+        </div>
+      </div>
     </div>
 
     <!-- ── Custom Providers card ─────────────────────────────── -->
@@ -389,7 +451,7 @@
 
 </main>
 
-<script type="module" src="/static/js/app.js?v=20260608c"></script>
+<script type="module" src="/static/js/app.js?v=20260630c"></script>
 
 </body>
 </html>

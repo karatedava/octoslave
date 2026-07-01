@@ -7,15 +7,17 @@ console.log('[app.js] Module loaded');
 import {
   WS_URL, connectWebSocket, sendMsg, applyConfig, populateModelSelects, onConfigUpdated,
   populateBackendSelects, getProviderName
-} from './websocket.js?v=20260507';
-import { handleSlashCommand } from './slash-commands.js?v=20260429';
+} from './websocket.js?v=20260630c';
+import { handleSlashCommand } from './slash-commands.js?v=20260630c';
 import {
   toggleHistory, browseDir, refreshHistory,
-  uploadFile, removeAttachment, clearChatMessages, appendChatInfo, appendChatError
-} from './components.js?v=20260608c';
+  uploadFile, removeAttachment, clearChatMessages, appendChatInfo, appendChatError,
+  dismissChatEmptyState
+} from './components.js?v=20260630c';
 import { scrollToBottom, autoResizeTextarea, renderMarkdown, esc } from './utils.js?v=20260429';
 
 // Export functions to global scope for inline handlers
+window.sendWs = sendMsg;   // used by the exec (local/remote) toggle in components.js
 window.toggleHistory = toggleHistory;
 window.browseDir = browseDir;
 window.refreshHistory = refreshHistory;
@@ -57,7 +59,7 @@ function handleServerMessage(msg) {
     case 'tool_call':     onToolCall(msg); break;
     case 'tool_result':   onToolResult(msg.name, msg.ok, msg.preview); break;
     case 'plan':          onPlan(msg.text); break;
-    case 'done':          onDone(msg.iterations); break;
+    case 'done':          onDone(msg.iterations, msg.stopped); break;
     case 'info':          appendChatInfo(msg.text); break;
     case 'error':         onServerError(msg.text); break;
     case 'cleared':       break;
@@ -77,6 +79,13 @@ function handleServerMessage(msg) {
     case 'user_question':       onUserQuestion(msg); break;
     case 'todos':               onTodos(msg); break;
     case 'parallel_result':     onParallelResult(msg); break;
+    case 'ok':
+      // set_remote reply carries the resolved remote working dir (its home).
+      if (msg.set_remote && typeof msg.working_dir === 'string') {
+        window.setWorkingDir(msg.working_dir);
+        window.renderExecToggle?.();
+      }
+      break;
     default: break;
   }
 }
@@ -280,6 +289,17 @@ let currentAssistantBubble = null;
 let currentToolCallsDiv = null;
 let streamBuffer = '';
 
+// Interrupt the running agent. The backend stops at the next stream chunk /
+// turn boundary and emits a `done` event, which clears the running state. The
+// partial conversation is kept, so the user can refine and send a follow-up.
+function stopChat() {
+  if (!window.appState.running || window.appState.stopping) return;
+  window.appState.stopping = true;
+  sendMsg({ type: 'stop' });
+  const btn = document.getElementById('chat-send-btn');
+  if (btn) btn.title = 'Stopping…';
+}
+
 function sendChat() {
   const textarea = document.getElementById('chat-textarea');
   const text = textarea.value.trim();
@@ -312,12 +332,14 @@ function sendChat() {
   setChatRunning(true);
 
   const model = document.getElementById('chat-model-select').value.trim();
-  const dir   = document.getElementById('chat-dir-input').value.trim();
+  const dir   = window.getWorkingDir();
   const profile = document.getElementById('chat-profile-select').value;
   const permMode = document.getElementById('chat-permission-select').value;
-  // Improved (council) mode — on by default; backend auto-falls back
-  // to the single agent on local/Ollama.
-  const council = !!document.getElementById('chat-council-toggle')?.checked;
+  // Agent mode — standard | improved | ultra (default improved). Improved/Ultra
+  // run the council; backend auto-falls back to the single agent on local/Ollama.
+  const mode = document.getElementById('mode-seg')?.dataset.mode || 'improved';
+  const council = mode === 'improved' || mode === 'ultra';
+  const ultra = mode === 'ultra';
 
   // Parallel mode short-circuit: when the popover toggle is on, route to the
   // multi-agent handler with per-candidate model/profile selections.
@@ -345,10 +367,11 @@ function sendChat() {
   const type = window.appState.chatIsFirst ? 'chat' : 'chat_continue';
   window.appState.chatIsFirst = false;
 
-  sendMsg({ type, message: fullText, model, working_dir: dir, prompt_profile: profile, permission_mode: permMode, council });
+  sendMsg({ type, message: fullText, model, working_dir: dir, prompt_profile: profile, permission_mode: permMode, council, ultra, mode, remote_id: window.getRemoteId ? window.getRemoteId() : null });
 }
 
 function appendUserMessage(text) {
+  dismissChatEmptyState();
   window.appState.messages.push({ role: 'user', content: text });
   const container = document.getElementById('chat-messages');
   const div = document.createElement('div');
@@ -600,9 +623,11 @@ function onPlan(text) {
   scrollToBottom(container);
 }
 
-function onDone(iterations) {
+function onDone(iterations, stopped) {
   setChatRunning(false);
-  appendChatInfo(`✓ Done (${iterations} iteration${iterations !== 1 ? 's' : ''})`);
+  appendChatInfo(stopped
+    ? `⏹ Stopped (${iterations} iteration${iterations !== 1 ? 's' : ''}) — refine and send to continue.`
+    : `✓ Done (${iterations} iteration${iterations !== 1 ? 's' : ''})`);
   // Auto-persist after every completed turn so the conversation shows up in
   // history (and survives a reload) without requiring a "New Chat" click.
   // Reuses currentChatId when set, so the same chat is updated in place.
@@ -618,6 +643,7 @@ function onServerError(text) {
 
 function setChatRunning(running) {
   window.appState.running = running;
+  if (!running) window.appState.stopping = false;
   const statusBadge = document.getElementById('chat-status');
   const sendBtn = document.getElementById('chat-send-btn');
 
@@ -626,7 +652,13 @@ function setChatRunning(running) {
     statusBadge.className = running ? 'badge badge-running' : 'badge badge-idle';
   }
 
-  if (sendBtn) sendBtn.disabled = running;
+  // The send button doubles as a stop button while a task runs — keep it
+  // enabled and swap its icon/colour via the `.running` class.
+  if (sendBtn) {
+    sendBtn.disabled = false;
+    sendBtn.classList.toggle('running', running);
+    sendBtn.title = running ? 'Stop the agent' : 'Send message';
+  }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -890,7 +922,18 @@ function initApp() {
   // Parallel-agents popover
   initParallelPopover();
 
-  document.getElementById('chat-send-btn')?.addEventListener('click', sendChat);
+  // Send button doubles as a stop button while the agent is working.
+  document.getElementById('chat-send-btn')?.addEventListener('click', () => {
+    if (window.appState.running) stopChat();
+    else sendChat();
+  });
+
+  // ── Working directory: the hero empty-state picker is the only UI for it.
+  //    It writes straight into appState (window.setWorkingDir). The picker is
+  //    rebuilt on New Chat, so delegate its events from the document.
+  //    browseDir() dispatches a synthetic 'change' after writing the path.
+  document.addEventListener('input',  (e) => { if (e.target?.id === 'empty-dir-input') window.setWorkingDir(e.target.value); });
+  document.addEventListener('change', (e) => { if (e.target?.id === 'empty-dir-input') window.setWorkingDir(e.target.value); });
 
   document.getElementById('chat-attach-btn')?.addEventListener('click', () => {
     document.getElementById('chat-file-input')?.click();
@@ -916,19 +959,36 @@ function initApp() {
     refreshHistory();
   });
 
+  // Mode selector (Standard · Improved · Ultra) — set active button + data-mode.
+  function _setMode(mode) {
+    const seg = document.getElementById('mode-seg');
+    if (!seg) return;
+    seg.dataset.mode = mode;
+    seg.querySelectorAll('.mode-seg-btn').forEach((b) => {
+      const on = b.dataset.mode === mode;
+      b.classList.toggle('active', on);
+      b.setAttribute('aria-checked', on ? 'true' : 'false');
+    });
+  }
+  document.getElementById('mode-seg')?.querySelectorAll('.mode-seg-btn').forEach((btn) => {
+    btn.addEventListener('click', () => { if (!btn.disabled) _setMode(btn.dataset.mode); });
+  });
+
   // Backend select change handler — send switch_backend and refresh model list.
-  // Improved (council) mode needs a cloud pool — grey out the toggle on Ollama
-  // so the user sees it won't apply there (backend also falls back gracefully).
+  // Improved/Ultra need a cloud pool — disable them on Ollama and snap back to
+  // Standard (the backend also falls back gracefully).
   function _updateCouncilAvailability(backend) {
-    const label = document.getElementById('council-switch-label');
-    const toggle = document.getElementById('chat-council-toggle');
-    if (!label || !toggle) return;
+    const seg = document.getElementById('mode-seg');
+    if (!seg) return;
     const ok = backend !== 'ollama';
-    label.classList.toggle('disabled', !ok);
-    toggle.disabled = !ok;
-    label.title = ok
-      ? 'Improved mode — a model council (Thinker · Worker · Verifier) behind one agent. Stronger results; uses more tokens.'
-      : 'Improved mode needs a cloud backend (e-INFRA / NIM). Not available on local Ollama.';
+    seg.classList.toggle('disabled', !ok);
+    seg.querySelectorAll('.mode-seg-btn').forEach((b) => {
+      if (b.dataset.mode !== 'standard') b.disabled = !ok;
+    });
+    if (!ok && seg.dataset.mode !== 'standard') _setMode('standard');
+    seg.title = ok
+      ? 'Agent mode — Standard: one model. Improved: a council (Thinker · Worker · Verifier). Ultra: council + multi-model debate on the plan and completion (strongest, more tokens).'
+      : 'Improved / Ultra need a cloud backend (e-INFRA / NIM). Not available on local Ollama.';
   }
   window._updateCouncilAvailability = _updateCouncilAvailability;
 
@@ -971,6 +1031,10 @@ function initApp() {
 
   // Custom-provider management
   initProviderForm();
+
+  // Remote (SSH) hosts management
+  initRemotesForm();
+  window.renderExecToggle?.();
 
   // MCP server management
   initMcpPanel();
@@ -1154,6 +1218,203 @@ function initProviderForm() {
     }, 300);
   });
 }
+
+// ──────────────────────────────────────────────────────────────
+// Remote hosts (SSH)
+// ──────────────────────────────────────────────────────────────
+
+async function refreshRemotes() {
+  try {
+    const res = await fetch('/api/remotes');
+    const data = await res.json();
+    window.appState.remotes = data.remotes || [];
+  } catch (err) {
+    console.error('Failed to load remotes:', err);
+  }
+  window.renderRemotesCard?.();
+  window.renderExecToggle?.();
+}
+
+window.renderRemotesCard = function () {
+  const host = document.getElementById('remotes-list');
+  if (!host) return;
+  const remotes = window.appState.remotes || [];
+  const active = window.appState.remoteId;
+  if (!remotes.length) {
+    host.innerHTML = '<div class="remotes-empty">No remote hosts yet. Add one below.</div>';
+    return;
+  }
+  host.innerHTML = remotes.map(r => {
+    const isActive = r.id === active;
+    const target = `${r.user ? esc(r.user) + '@' : ''}${esc(r.host)}${r.port && r.port !== 22 ? ':' + r.port : ''}`;
+    return `
+      <div class="remote-row${isActive ? ' remote-active' : ''}">
+        <span class="remote-name">${esc(r.name || r.id)}</span>
+        <span class="remote-target">${target}<span class="remote-dir">:${esc(r.remote_dir || '.')}</span></span>
+        ${isActive ? '<span class="provider-tag tag-active">active</span>' : ''}
+        <div class="remote-actions">
+          <button class="btn-link" data-ract="use" data-id="${esc(r.id)}">use</button>
+          <button class="btn-link btn-link-danger" data-ract="remove" data-id="${esc(r.id)}">remove</button>
+        </div>
+      </div>`;
+  }).join('');
+  host.querySelectorAll('button[data-ract]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const id = btn.dataset.id;
+      if (btn.dataset.ract === 'use') {
+        window.setRemoteMode('remote', id);
+      } else {
+        if (!confirm(`Remove remote "${id}"?`)) return;
+        await fetch(`/api/remotes/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        if (window.appState.remoteId === id) window.setRemoteMode('local');
+        refreshRemotes();
+      }
+    });
+  });
+};
+
+window.openRemotesConfig = function () {
+  // Switch to the Settings tab and scroll the Remotes card into view.
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+  document.querySelector('.nav-btn[data-tab="settings"]')?.classList.add('active');
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  document.getElementById('tab-settings')?.classList.add('active');
+  const card = document.getElementById('remotes-card');
+  if (card) {
+    card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    card.classList.add('card-flash');
+    setTimeout(() => card.classList.remove('card-flash'), 1200);
+    document.getElementById('remote-host')?.focus();
+  }
+};
+
+function _remoteFormValues() {
+  return {
+    id:            (document.getElementById('remote-id')?.value || '').trim(),
+    name:          (document.getElementById('remote-name')?.value || '').trim(),
+    host:          (document.getElementById('remote-host')?.value || '').trim(),
+    user:          (document.getElementById('remote-user')?.value || '').trim(),
+    port:          parseInt(document.getElementById('remote-port')?.value || '22', 10) || 22,
+    identity_file: (document.getElementById('remote-identity')?.value || '').trim(),
+  };
+}
+
+function _setRemoteStatus(text, kind) {
+  const el = document.getElementById('remote-test-status');
+  if (!el) return;
+  el.textContent = text || '';
+  el.classList.remove('status-ok', 'status-fail');
+  if (kind === 'ok') el.classList.add('status-ok');
+  if (kind === 'fail') el.classList.add('status-fail');
+}
+
+function initRemotesForm() {
+  const idInp = document.getElementById('remote-id');
+  idInp?.addEventListener('input', () => {
+    const v = idInp.value.toLowerCase().replace(/[^a-z0-9_-]+/g, '-');
+    if (v !== idInp.value) idInp.value = v;
+  });
+
+  document.getElementById('remote-test-btn')?.addEventListener('click', async () => {
+    const v = _remoteFormValues();
+    if (!v.host) { _setRemoteStatus('Host is required to test.', 'fail'); return; }
+    _setRemoteStatus('Testing connection…');
+    try {
+      const res = await fetch('/api/remotes/test', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(v),
+      });
+      const data = await res.json();
+      _setRemoteStatus((data.ok ? '✓ ' : '✗ ') + (data.message || ''), data.ok ? 'ok' : 'fail');
+    } catch (err) {
+      _setRemoteStatus('✗ ' + err, 'fail');
+    }
+  });
+
+  // (remote directory picker is defined below as window.openRemoteDirPicker)
+
+  document.getElementById('remote-add-btn')?.addEventListener('click', async () => {
+    const v = _remoteFormValues();
+    if (!v.host) { _setRemoteStatus('Host is required.', 'fail'); return; }
+    _setRemoteStatus('Saving…');
+    try {
+      const res = await fetch('/api/remotes', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(v),
+      });
+      const data = await res.json();
+      if (!data.ok) { _setRemoteStatus('✗ ' + (data.error || 'failed'), 'fail'); return; }
+      _setRemoteStatus('✓ added', 'ok');
+      ['remote-id', 'remote-name', 'remote-host', 'remote-user', 'remote-identity']
+        .forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+      const portEl = document.getElementById('remote-port'); if (portEl) portEl.value = '22';
+      await refreshRemotes();
+      // Activate the freshly added remote.
+      if (data.remote?.id) window.setRemoteMode('remote', data.remote.id);
+    } catch (err) {
+      _setRemoteStatus('✗ ' + err, 'fail');
+    }
+  });
+}
+
+// Remote directory picker — a small modal that navigates folders on the active
+// remote host over SSH and writes the chosen path into the working-dir field.
+window.openRemoteDirPicker = function (inputId) {
+  const rid = window.getRemoteId?.();
+  if (!rid) return;
+  let curPath = '';   // '' → server resolves the remote home
+
+  const overlay = document.createElement('div');
+  overlay.className = 'remote-picker-overlay';
+  overlay.innerHTML = `
+    <div class="remote-picker" role="dialog" aria-label="Choose a remote folder">
+      <div class="remote-picker-head">
+        <span class="remote-picker-title">🌐 Remote folder</span>
+        <button class="remote-picker-close" title="Close">✕</button>
+      </div>
+      <div class="remote-picker-path" id="rp-path">…</div>
+      <div class="remote-picker-list" id="rp-list"><div class="remote-picker-loading">Loading…</div></div>
+      <div class="remote-picker-foot">
+        <button class="btn-secondary btn-sm" id="rp-cancel">Cancel</button>
+        <button class="btn-primary btn-sm" id="rp-use">Use this folder</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  const close = () => overlay.remove();
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  overlay.querySelector('.remote-picker-close').addEventListener('click', close);
+  overlay.querySelector('#rp-cancel').addEventListener('click', close);
+  overlay.querySelector('#rp-use').addEventListener('click', () => {
+    if (curPath) {
+      window.setWorkingDir(curPath);
+      const input = document.getElementById(inputId);
+      if (input) { input.value = curPath; input.dispatchEvent(new Event('change', { bubbles: true })); }
+    }
+    close();
+  });
+
+  async function load(path) {
+    const listEl = overlay.querySelector('#rp-list');
+    listEl.innerHTML = '<div class="remote-picker-loading">Loading…</div>';
+    try {
+      const res = await fetch(`/api/remote-dirs?remote_id=${encodeURIComponent(rid)}&path=${encodeURIComponent(path)}`);
+      const data = await res.json();
+      if (!data.ok) { listEl.innerHTML = `<div class="remote-picker-error">${esc(data.error || 'failed')}</div>`; return; }
+      curPath = data.path;
+      overlay.querySelector('#rp-path').textContent = curPath;
+      const rows = [`<button class="remote-picker-row remote-picker-up" data-path="${esc(curPath + '/..')}">↩ ..</button>`]
+        .concat((data.dirs || []).map(d =>
+          `<button class="remote-picker-row" data-path="${esc((curPath.endsWith('/') ? curPath : curPath + '/') + d)}">📁 ${esc(d)}</button>`));
+      listEl.innerHTML = rows.join('') || '<div class="remote-picker-empty">(no sub-folders)</div>';
+      listEl.querySelectorAll('.remote-picker-row').forEach(btn =>
+        btn.addEventListener('click', () => load(btn.dataset.path)));
+    } catch (err) {
+      listEl.innerHTML = `<div class="remote-picker-error">${esc(String(err))}</div>`;
+    }
+  }
+  load(curPath);
+};
 
 // ──────────────────────────────────────────────────────────────
 // MCP servers (Settings tab) — wire in external tools
@@ -1674,7 +1935,7 @@ function maybeShowFilePicker(ta) {
   }
   pickerToken = { start: i, end: caret };
   const query = value.slice(i + 1, caret);
-  const wd = document.getElementById('chat-dir-input')?.value || '.';
+  const wd = window.getWorkingDir();
   fetch(`/api/picker?working_dir=${encodeURIComponent(wd)}&q=${encodeURIComponent(query)}`)
     .then(r => r.json())
     .then(data => {

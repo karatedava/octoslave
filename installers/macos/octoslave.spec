@@ -48,7 +48,7 @@ datas = [
 # ---------------------------------------------------------------------------
 hidden = [
     # octoslave internals
-    "octoslave.agent", "octoslave.config", "octoslave.display",
+    "octoslave.agent", "octoslave.interrupt", "octoslave.config", "octoslave.display",
     "octoslave.logger", "octoslave.parallel", "octoslave.research",
     "octoslave.tools", "octoslave.tools_bio", "octoslave.vault",
     "octoslave.web.app", "octoslave.wizard",

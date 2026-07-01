@@ -103,9 +103,10 @@ ots                                            # interactive TUI (default backen
 ots run "build a todo API"                     # one-shot task, then exit
 ots improved                                   # Improved TUI — a unified model council (see below)
 ots improved run "analyse this dataset"        # one-shot through the council
+ots improved run "hard task" --ultra           # Ultra — multi-model debate (strongest)
 ots --local                                    # local Ollama
 ots --nim                                       # NVIDIA NIM
-ots web                                          # browser UI at http://127.0.0.1:7860 (Improved toggle ON by default)
+ots web                                          # browser UI at http://127.0.0.1:7860 (Standard · Improved · Ultra selector)
 ots run "build a Flask REST API for a todo app"
 ots run "summarise this paper" -i                # one-shot, then stay interactive
 
@@ -128,6 +129,7 @@ ots
 | | |
 |---|---|
 | 🐙 **Improved mode** | A unified model council — Thinker · Worker · Verifier behind one agent (`ots improved`) |
+| ⚡ **Ultra mode** | Deeper tier — a diverse panel debates the plan & completion, synthesized into one (`ots improved --ultra`) |
 | 🔁 **Autonomous loop** | Runs many tool-call iterations end-to-end — no hand-holding |
 | 🧠 **Upfront planning** | Writes a numbered execution plan before touching files |
 | ✅ **Self-verification** | Optional DONE / PARTIAL / FAILED grade after each task (`--verify`) |
@@ -181,10 +183,12 @@ Common flags for `ots` and `ots run`:
 | `/help` | Show all commands |
 | `/model [name]` | Switch model (lists available if no name) |
 | `/dir [path]` · `/new-project [hint]` | Change or create a working directory |
+| `/remote [id\|local\|add]` | Run tools locally or on a remote host over SSH |
 | `/profile [name]` | Switch prompt profile |
 | `/permission [mode]` | Show or change permission mode |
 | `/plan` · `/verify` · `/memory` | Toggle agentic behaviours (`on`/`off`) |
 | `/improved [on\|off\|status]` | Toggle Improved (council) mode and show the resolved roles |
+| `/ultra [on\|off\|status]` | Toggle Ultra (multi-model debate) on top of Improved mode |
 | `/parallel N [strategy] task` | Run N agents on one task |
 | `/long-research TASK [flags]` | Launch the autonomous Lab (dynamic team) |
 | `/vault-improve [path]` | Launch vault-wide note improvement |
@@ -241,8 +245,9 @@ single model.
 ```bash
 ots improved                                   # Improved TUI (interactive)
 ots improved run "analyse this dataset" -p analyst -d ~/data   # one-shot (mirrors `ots run`)
+ots improved --ultra                           # deeper tier (multi-model debate)
 ots improved --thinker glm-5.2                 # override a role
-ots web                                         # web UI ships the "🐙 Improved" toggle ON by default
+ots web                                         # web UI: Standard · Improved · Ultra selector (Improved default)
 ```
 
 Three roles, drawn from the best of the e-INFRA offer:
@@ -261,10 +266,23 @@ A **heuristic coordinator** routes each step (no extra routing call, so it stays
 - repeated errors pull in the Thinker for a course correction;
 - when the Worker claims done, the Verifier grades the result and can send it back for another round.
 
+**Diversity escalation:** when the Worker gets stuck — repeated errors, a verifier-deadlocked action,
+a rejected completion, or **re-running the same action with no progress** — the loop switches it to a
+different model *family* (a block one family can't clear is often trivial for another) and, on a
+rejected completion, the Thinker re-strategizes. Two trust guards: the Worker is **forced to act
+before it can ever "complete"**, and a run that loops on an identical action is stopped automatically.
+
+**⚡ Ultra** (`ots improved --ultra`, `/ultra on`, or the web selector): for the hardest tasks, a
+**diverse panel** (one model per family, e.g. `kimi-k2.7 · glm-5.2 · deepseek-v3.2-thinking`) each
+drafts the **plan** in isolation and the aggregator synthesizes one stronger plan; at **completion**
+the panel independently grades the work and the aggregator resolves their verdicts. Isolated
+drafts/reviews preserve diversity; the synthesis harvests their combined strengths — how a
+non-frontier pool can exceed any single model. More tokens/latency, so it's **off by default**.
+
 Models are **probed live** at startup and resolved down a fallback chain; override any role with
 `--worker/--thinker/--verifier` or `OCTOSLAVE_COUNCIL_{WORKER,THINKER,VERIFIER}`. Toggle mid-session
-with `/improved on|off|status`. Needs a cloud backend (e-INFRA / NIM); on local Ollama it falls back
-to the normal single agent. The plain `ots` is unchanged. Full details:
+with `/improved on|off|status` and `/ultra on|off|status`. Needs a cloud backend (e-INFRA / NIM); on
+local Ollama it falls back to the normal single agent. The plain `ots` is unchanged. Full details:
 [docs/IMPROVED_MODE.md](docs/IMPROVED_MODE.md).
 
 ### Agentic behaviour
@@ -335,6 +353,47 @@ ots batch tasks.txt --resume                             # tasks one-per-line, '
 
 Both persist state to disk and resume exactly where they left off. See
 [docs/VAULT_IMPROVE.md](docs/VAULT_IMPROVE.md).
+
+### Remote execution (SSH)
+
+By default the agent operates on your local machine. Switch to a **remote host**
+and its `bash` and file tools (read / write / edit, glob, grep, list, background
+jobs) run over SSH on that host instead — for remote compute, GPUs, or data that
+lives on a server. Path-based bio/OCR tools still work: the remote file is staged
+to a local temp copy, processed, and any output pushed back. **Local is always the
+default**; you opt in per session, and switching back is instant.
+
+**Add a host once**, then switch between hosts freely — the toggle/`/remote`
+command lists every configured remote so you can pick which one to connect to.
+
+```bash
+# TUI
+ots
+  /remote add            # register a host (id, name, host, user, port, optional key)
+  /remote list           # show every configured remote
+  /remote <id>           # connect to one over SSH (starts in its home dir)
+  /remote local          # back to local execution
+  /dir <path>            # change the remote folder
+
+# One-shot
+ots run "train the model" --remote gpu01
+```
+
+**Web UI.** Next to the working-directory picker there's a **💻 Local | 🌐 Remote**
+toggle (a dropdown lets you choose *which* remote when several are configured).
+Choosing *Remote* with nothing set up opens the **Remote hosts (SSH)** card in
+Settings — add / test connection / delete. Once connected you start in the remote
+home directory, and the **Browse…** button navigates folders **on the remote host**
+(no working directory is entered up front). The toggle is on the start screen and
+after every **New Chat**.
+
+**Transport & auth.** OctoSlave shells out to your system `ssh`/`scp`, so it honors
+`~/.ssh/config`, keys, ssh-agent and `ProxyJump`, with connection multiplexing for
+speed. Auth is **key/agent based** (no interactive password prompts), so a
+passphrase-protected key must be loaded once with `ssh-add` first. Remotes are
+stored in `~/.octoslave/config.json`; MCP servers stay local.
+
+See [docs/REMOTE_EXECUTION.md](docs/REMOTE_EXECUTION.md) for the full guide.
 
 ---
 
@@ -410,6 +469,7 @@ modifying action), `supervised` (ask before file edits only). See
 | [docs/USAGE.md](docs/USAGE.md) | Extended usage examples and install reference |
 | [docs/RESEARCH.md](docs/RESEARCH.md) | Long-research pipeline contract and per-role models |
 | [docs/VAULT_IMPROVE.md](docs/VAULT_IMPROVE.md) | Vault-improve pipeline |
+| [docs/REMOTE_EXECUTION.md](docs/REMOTE_EXECUTION.md) | Run the agent on a remote host over SSH |
 | [docs/PERMISSION_MODE.md](docs/PERMISSION_MODE.md) | Permission mode reference |
 | [docs/PROMPT_PROFILES.md](docs/PROMPT_PROFILES.md) | Prompt profile reference |
 | [docs/SCRAPING.md](docs/SCRAPING.md) | Web scraping / `crawl_tree` details |

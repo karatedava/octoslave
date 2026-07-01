@@ -541,6 +541,20 @@ def print_done(iterations: int):
     console.print()
 
 
+def print_interrupted(iterations: int):
+    """Stopped by the user. Emits a ``done`` event (so the web UI resets its
+    running state) tagged ``stopped`` so the client can label it accordingly."""
+    _emit({"type": "done", "iterations": iterations, "stopped": True})
+    if _silent():
+        return
+    console.print()
+    console.print(
+        f"  [bold #f5a742]⏹[/bold #f5a742] [dim #7a7d86]stopped · "
+        f"{iterations} iteration{'s' if iterations != 1 else ''}[/dim #7a7d86]"
+    )
+    console.print()
+
+
 # ---------------------------------------------------------------------------
 # Todo list (task tracking)
 # ---------------------------------------------------------------------------
@@ -714,6 +728,7 @@ def print_help():
         "[bold white]Slash commands[/bold white]\n\n"
         "  [cyan]/model [NAME][/cyan]           Switch model (or list if no name given)\n"
         "  [cyan]/dir [PATH][/cyan]             Change working directory\n"
+        "  [cyan]/remote [ID|local|add][/cyan]  Run tools locally or on a remote host over SSH\n"
         "  [cyan]/profile [NAME][/cyan]         Switch prompt profile (base/coder/analyst)\n"
         "  [cyan]/permission [MODE][/cyan]      Switch permission mode (autonomous/controlled/supervised)\n"
         "  [cyan]/verbose[/cyan]                Toggle verbose mode (show full diffs & output live)\n"
@@ -733,6 +748,7 @@ def print_help():
         "  [cyan]/verify on|off[/cyan]          Enable/disable post-task verification grade (default: off)\n"
         "  [cyan]/improved on|off|status[/cyan] Toggle council mode (Thinker/Worker/Verifier model pool)\n"
         "  [cyan]/memory[/cyan]                 Show this project's memory (remembered insights + prior task outcomes)\n"
+        "  [cyan]/memory forget <text>[/cyan]  Remove stale insight(s) matching <text>\n"
         "  [cyan]/memory clear[/cyan]           Erase this project's memory file (.octo/memory.md)\n"
         "  [cyan]/memory on|off[/cyan]          Enable/disable memory loading/saving (default: on)\n\n"
         "[bold white]Backend switching:[/bold white]\n"

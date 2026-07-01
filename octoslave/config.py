@@ -153,8 +153,47 @@ COUNCIL_ROLE_PREFERENCES: dict[str, list[str]] = {
 # whose family differs from the resolved Worker wins; if none differ, escalation
 # is simply disabled (graceful).
 COUNCIL_WORKER_ESCALATION: list[str] = [
-    "deepseek-v3.2-thinking", "glm-5.2", "qwen3-coder", "kimi-k2.6",
+    "kimi-k2.6","glm-5.2","deepseek-v3.2-thinking"
 ]
+
+# ---------------------------------------------------------------------------
+# Ultra tier — multi-model best-of-N debate (deeper orchestration)
+# ---------------------------------------------------------------------------
+# A diverse, isolated panel that independently drafts a candidate (e.g. a plan or
+# a critical solution), which an aggregator then synthesizes into one stronger
+# answer. Isolation between panelists preserves diversity (prevents "orchestration
+# collapse"); the synthesis harvests the union of their strengths — the mechanism
+# that lets a non-frontier pool exceed any single model. kimi/glm prioritized,
+# with one different-family reasoner for genuine diversity. Resolved against the
+# live catalog; deduped by family so the panel is actually diverse.
+COUNCIL_DEBATE_MODELS: list[str] = [
+    "kimi-k2.7", "glm-5.2", "deepseek-v3.2-thinking",
+]
+# How many panelists to actually use (kept small for latency/cost).
+COUNCIL_DEBATE_PANEL = 3
+
+
+def resolve_debate_panel(available: list[str] | None, worker: str = "") -> list[str]:
+    """Pick up to COUNCIL_DEBATE_PANEL debate models, one per family, from the
+    live catalog (prioritizing the configured order). Falls back to the configured
+    ids when the catalog is unknown. The primary worker is included first so the
+    panel always contains the main model plus diverse second opinions."""
+    avail = {m for m in (available or [])}
+    picked: list[str] = []
+    seen_fam: set[str] = set()
+    for cand in ([worker] if worker else []) + COUNCIL_DEBATE_MODELS:
+        if not cand:
+            continue
+        if avail and cand not in avail:
+            continue
+        fam = _model_family(cand)
+        if fam in seen_fam or cand in picked:
+            continue
+        picked.append(cand)
+        seen_fam.add(fam)
+        if len(picked) >= COUNCIL_DEBATE_PANEL:
+            break
+    return picked
 
 
 def _model_family(model: str) -> str:
@@ -218,6 +257,13 @@ def resolve_council_models(
             if cand in avail_set and _model_family(cand) != worker_fam:
                 roles["worker_alt"] = cand
                 break
+
+    # Ultra-tier debate panel (diverse, one model per family). Stored as a list
+    # under a non-standard key — print_roles / the loop only read the three string
+    # roles, so the extra entry is inert unless ultra mode pulls it.
+    panel = resolve_debate_panel(list(avail_set) if avail_set else None, roles.get("worker", ""))
+    if len(panel) >= 2:
+        roles["debate"] = panel  # type: ignore[assignment]
     return roles, notes
 
 
@@ -533,6 +579,7 @@ def load_config() -> dict:
         "role_models_ollama": {},
         "custom_providers": [],     # list of {id, name, base_url, api_key, default_model, models?}
         "mcp_servers": [],          # list of {name, enabled, command/args/env | url/headers}
+        "remotes": [],              # list of {id, name, host, user, port, remote_dir, identity_file}
     }
     # Env vars override config file
     if os.environ.get("OCTOSLAVE_API_KEY"):
@@ -580,6 +627,12 @@ def load_config() -> dict:
             if isinstance(mcp, list):
                 config["mcp_servers"] = [
                     s for s in mcp if isinstance(s, dict) and s.get("name")
+                ]
+            # Remote (SSH) targets — only loaded from file
+            remotes = saved.get("remotes")
+            if isinstance(remotes, list):
+                config["remotes"] = [
+                    r for r in remotes if isinstance(r, dict) and r.get("id")
                 ]
             # role_models_* are dicts — no env-var override, just load from file.
             # We also pick up role_models_<custom-id> dynamically.
@@ -765,6 +818,104 @@ def remove_custom_provider(provider_id: str) -> bool:
         cfg["backend"] = "einfra"
     # Drop any role_models_<id> entries for the removed provider
     cfg.pop(f"role_models_{provider_id}", None)
+    _write_config_file(cfg)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Remote (SSH) targets CRUD
+# ---------------------------------------------------------------------------
+
+def _normalize_remote(r: dict) -> dict:
+    """Return a clean remote-target dict from raw user input."""
+    rid = _normalize_provider_id(r.get("id") or r.get("name") or r.get("host") or "")
+    name = (r.get("name") or rid or "").strip() or rid
+    host = (r.get("host") or "").strip()
+    user = (r.get("user") or "").strip()
+    # Optional: unset ("") means "start in the remote home directory", resolved
+    # on connect. The working dir is then chosen by browsing the remote host.
+    remote_dir = (r.get("remote_dir") or "").strip()
+    identity_file = (r.get("identity_file") or "").strip()
+    try:
+        port = int(r.get("port") or 22)
+    except (ValueError, TypeError):
+        port = 22
+    return {
+        "id": rid,
+        "name": name,
+        "host": host,
+        "user": user,
+        "port": port,
+        "remote_dir": remote_dir,
+        "identity_file": identity_file,
+    }
+
+
+def _validate_remote(r: dict) -> str | None:
+    """Return an error message if the remote is invalid, else None."""
+    if not r.get("id"):
+        return "Remote id is required."
+    if not r.get("host"):
+        return "Host is required."
+    return None
+
+
+def get_remotes(cfg: dict | None = None) -> list[dict]:
+    """Return the list of user-defined remote (SSH) targets."""
+    if cfg is None:
+        cfg = load_config()
+    remotes = cfg.get("remotes") or []
+    return [r for r in remotes if isinstance(r, dict) and r.get("id")]
+
+
+def get_remote(cfg: dict | None, remote_id: str) -> dict | None:
+    """Return the remote target with this id, or None."""
+    if not remote_id:
+        return None
+    for r in get_remotes(cfg):
+        if r.get("id") == remote_id:
+            return r
+    return None
+
+
+def add_remote(remote: dict) -> dict:
+    """Add a new remote target. Raises ValueError on validation errors."""
+    r = _normalize_remote(remote)
+    err = _validate_remote(r)
+    if err:
+        raise ValueError(err)
+    cfg = load_config()
+    existing = cfg.get("remotes") or []
+    if any(e.get("id") == r["id"] for e in existing):
+        raise ValueError(f"Remote id '{r['id']}' already exists.")
+    existing.append(r)
+    cfg["remotes"] = existing
+    _write_config_file(cfg)
+    return r
+
+
+def update_remote(remote_id: str, fields: dict) -> dict:
+    """Patch an existing remote target. id is immutable."""
+    cfg = load_config()
+    existing = cfg.get("remotes") or []
+    for i, e in enumerate(existing):
+        if e.get("id") == remote_id:
+            merged = {**e, **fields, "id": remote_id}
+            existing[i] = _normalize_remote(merged)
+            cfg["remotes"] = existing
+            _write_config_file(cfg)
+            return existing[i]
+    raise ValueError(f"Remote '{remote_id}' not found.")
+
+
+def remove_remote(remote_id: str) -> bool:
+    """Remove a remote target. Returns True if removed."""
+    cfg = load_config()
+    existing = cfg.get("remotes") or []
+    new_list = [e for e in existing if e.get("id") != remote_id]
+    if len(new_list) == len(existing):
+        return False
+    cfg["remotes"] = new_list
     _write_config_file(cfg)
     return True
 

@@ -45,6 +45,7 @@ from openai import OpenAI
 
 from . import display
 from . import logger
+from . import interrupt
 from .agent import (
     MAX_ITERATIONS,
     _robust_stream,
@@ -59,7 +60,7 @@ from .agent import (
     load_session_memory,
     _rt,
 )
-from .tools import execute_tool, all_tool_definitions, valid_tool_names, init_mcp
+from .tools import execute_tool, all_tool_definitions, valid_tool_names, init_mcp, configure_execution
 from .config import (
     load_config,
     resolve_backend,
@@ -86,6 +87,14 @@ _TAG = {
 _MAX_VERIFIER_REVISIONS = 2
 # Bound how many full completion-gate rounds the Verifier can demand.
 _MAX_COMPLETION_ROUNDS = 3
+# Re-running the SAME action (same tool + args) with no edit in between is the
+# classic stuck loop (e.g. running `tsc`/tests repeatedly without changing code).
+# Soft = re-strategize + switch family; hard = stop the loop. Re-runs that follow
+# a real edit are productive and never counted (the streak resets on each edit).
+_REPEAT_LOOP_SOFT = 3
+_REPEAT_LOOP_HARD = 6
+# Tools whose successful execution counts as a real state change (resets streaks).
+_EDIT_TOOLS = frozenset({"write_file", "edit_file", "apply_patch"})
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +226,56 @@ def _verifier_gate_completion(
     return True, ""
 
 
+def _debate_completion(
+    client: OpenAI,
+    panel: list[str],
+    aggregator_model: str,
+    task: str,
+    messages: list[dict],
+) -> tuple[bool, str]:
+    """Completion gate as a debate: a diverse panel of critics each grades the
+    finished work in ISOLATION, then the aggregator resolves their verdicts.
+
+    Different model families catch different defects, so a deliverable only clears
+    when independent critics agree — and a real issue any one of them spots is
+    surfaced. The aggregator makes the final call (and dismisses nitpicks), so a
+    lone over-strict critic can't deadlock progress. Returns ``(done, note)``."""
+    verdicts: list[tuple[str, bool, str]] = []
+    for m in panel:
+        done, note = _verifier_gate_completion(client, m, task, messages)
+        verdicts.append((m, done, note))
+    # Unanimous DONE → finish without spending an aggregator call.
+    if all(d for _, d, _ in verdicts):
+        return True, ""
+    concerns = [f"- {m}: {note}" for m, d, note in verdicts if not d and note]
+    if not concerns:  # a REVISE with no stated reason — treat as a minor, pass it
+        return True, ""
+    transcript = _recent_text(messages, n=10)
+    prompt = (
+        f"You are the AGGREGATOR resolving a completion review. Independent critics "
+        f"graded the WORKER's finished work; some raised concerns. Decide the FINAL "
+        f"verdict: is the deliverable actually complete and correct for the task?\n\n"
+        f"TASK:\n{task}\n\nWHAT THE WORKER DID (recent transcript):\n{transcript[:3500]}\n\n"
+        f"CRITIC CONCERNS:\n" + "\n".join(concerns) + "\n\n"
+        "Dismiss concerns that are nitpicks or already satisfied. Reply with EXACTLY one of:\n"
+        "  DONE\n"
+        "  REVISE: <the single most important REAL defect to fix>\n"
+        "Be terse."
+    )
+    raw = _simple_completion(client, aggregator_model, [
+        {"role": "system", "content": "You make the final completion call from several reviews. Decisive, no preamble."},
+        {"role": "user", "content": prompt},
+    ], max_tokens=200).strip()
+    if not raw:
+        # Aggregator silent — fall back to the strongest critic concern (stay safe).
+        return False, concerns[0].split(": ", 1)[-1]
+    head = raw.splitlines()[0].strip()
+    if head.upper().startswith("REVISE"):
+        reason = head.split(":", 1)[1].strip() if ":" in head else raw[len("REVISE"):].strip()
+        return False, reason or "work appears incomplete"
+    return True, ""
+
+
 def _thinker_consult(
     client: OpenAI,
     thinker_model: str,
@@ -243,6 +302,68 @@ def _thinker_consult(
 # Thinker plan (orient with worker's tools, then plan with the reasoning model)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Ultra tier — best-of-N debate (isolated panel + aggregator)
+# ---------------------------------------------------------------------------
+
+def _debate_drafts(
+    client: OpenAI,
+    models: list[str],
+    system: str,
+    prompt: str,
+    max_tokens: int = 800,
+) -> list[tuple[str, str]]:
+    """Ask each panel model the SAME prompt in ISOLATION (none sees another's
+    answer) and return ``[(model, text), …]`` for the non-empty replies.
+
+    Isolation is deliberate — it preserves the diversity the aggregator harvests
+    and prevents the panel from collapsing onto the first model's framing."""
+    drafts: list[tuple[str, str]] = []
+    for m in models:
+        txt = _simple_completion(client, m, [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ], max_tokens=max_tokens).strip()
+        if txt:
+            drafts.append((m, txt))
+    return drafts
+
+
+def _aggregate(
+    client: OpenAI,
+    aggregator_model: str,
+    task: str,
+    instruction: str,
+    drafts: list[tuple[str, str]],
+    max_tokens: int = 900,
+) -> str:
+    """Synthesize the isolated panel drafts into one stronger answer.
+
+    The aggregator is told to keep the best of each, drop what's wrong, and resolve
+    disagreements — not to vote, but to compose. Returns the synthesized text (or
+    the single draft when only one is present)."""
+    if not drafts:
+        return ""
+    if len(drafts) == 1:
+        return drafts[0][1]
+    panel = "\n\n".join(
+        f"--- CANDIDATE {i+1} (from {m}) ---\n{txt}" for i, (m, txt) in enumerate(drafts)
+    )
+    prompt = (
+        f"You are the AGGREGATOR. {len(drafts)} models independently produced the "
+        f"candidates below for this task. Synthesize ONE superior result: keep the "
+        f"strongest, most correct ideas from each, drop anything wrong or redundant, "
+        f"and resolve disagreements on the merits. Output only the final result, in "
+        f"the same format the task asks for — do not mention the candidates.\n\n"
+        f"TASK:\n{task}\n\nWHAT TO PRODUCE:\n{instruction}\n\nCANDIDATES:\n{panel}"
+    )
+    out = _simple_completion(client, aggregator_model, [
+        {"role": "system", "content": "You compose the best unified answer from several drafts. Be decisive and concrete."},
+        {"role": "user", "content": prompt},
+    ], max_tokens=max_tokens).strip()
+    return out or drafts[0][1]
+
+
 def _thinker_plan(
     client: OpenAI,
     roles: dict[str, str],
@@ -250,14 +371,17 @@ def _thinker_plan(
     messages: list[dict],
     working_dir: str,
     permission_mode: str,
+    ultra: bool = False,
 ) -> tuple[list[dict], str]:
-    """Orient (read-only, via Worker) then ask the Thinker for a strategic plan.
+    """Orient (read-only, via Worker) then author a strategic plan.
 
-    Returns ``(messages, plan_text)`` with the plan injected so the Worker shares it."""
+    Normal: the Thinker writes the plan. Ultra: a diverse panel each drafts a plan
+    in isolation and the aggregator (Verifier model — a different family, good at
+    judging) synthesizes them into one stronger plan (multi-model debate). Returns
+    ``(messages, plan_text)`` with the plan injected so the Worker shares it."""
     # Orientation uses the worker model (good tool-caller) with read-only tools.
     messages = _orientation_phase(client, roles["worker"], messages, working_dir, permission_mode)
 
-    display.print_info(f"{_TAG['thinker']} planning…")
     plan_request = (
         "You are the THINKER. Based on the task and what was just observed in the "
         "working directory, write a concise numbered plan (3-8 steps) the WORKER will "
@@ -265,7 +389,29 @@ def _thinker_plan(
         "Do not call tools — output the plan only."
     )
     plan_msgs = list(messages) + [{"role": "user", "content": plan_request}]
-    plan_text = _simple_completion(client, roles["thinker"], plan_msgs, max_tokens=800).strip()
+
+    panel = roles.get("debate") if ultra else None
+    if panel and len(panel) >= 2:
+        digest = _recent_text(messages, n=6)
+        draft_prompt = (
+            f"{plan_request}\n\nTASK:\n{task}\n\n"
+            f"WHAT WAS OBSERVED IN THE WORKING DIRECTORY:\n{digest[:3000]}"
+        )
+        display.print_info(
+            f"{_TAG['thinker']} debating the plan across "
+            f"[bold]{', '.join(panel)}[/bold]…"
+        )
+        drafts = _debate_drafts(client, panel, "You are a sharp planning strategist. Be concrete and brief.", draft_prompt)
+        plan_text = _aggregate(
+            client, roles["verifier"], task,
+            "a single numbered execution plan (3-8 steps)", drafts,
+        ).strip()
+        if not plan_text:  # debate produced nothing usable — fall back to the solo planner
+            plan_text = _simple_completion(client, roles["thinker"], plan_msgs, max_tokens=800).strip()
+    else:
+        display.print_info(f"{_TAG['thinker']} planning…")
+        plan_text = _simple_completion(client, roles["thinker"], plan_msgs, max_tokens=800).strip()
+
     if not plan_text:
         return messages, ""
 
@@ -319,9 +465,12 @@ def _council_loop(
     working_dir: str,
     client: OpenAI,
     permission_mode: str,
+    ultra: bool = False,
 ) -> list[dict]:
     worker = roles["worker"]
     worker_alt = roles.get("worker_alt")  # diverse second-opinion model (may be None)
+    # Ultra: a diverse critic panel debates the completion gate (else single Verifier).
+    completion_panel = roles.get("debate") if ultra else None
     active_worker = worker
     retry_state = {"rate": 0, "timeout": 0, "conn": 0}
     iteration = 0
@@ -331,6 +480,10 @@ def _council_loop(
     redundant = 0
     actions_taken = 0  # tool calls actually executed in this loop (NOT orientation)
     empty_start = 0    # consecutive no-tool turns before any work has begun
+    edit_epoch = 0           # ++ on each successful edit; identical actions across the
+    sig_epoch: dict = {}     # same epoch (no edit between) are a stuck repeat
+    sig_streak: dict = {}
+    repeat_warned = False     # nudged the current repeat-streak already
     end_reason = "completed"
 
     def _escalate_worker(reason: str) -> None:
@@ -352,6 +505,12 @@ def _council_loop(
 
     while iteration < MAX_ITERATIONS:
         iteration += 1
+        # User-requested stop (web UI) — caught between turns; the mid-stream
+        # check in _stream_completion handles aborts during generation.
+        if interrupt.should_stop():
+            display.print_interrupted(iteration - 1)
+            logger.log_session_end(iteration, reason="interrupted")
+            return messages
         # Force a tool call until the worker has actually DONE something. The
         # orient+plan preamble ends with the worker promising to execute, and
         # some models then narrate ("I will now…") or falsely claim completion
@@ -367,7 +526,7 @@ def _council_loop(
             continue
         if signal == "interrupt":
             display.stream_end(False)
-            display.console.print("\n[dim]Interrupted.[/dim]")
+            display.print_interrupted(iteration)
             logger.log_session_end(iteration, reason="interrupted")
             return messages
         if signal == "fatal":
@@ -434,8 +593,17 @@ def _council_loop(
             if completion_rounds > _MAX_COMPLETION_ROUNDS:
                 display.print_done(iteration)
                 break
-            display.print_info(f"{_TAG['verifier']} reviewing completion…")
-            done, note = _verifier_gate_completion(client, roles["verifier"], task, messages)
+            if completion_panel and len(completion_panel) >= 2:
+                display.print_info(
+                    f"{_TAG['verifier']} debating completion across "
+                    f"[bold]{', '.join(completion_panel)}[/bold]…"
+                )
+                done, note = _debate_completion(
+                    client, completion_panel, roles["verifier"], task, messages
+                )
+            else:
+                display.print_info(f"{_TAG['verifier']} reviewing completion…")
+                done, note = _verifier_gate_completion(client, roles["verifier"], task, messages)
             if done:
                 display.print_info(f"{_TAG['verifier']} [bold #7fd88f]approved[/bold #7fd88f] — task complete.")
                 display.print_done(iteration)
@@ -511,6 +679,7 @@ def _council_loop(
         # ---- Execute the (approved) tool calls --------------------------------
         display.print_separator()
         turn_had_error = False
+        turn_repeat = 0  # longest identical-action streak (no edit between) this turn
         actions_taken += len(tool_calls)  # the task has actually begun
         for tc in tool_calls:
             name = tc["function"]["name"]
@@ -542,6 +711,16 @@ def _council_loop(
                     redundant += 1
                 seen_calls[key] = seen_calls.get(key, 0) + 1
 
+            # Repeated-identical-action streak (covers bash/tests/builds too). A real
+            # edit advances the epoch, so re-running a command AFTER a change resets
+            # its streak; re-running it with nothing changed grows the streak.
+            if name in _EDIT_TOOLS and success:
+                edit_epoch += 1
+            sig = (name, raw_args)
+            sig_streak[sig] = (sig_streak.get(sig, 0) + 1) if sig_epoch.get(sig) == edit_epoch else 1
+            sig_epoch[sig] = edit_epoch
+            turn_repeat = max(turn_repeat, sig_streak[sig])
+
         # ---- Hard/stalled escalation to the Thinker ---------------------------
         if turn_had_error:
             stall += 1
@@ -556,6 +735,34 @@ def _council_loop(
                 # A different family often clears an error the current one keeps hitting.
                 _escalate_worker("repeated execution errors")
                 stall = 0
+
+        # ---- Stuck re-running the same action with no edits between ------------
+        if turn_repeat >= _REPEAT_LOOP_HARD:
+            display.print_error(
+                f"Worker repeated the same action {turn_repeat}× with no change between runs "
+                f"— stopping to avoid an endless loop."
+            )
+            display.print_done(iteration)
+            end_reason = "looping"
+            break
+        if turn_repeat >= _REPEAT_LOOP_SOFT and not repeat_warned:
+            repeat_warned = True
+            display.print_info(
+                f"{_TAG['worker']} is repeating the same action without progress — re-strategizing."
+            )
+            note = _thinker_consult(client, roles["thinker"], task, plan, messages)
+            if note:
+                display.print_plan(note)
+            messages.append({"role": "user", "content": (
+                f"You have run the SAME action {turn_repeat} times with nothing changed in between and "
+                f"got the same result — repeating it will not help. STOP repeating it. Either make a "
+                f"concrete edit to fix the underlying problem, or take a genuinely different approach"
+                + (f". Planner's guidance: {note}" if note else "")
+                + ". If the task is already complete, stop and say so."
+            )})
+            _escalate_worker("repeating the same action")
+        elif turn_repeat <= 1:
+            repeat_warned = False  # streak broken by a real edit / new action — re-arm
 
         if redundant >= 5:
             display.print_info("Stopping: repeated calls without new progress (task likely complete).")
@@ -578,7 +785,7 @@ def _council_loop(
 # Public entry points
 # ---------------------------------------------------------------------------
 
-def print_roles(roles: dict[str, str], notes: dict[str, str] | None = None) -> None:
+def print_roles(roles: dict[str, str], notes: dict[str, str] | None = None, ultra: bool = False) -> None:
     """Show the resolved council assignment (and any live-fallback notes)."""
     notes = notes or {}
     display.console.print("  [bold #fab283]🐙 council[/bold #fab283] [dim]— unified single agent[/dim]")
@@ -590,6 +797,10 @@ def print_roles(roles: dict[str, str], notes: dict[str, str] | None = None) -> N
         display.console.print(
             f"    [dim]↳ escalation worker:[/dim] [bold]{roles['worker_alt']}[/bold] "
             f"[dim](used when the Worker gets stuck)[/dim]"
+        )
+    if ultra and roles.get("debate"):
+        display.console.print(
+            f"    [dim]↳ ⚡ ultra debate panel:[/dim] [bold]{', '.join(roles['debate'])}[/bold]"
         )
     display.console.print()
 
@@ -604,12 +815,18 @@ def run_council_agent(
     enable_plan: bool = True,
     enable_memory: bool = True,
     plan_out: list | None = None,
+    ultra: bool = False,
+    remote: dict | None = None,
 ) -> list[dict]:
-    """Run one task through the council. Same return shape as ``agent.run_agent``."""
+    """Run one task through the council. Same return shape as ``agent.run_agent``.
+
+    ``ultra`` turns on deeper multi-model orchestration (currently: best-of-N
+    debate planning across a diverse panel, synthesized by the aggregator)."""
     if permission_mode is None:
         permission_mode = load_config().get("permission_mode", "autonomous")
 
-    init_mcp()
+    configure_execution(remote)
+    init_mcp(working_dir=working_dir)
     # Worker model drives tool knobs; council only runs on cloud backends so this
     # is a no-op for context sizing but keeps _rt() consistent.
     configure_runtime(client, roles["worker"], prompt_profile)
@@ -637,12 +854,17 @@ def run_council_agent(
     ]
 
     plan_text = ""
-    if enable_plan:
-        messages, plan_text = _thinker_plan(client, roles, task, messages, working_dir, permission_mode)
-        if plan_text and plan_out is not None:
-            plan_out.append(plan_text)
+    try:
+        if enable_plan:
+            messages, plan_text = _thinker_plan(
+                client, roles, task, messages, working_dir, permission_mode, ultra=ultra
+            )
+            if plan_text and plan_out is not None:
+                plan_out.append(plan_text)
 
-    return _council_loop(messages, roles, task, plan_text, working_dir, client, permission_mode)
+        return _council_loop(messages, roles, task, plan_text, working_dir, client, permission_mode, ultra=ultra)
+    finally:
+        configure_execution(None)
 
 
 def continue_council_agent(
@@ -652,11 +874,17 @@ def continue_council_agent(
     roles: dict[str, str],
     working_dir: str,
     permission_mode: str | None = None,
+    ultra: bool = False,
+    remote: dict | None = None,
 ) -> list[dict]:
     """Follow-up turn in council mode (no re-plan; Worker continues with gating)."""
     if permission_mode is None:
         permission_mode = load_config().get("permission_mode", "autonomous")
-    init_mcp()
+    configure_execution(remote)
+    init_mcp(working_dir=working_dir)
     configure_runtime(client, roles["worker"], "base")
     messages.append({"role": "user", "content": follow_up})
-    return _council_loop(messages, roles, follow_up, "", working_dir, client, permission_mode)
+    try:
+        return _council_loop(messages, roles, follow_up, "", working_dir, client, permission_mode, ultra=ultra)
+    finally:
+        configure_execution(None)

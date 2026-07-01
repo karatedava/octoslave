@@ -24,6 +24,7 @@ _STREAM_READ_TIMEOUT = httpx.Timeout(300.0, connect=30.0)
 
 from . import display
 from . import logger
+from . import interrupt
 from .tools import TOOL_DEFINITIONS, execute_tool, all_tool_definitions, valid_tool_names
 from .config import load_config, OLLAMA_BASE_URL
 
@@ -365,10 +366,13 @@ PROJECT_MEMORY_FILENAME = "memory.md"
 def memory_file(working_dir: str) -> Path:
     """Path to the project-scoped memory file for ``working_dir``."""
     return Path(working_dir) / PROJECT_MEMORY_DIR / PROJECT_MEMORY_FILENAME
-_SESSION_MAX_ENTRIES = 40   # session outcomes retained on disk
-_INSIGHT_MAX_ENTRIES = 60   # agent-authored insights retained on disk
+_SESSION_MAX_ENTRIES = 20   # session outcomes retained on disk
+_INSIGHT_MAX_ENTRIES = 40   # agent-authored insights retained on disk
 _RECALL_SESSIONS = 4        # session entries injected into a prompt
 _RECALL_INSIGHTS = 6        # insight entries injected into a prompt
+# Token-overlap (Jaccard) at/above which a new insight is treated as the same
+# fact as an existing one — the old copy is superseded rather than piling up.
+_INSIGHT_DUP_THRESHOLD = 0.5
 
 _MEMORY_STOPWORDS = frozenset(
     "the a an and or but for to of in on at by with from into is are was were be "
@@ -384,6 +388,15 @@ def _mem_tokenize(text: str) -> set[str]:
     tiktoken, consistent with how _estimated_tokens approximates token counts."""
     toks = re.findall(r"[a-z0-9_]{3,}", (text or "").lower())
     return {t for t in toks if t not in _MEMORY_STOPWORDS}
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    """Symmetric token-set similarity in [0, 1]. Used to detect near-duplicate
+    insights so re-stating a fact supersedes the old copy instead of bloating."""
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    return inter / len(a | b) if inter else 0.0
 
 
 def _entry_match_text(e: dict) -> str:
@@ -584,16 +597,60 @@ def save_memory_insight(working_dir: str, content: str, tags=None) -> bool:
         tag_str = ""
     try:
         entries = _parse_memory_entries(working_dir)
-        entries.append({
+        # Supersede near-duplicate insights instead of appending, so re-stating
+        # or updating a fact keeps memory concise rather than bloating it.
+        new_tok = _mem_tokenize(content)
+        kept = []
+        for e in entries:
+            if e.get("kind") == "insight" and _jaccard(new_tok, _mem_tokenize(e.get("text", ""))) >= _INSIGHT_DUP_THRESHOLD:
+                continue  # drop the stale/duplicate copy
+            kept.append(e)
+        kept.append({
             "kind": "insight",
             "date": _date_cls.today().isoformat(),
             "tags": tag_str[:120],
             "text": content,
         })
-        _write_memory(working_dir, entries)
+        _write_memory(working_dir, kept)
         return True
     except Exception:
         return False
+
+
+def delete_memory_insight(working_dir: str, query: str, max_remove: int = 3) -> list[str]:
+    """Remove agent insights that match ``query`` (the `forget` tool / `/memory
+    forget`). Returns the texts of removed insights (empty if none matched).
+
+    Matches lexically against insight text+tags; removes up to ``max_remove`` of
+    the strongest matches above a small relevance floor. Sessions are untouched."""
+    query = (query or "").strip()
+    if not query:
+        return []
+    try:
+        entries = _parse_memory_entries(working_dir)
+    except Exception:
+        return []
+    qtok = _mem_tokenize(query)
+    if not qtok:
+        return []
+    scored = []
+    for i, e in enumerate(entries):
+        if e.get("kind") != "insight":
+            continue
+        score = _mem_relevance(qtok, e)
+        if score > 0.0:
+            scored.append((score, i, e))
+    if not scored:
+        return []
+    scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
+    drop_ids = {id(e) for _, _, e in scored[:max_remove]}
+    removed = [e.get("text", "").strip() for _, _, e in scored[:max_remove]]
+    kept = [e for e in entries if id(e) not in drop_ids]
+    try:
+        _write_memory(working_dir, kept)
+    except Exception:
+        return []
+    return removed
 
 
 def load_system_prompt(profile: str = "base", working_dir: str = None) -> str:
@@ -1079,6 +1136,13 @@ def _stream_completion(client: OpenAI, model: str, messages: list, force_tool: b
         **extra,
     ) as stream:
         for chunk in stream:
+            # User-requested stop (web UI): abort the stream promptly. Inside the
+            # main loop this is caught by _robust_stream (StopRequested subclasses
+            # KeyboardInterrupt) and surfaced as the existing "interrupt" signal;
+            # when _stream_completion is called directly (orientation / planning
+            # phases) it propagates to the top-level handler in the web layer.
+            if interrupt.should_stop():
+                raise interrupt.StopRequested
             if not chunk.choices:
                 continue
             choice = chunk.choices[0]
@@ -1145,14 +1209,20 @@ def run_agent(
     enable_memory: bool = True,
     plan_out: list | None = None,
     verify_out: list | None = None,
+    remote: dict | None = None,
 ) -> list[dict]:
     if permission_mode is None:
         cfg = load_config()
         permission_mode = cfg.get("permission_mode", "autonomous")
 
+    # Route filesystem/bash tools to a remote host over SSH for this thread, or
+    # keep them local (default). Reset in the finally so a later local task on
+    # the same thread is unaffected.
+    from .tools import init_mcp, configure_execution
+    configure_execution(remote)
+
     # Connect any user-configured MCP servers (idempotent across calls).
-    from .tools import init_mcp
-    init_mcp()
+    init_mcp(working_dir=working_dir)
 
     # Adapt context/tool knobs to the backend (small-model accommodations for
     # local Ollama; no-op for e-INFRA / NIM / custom).
@@ -1206,18 +1276,21 @@ def run_agent(
     elif enable_plan and is_local:
         display.print_info("Local model: skipping separate planning step (plans inline).")
 
-    # Main agent loop
-    messages = _agent_loop(messages, model, working_dir, client, permission_mode)
+    try:
+        # Main agent loop
+        messages = _agent_loop(messages, model, working_dir, client, permission_mode)
 
-    # Post-loop verification pass
-    if enable_verify:
-        display.print_info("Verifying…")
-        verdict = _verify_completion(messages, task, client, model)
-        if verdict:
-            logger.log_verify(verdict)
-            display.print_verify(verdict)
-            if verify_out is not None:
-                verify_out.append(verdict)
+        # Post-loop verification pass
+        if enable_verify:
+            display.print_info("Verifying…")
+            verdict = _verify_completion(messages, task, client, model)
+            if verdict:
+                logger.log_verify(verdict)
+                display.print_verify(verdict)
+                if verify_out is not None:
+                    verify_out.append(verdict)
+    finally:
+        configure_execution(None)
 
     return messages
 
@@ -1229,13 +1302,15 @@ def continue_agent(
     working_dir: str,
     client: OpenAI,
     permission_mode: str = None,
+    remote: dict | None = None,
 ) -> list[dict]:
     if permission_mode is None:
         cfg = load_config()
         permission_mode = cfg.get("permission_mode", "autonomous")
 
-    from .tools import init_mcp
-    init_mcp()
+    from .tools import init_mcp, configure_execution
+    configure_execution(remote)
+    init_mcp(working_dir=working_dir)
 
     # Re-apply backend-adaptive knobs (per-thread state may be stale/unset on a
     # fresh follow-up turn or a different thread).
@@ -1243,7 +1318,10 @@ def continue_agent(
     configure_runtime(client, model, prompt_profile)
 
     messages.append({"role": "user", "content": follow_up})
-    return _agent_loop(messages, model, working_dir, client, permission_mode)
+    try:
+        return _agent_loop(messages, model, working_dir, client, permission_mode)
+    finally:
+        configure_execution(None)
 
 
 def _robust_stream(
@@ -1402,6 +1480,12 @@ def _agent_loop(
 
     while iteration < MAX_ITERATIONS:
         iteration += 1
+        # User-requested stop (web UI) — caught here between turns (e.g. while a
+        # tool was running) in addition to the mid-stream check.
+        if interrupt.should_stop():
+            display.print_interrupted(iteration - 1)
+            logger.log_session_end(iteration, reason="interrupted")
+            return messages
         # Force a tool call only on the very first turn — kick-starts models that
         # would otherwise reply with chit-chat. After that, leave tool_choice="auto"
         # so a model that has finished can naturally return a text-only "done"
@@ -1415,7 +1499,7 @@ def _agent_loop(
             continue
         if _signal == "interrupt":
             display.stream_end(False)
-            display.console.print("\n[dim]Interrupted.[/dim]")
+            display.print_interrupted(iteration)
             logger.log_session_end(iteration, reason="interrupted")
             return messages
         if _signal == "fatal":
