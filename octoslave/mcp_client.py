@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import threading
 import atexit
+import functools
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +97,90 @@ def _norm_roots(paths) -> list[str]:
         if ap not in out:
             out.append(ap)
     return out
+
+
+# ---------------------------------------------------------------------------
+# PATH resolution for stdio servers
+# ---------------------------------------------------------------------------
+#
+# When octoslave is launched as an installed GUI app (Finder/dock on macOS,
+# Start menu on Windows) rather than from a terminal, it inherits a bare-bones
+# PATH — typically ``/usr/bin:/bin:/usr/sbin:/sbin`` on macOS. Node installed
+# via Homebrew, nvm, fnm or volta lives elsewhere, so ``npx``/``uvx`` can't be
+# found and stdio MCP servers fail with "command not found" even though the
+# same command works fine in a shell. We rebuild a realistic PATH once and use
+# it to both resolve and launch stdio servers.
+
+_PATH_SENTINEL_A = "__OTS_PATH_BEGIN__"
+_PATH_SENTINEL_B = "__OTS_PATH_END__"
+
+
+@functools.lru_cache(maxsize=1)
+def _login_shell_path() -> str:
+    """The PATH the user's interactive login shell would have (nvm/fnm/volta
+    hook in via rc files, so only a login+interactive shell sees them).
+
+    Best-effort and cached: returns "" on Windows or on any failure.
+    """
+    if os.name == "nt":
+        return ""
+    shell = os.environ.get("SHELL") or "/bin/bash"
+    # printf around sentinels so rc-file banner noise on stdout can't corrupt
+    # the value we extract.
+    script = f'printf "%s%s%s" "{_PATH_SENTINEL_A}" "$PATH" "{_PATH_SENTINEL_B}"'
+    try:
+        out = subprocess.run(
+            [shell, "-ilc", script],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return ""
+    text = out.stdout or ""
+    i = text.find(_PATH_SENTINEL_A)
+    j = text.find(_PATH_SENTINEL_B)
+    if i == -1 or j == -1 or j < i:
+        return ""
+    return text[i + len(_PATH_SENTINEL_A):j]
+
+
+@functools.lru_cache(maxsize=1)
+def _enriched_path() -> str:
+    """Current PATH, augmented with the login-shell PATH and well-known Node/uv
+    install locations. Order preserved; only existing directories are kept."""
+    parts: list[str] = []
+
+    def add(p: str) -> None:
+        if p and p not in parts and os.path.isdir(p):
+            parts.append(p)
+
+    # Respect whatever PATH the process already has first.
+    for p in (os.environ.get("PATH") or "").split(os.pathsep):
+        add(p)
+    # Then the real login-shell PATH (covers nvm/fnm/volta/Homebrew node).
+    for p in _login_shell_path().split(os.pathsep):
+        add(p)
+
+    # Static backstops for the common cases where the probe above is
+    # unavailable (e.g. non-interactive shells that don't source rc files).
+    home = os.path.expanduser("~")
+    if os.name == "nt":
+        for p in (
+            os.path.join(os.environ.get("ProgramFiles", ""), "nodejs"),
+            os.path.join(os.environ.get("APPDATA", ""), "npm"),
+            os.path.join(home, "AppData", "Roaming", "npm"),
+            os.path.join(home, "AppData", "Local", "Programs", "nodejs"),
+        ):
+            add(p)
+    else:
+        for p in (
+            "/usr/local/bin", "/opt/homebrew/bin", "/opt/local/bin",
+            "/usr/bin", "/bin",
+            os.path.join(home, ".local", "bin"),
+            os.path.join(home, ".volta", "bin"),
+            os.path.join(home, ".cargo", "bin"),
+        ):
+            add(p)
+    return os.pathsep.join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -315,12 +400,18 @@ class MCPServer:
         command = self.config.get("command")
         if not command:
             raise MCPError("stdio MCP server requires a 'command'.")
-        resolved = shutil.which(command) or command
-        argv = [resolved, *(self.config.get("args") or [])]
+
         env = dict(os.environ)
         # Don't leak octoslave's venv into the child unless the user wants it.
         env.pop("VIRTUAL_ENV", None)
+        # Enrich PATH so npx/uvx/etc. resolve even when octoslave was launched
+        # as a GUI app with a minimal PATH (Finder/dock, Start menu).
+        env["PATH"] = _enriched_path()
         env.update({k: str(v) for k, v in (self.config.get("env") or {}).items()})
+
+        # Resolve against the same PATH the child will run with.
+        resolved = shutil.which(command, path=env.get("PATH")) or command
+        argv = [resolved, *(self.config.get("args") or [])]
 
         try:
             self._proc = subprocess.Popen(
@@ -334,7 +425,11 @@ class MCPServer:
                 cwd=self.config.get("cwd") or None,
             )
         except FileNotFoundError:
-            raise MCPError(f"command not found: {command}")
+            raise MCPError(
+                f"command not found: {command} "
+                f"(not on PATH; if it's installed via nvm/fnm/volta, launch "
+                f"octoslave from a terminal or set an absolute 'command' path)"
+            )
 
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
