@@ -169,7 +169,7 @@ Common flags for `ots` and `ots run`:
 |------|-------------|
 | `-m`, `--model` | Model override |
 | `-d`, `--dir` | Working directory |
-| `-p`, `--prompt-profile` | `base` / `coder` / `analyst` |
+| `-p`, `--prompt-profile` | `base` / `coder` / `analyst` / `cryouncle` |
 | `--local` / `--nim` | Force backend for this session |
 | `--permission-mode` | `autonomous` / `controlled` / `supervised` |
 | `--no-plan` / `--verify` / `--no-memory` | Toggle agentic behaviours |
@@ -456,8 +456,9 @@ Precedence: **environment variable** → `~/.octoslave/config.json` → built-in
 modifying action), `supervised` (ask before file edits only). See
 [docs/PERMISSION_MODE.md](docs/PERMISSION_MODE.md).
 
-**Prompt profiles:** `base` (default), `coder`, `analyst`. Switch with `-p NAME` or
-`/profile NAME`. See [docs/PROMPT_PROFILES.md](docs/PROMPT_PROFILES.md).
+**Prompt profiles:** `base` (default), `coder`, `analyst`, and `cryouncle` (a
+CryoSPARC-connected cryo-EM companion for structural biologists). Switch with
+`-p NAME` or `/profile NAME`. See [docs/PROMPT_PROFILES.md](docs/PROMPT_PROFILES.md).
 
 ---
 
