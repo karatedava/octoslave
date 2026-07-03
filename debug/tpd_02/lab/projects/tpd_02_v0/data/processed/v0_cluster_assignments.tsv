@@ -1,9 +1,0 @@
-peptide_id	canonical_sequence	label_active	cluster_id	score	net_charge_ph7_4	gravy	hydrophobic_moment	helicity_proxy	flag_combined_tox_risk
-tox_v0_01	GIGKFLHSAKKFGKAFVGEIMNS	1	cls_cationic_amphipathic_1	1.0	4.031	0.0826	0.2894	0.6438	1
-tox_v0_02	GIGKFLHSAGKFGKAFVGEIMNS	1	cls_cationic_amphipathic_1	1.0	3.032	0.2348	0.292	0.631	0
-tox_v0_03	KWKLFKKIGIGKVLTTGLPALIS	1	cls_cationic_amphipathic_2	1.0	5.991	0.5261	0.0444	0.6554	1
-tox_v0_04	GLFDIVKKVVGALGSL	1	cls_hydrophobic_short	0.0	0.999	1.2375	0.322	0.6546	0
-clo_v0_05	RLLFKFFRCKWKF	1	cls_cysteine_constrained	1.0	5.888	-0.0231	0.4244	0.7036	1
-neg_v0_06	AAAAAA	0	cls_decoy_1	0.0	-0.005	1.8	0.0471	0.9667	0
-neg_v0_07	GGGGGG	0	cls_decoy_2	0.4	-0.005	-0.4	0.0	0.3533	0
-neg_v0_08	EEKKEE	0	cls_decoy_3	0.4	-2.004	-3.6333	0.014	0.7356	0

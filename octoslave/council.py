@@ -197,20 +197,28 @@ def _verifier_gate_completion(
     verifier_model: str,
     task: str,
     messages: list[dict],
+    evidence: str = "",
 ) -> tuple[bool, str]:
     """Verifier grades the finished work. Returns ``(done, note)``.
 
-    DONE -> finish. REVISE -> Worker gets another round."""
+    DONE -> finish. REVISE -> Worker gets another round. ``evidence`` summarises
+    what the Worker actually did this session (e.g. that it only *inspected*
+    files and produced nothing) — the transcript alone can be talked past by a
+    confident but premature "done", so this hard signal anchors the grade."""
     transcript = _recent_text(messages, n=10)
     prompt = (
         f"You are the VERIFIER. The WORKER says it is finished. Independently grade "
         f"completion against the task.\n\n"
         f"TASK:\n{task}\n\n"
-        f"WHAT THE WORKER DID (recent transcript):\n{transcript[:4000]}\n\n"
+        + (f"SESSION ACTIVITY (ground truth, not the worker's claim):\n{evidence}\n\n" if evidence else "")
+        + f"WHAT THE WORKER DID (recent transcript):\n{transcript[:4000]}\n\n"
         "Reply with EXACTLY one of:\n"
         "  DONE\n"
         "  REVISE: <the single most important thing still missing or wrong>\n"
-        "Only say DONE if the deliverable actually exists and satisfies the task. "
+        "Only say DONE if the task's deliverable was actually produced and verified "
+        "THIS session. Pre-existing files, or the worker's assertion that something "
+        "'already works', are NOT evidence — if the task asks to build, run, test, "
+        "fix, or produce something and none of that happened, answer REVISE. "
         "Be terse."
     )
     raw = _simple_completion(client, verifier_model, [
@@ -232,6 +240,7 @@ def _debate_completion(
     aggregator_model: str,
     task: str,
     messages: list[dict],
+    evidence: str = "",
 ) -> tuple[bool, str]:
     """Completion gate as a debate: a diverse panel of critics each grades the
     finished work in ISOLATION, then the aggregator resolves their verdicts.
@@ -242,7 +251,7 @@ def _debate_completion(
     lone over-strict critic can't deadlock progress. Returns ``(done, note)``."""
     verdicts: list[tuple[str, bool, str]] = []
     for m in panel:
-        done, note = _verifier_gate_completion(client, m, task, messages)
+        done, note = _verifier_gate_completion(client, m, task, messages, evidence=evidence)
         verdicts.append((m, done, note))
     # Unanimous DONE → finish without spending an aggregator call.
     if all(d for _, d, _ in verdicts):
@@ -255,7 +264,9 @@ def _debate_completion(
         f"You are the AGGREGATOR resolving a completion review. Independent critics "
         f"graded the WORKER's finished work; some raised concerns. Decide the FINAL "
         f"verdict: is the deliverable actually complete and correct for the task?\n\n"
-        f"TASK:\n{task}\n\nWHAT THE WORKER DID (recent transcript):\n{transcript[:3500]}\n\n"
+        f"TASK:\n{task}\n\n"
+        + (f"SESSION ACTIVITY (ground truth):\n{evidence}\n\n" if evidence else "")
+        + f"WHAT THE WORKER DID (recent transcript):\n{transcript[:3500]}\n\n"
         f"CRITIC CONCERNS:\n" + "\n".join(concerns) + "\n\n"
         "Dismiss concerns that are nitpicks or already satisfied. Reply with EXACTLY one of:\n"
         "  DONE\n"
@@ -453,6 +464,22 @@ def _classify_turn(tool_calls: list[dict]) -> str:
     return "easy"
 
 
+# Substrings that mark a tool as state-changing even when it's MCP-namespaced
+# (e.g. mcp__filesystem__write_file / __edit_file / __create_directory / __move_file).
+_WORK_TOOL_HINTS = ("write", "edit", "create", "patch", "delete", "remove",
+                    "run", "exec", "move", "rename", "mkdir", "append")
+
+
+def _is_work_tool(name: str) -> bool:
+    """True if executing ``name`` changes state / runs something (vs read-only
+    inspection). Errs toward read-only: a misclassified reader just softens the
+    'did no real work' guard, never wrongly blocks a genuine deliverable."""
+    if name in MUTATING_TOOLS:
+        return True
+    low = name.lower()
+    return any(h in low for h in _WORK_TOOL_HINTS)
+
+
 # ---------------------------------------------------------------------------
 # Council loop — Worker-driven, with adaptive Thinker/Verifier routing
 # ---------------------------------------------------------------------------
@@ -479,6 +506,9 @@ def _council_loop(
     seen_calls: dict[tuple, int] = {}
     redundant = 0
     actions_taken = 0  # tool calls actually executed in this loop (NOT orientation)
+    work_actions = 0   # of those, state-changing ones (writes/edits/commands/bg runs)
+    inspect_actions = 0  # of those, read-only ones (reads/greps/lists/searches/…)
+    nudged_no_work = False  # pushed back on a "done" claim that did zero real work yet
     empty_start = 0    # consecutive no-tool turns before any work has begun
     edit_epoch = 0           # ++ on each successful edit; identical actions across the
     sig_epoch: dict = {}     # same epoch (no edit between) are a stuck repeat
@@ -588,22 +618,59 @@ def _council_loop(
                 )})
                 continue
 
+            # A completion claim with zero state-changing work is usually premature:
+            # the worker only inspected existing files (read/grep/list) and assumed
+            # the task was already satisfied. Push back ONCE to make it actually
+            # perform & verify the task this session before we trust "done". Bounded
+            # (one nudge) so a genuine read-only / answer-only task can still finish —
+            # the verifier gate below, now told nothing was produced, makes the call.
+            if work_actions == 0 and not nudged_no_work:
+                nudged_no_work = True
+                display.print_info(
+                    f"{_TAG['worker']} claims completion without doing any work — "
+                    f"directing it to actually execute and verify."
+                )
+                messages.append({"role": "user", "content": (
+                    "You are claiming the task is done, but this session you have only INSPECTED "
+                    "files (reads/greps/lists) — you have not run, built, written, edited, produced, "
+                    "or verified anything. Pre-existing files do NOT prove the task is satisfied. "
+                    "Carry out the task now and verify it end-to-end: run the app/tests, produce or "
+                    "regenerate the required deliverable, and confirm it actually works (e.g. the "
+                    "report opens). Only report completion once you have concrete evidence from THIS "
+                    "session. If the task was genuinely only to read or answer, state that explicitly "
+                    "and give the answer."
+                )})
+                continue
+
             # Genuine completion claim -> Verifier gate.
             completion_rounds += 1
             if completion_rounds > _MAX_COMPLETION_ROUNDS:
                 display.print_done(iteration)
                 break
+            evidence = (
+                f"This session the worker ran {inspect_actions} inspection action(s) "
+                f"(reads/greps/lists/searches) and {work_actions} state-changing action(s) "
+                f"(writes/edits/commands/background runs)."
+            )
+            if work_actions == 0:
+                evidence += (
+                    " It produced, changed, and ran NOTHING — it only inspected existing files. "
+                    "If the task requires building, running, testing, fixing, or producing anything, "
+                    "it is NOT complete."
+                )
             if completion_panel and len(completion_panel) >= 2:
                 display.print_info(
                     f"{_TAG['verifier']} debating completion across "
                     f"[bold]{', '.join(completion_panel)}[/bold]…"
                 )
                 done, note = _debate_completion(
-                    client, completion_panel, roles["verifier"], task, messages
+                    client, completion_panel, roles["verifier"], task, messages, evidence=evidence
                 )
             else:
                 display.print_info(f"{_TAG['verifier']} reviewing completion…")
-                done, note = _verifier_gate_completion(client, roles["verifier"], task, messages)
+                done, note = _verifier_gate_completion(
+                    client, roles["verifier"], task, messages, evidence=evidence
+                )
             if done:
                 display.print_info(f"{_TAG['verifier']} [bold #7fd88f]approved[/bold #7fd88f] — task complete.")
                 display.print_done(iteration)
@@ -696,6 +763,12 @@ def _council_loop(
             display.print_tool_call(name, args)
             logger.log_tool_call(tc.get("id", ""), name, args)
             result, success = execute_tool(name, args, working_dir, permission_mode)
+            # Track substantive vs read-only activity so the completion gate knows
+            # whether the worker actually DID the task or merely inspected files.
+            if _is_work_tool(name):
+                work_actions += 1
+            else:
+                inspect_actions += 1
             if not success:
                 turn_had_error = True
             result = _cap_result(result, name)
@@ -720,6 +793,13 @@ def _council_loop(
             sig_streak[sig] = (sig_streak.get(sig, 0) + 1) if sig_epoch.get(sig) == edit_epoch else 1
             sig_epoch[sig] = edit_epoch
             turn_repeat = max(turn_repeat, sig_streak[sig])
+
+        # A Stop clicked *during* tool execution (e.g. a long bash) should abort
+        # before we spend more model calls on error/stall consults below.
+        if interrupt.should_stop():
+            display.print_interrupted(iteration)
+            logger.log_session_end(iteration, reason="interrupted")
+            return messages
 
         # ---- Hard/stalled escalation to the Thinker ---------------------------
         if turn_had_error:

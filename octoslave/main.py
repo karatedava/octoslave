@@ -2498,7 +2498,7 @@ def _handle_long_research(arg: str, state: dict, cfg: dict, client):
             "from the old fixed pipeline and are ignored by the new Lab.[/dim]"
         )
 
-    # Single model for all roles: --all wins, else the backend default (kimi-k2.6).
+    # Single model for all roles: --all wins, else the backend default (kimi-k2.7).
     lab_model = all_model or cfg.get("default_model")
 
     from .lab.runner import run_lab

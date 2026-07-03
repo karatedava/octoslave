@@ -216,7 +216,7 @@ Run `ots config` to choose, and `ots models` for the live list.
 
 | Goal | Model |
 |------|-------|
-| Best all-round — **start here** | `kimi-k2.6` |
+| Best all-round — **start here** | `kimi-k2.7` |
 | Chain-of-thought / hard problems | `deepseek-v3.2-thinking` |
 | Code generation | `qwen3-coder-30b` |
 | Writing-heavy tasks | `gpt-oss-120b` |
@@ -341,7 +341,7 @@ ots web   →   http://127.0.0.1:7860/lab                         # web UI (reco
 
 Everything is persisted under `<working_dir>/lab/`: `state.json`, live `plan.md` and `team.md`,
 meeting transcripts in `meetings/`, organized work in `projects/<subproject>/`, any
-runtime-built tools in `tools/`, and the final `report.html`. All roles run on `kimi-k2.6` by
+runtime-built tools in `tools/`, and the final `report.html`. All roles run on `kimi-k2.7` by
 default. Full contract: [docs/RESEARCH.md](docs/RESEARCH.md).
 
 ### Vault improve & batch
@@ -407,7 +407,7 @@ Each tool is exposed as `mcp__<server>__<tool>`.
 
 ```bash
 /mcp                       # list servers + live status
-/mcp registry              # browse the curated catalog (20 servers)
+/mcp registry              # browse the curated catalog (21 servers)
 /mcp install filesystem    # install a catalog server (prompts for inputs)
 /mcp add NAME CMD [args…]   # quick-add a custom stdio server
 /mcp reconnect              # re-read config and reconnect
