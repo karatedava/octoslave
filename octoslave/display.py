@@ -72,6 +72,18 @@ def _emit(event: dict) -> None:
             pass
 
 
+def _plain(msg: str) -> str:
+    """Strip Rich console markup (e.g. ``[bold #9d7cd8]🧠 Thinker[/bold #9d7cd8]``)
+    so status text emitted to the web UI shows as ``🧠 Thinker`` instead of raw
+    tags. Safe on strings that only *look* like markup — falls back to the input."""
+    if "[" not in msg:
+        return msg
+    try:
+        return Text.from_markup(msg).plain
+    except Exception:
+        return msg
+
+
 _THEME = Theme(
     {
         "tool.name": "bold #fab283",
@@ -516,14 +528,14 @@ def print_separator():
 
 
 def print_info(msg: str):
-    _emit({"type": "info", "text": msg})
+    _emit({"type": "info", "text": _plain(msg)})
     if _silent():
         return
     console.print(f"[info]{msg}[/info]")
 
 
 def print_error(msg: str):
-    _emit({"type": "error", "text": msg})
+    _emit({"type": "error", "text": _plain(msg)})
     if _silent():
         return
     err_console.print(f"[tool.err]Error:[/tool.err] {msg}")

@@ -934,17 +934,37 @@ def _cap_result(result: str, tool_name: str) -> str:
 
 
 def _simple_completion(client: OpenAI, model: str, messages: list, max_tokens: int = 600) -> str:
-    """Non-streaming completion without tools — used for planning and verification."""
+    """Completion without tools — used for planning and verification (Thinker/
+    Verifier consults, plan authoring, Ultra debate).
+
+    Streams internally so a user Stop (web UI) aborts these background calls
+    *promptly* instead of blocking up to the 120s request timeout — council mode
+    issues many of these per turn, so a non-interruptible version made Stop feel
+    unresponsive. Tokens are NOT surfaced to the display (these are internal
+    consults, not the worker's visible turn). Raises ``interrupt.StopRequested``
+    on stop; returns "" on any transport error."""
     extra = {"extra_body": _ollama_extra_body()} if _is_ollama_client(client) else {}
     try:
-        resp = client.chat.completions.create(
+        parts: list[str] = []
+        with client.chat.completions.create(
             model=model,
             messages=messages,
-            **extra,
+            stream=True,
             max_tokens=max_tokens,
             timeout=120.0,
-        )
-        return (resp.choices[0].message.content or "").strip()
+            **extra,
+        ) as stream:
+            for chunk in stream:
+                if interrupt.should_stop():
+                    raise interrupt.StopRequested
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    parts.append(delta.content)
+        return "".join(parts).strip()
+    except interrupt.StopRequested:
+        raise
     except Exception:
         return ""
 

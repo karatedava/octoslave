@@ -50,7 +50,8 @@ hidden = [
     # octoslave internals
     "octoslave.agent", "octoslave.interrupt", "octoslave.config", "octoslave.display",
     "octoslave.logger", "octoslave.parallel", "octoslave.research",
-    "octoslave.tools", "octoslave.tools_bio", "octoslave.vault",
+    "octoslave.tools", "octoslave.tools_bio", "octoslave.tools_cryo",
+    "octoslave.remote", "octoslave.vault",
     "octoslave.web.app", "octoslave.wizard",
     "octoslave.mcp_client", "octoslave.mcp_registry",
     # octoslave Lab (dynamic multi-agent) — imported lazily, so list explicitly

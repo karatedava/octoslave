@@ -1,5 +1,0 @@
-rule	n_conditions	tp	fp	fn	tn	support	precision	recall	specificity	odds_ratio	fisher_pvalue	coverage_clusters	toxicity_guard_columns	toxicity_guard_present	bh_pvalue	is_significant
-net_charge_ph7_4 >= 2.5 AND gravy <= 0.6	2	4	0	1	3	4	1.0	0.8	1.0	inf	0.07142857142857144	3	['flag_combined_tox_risk']	True	0.28571428571428575	False
-net_charge_ph7_4 >= 4.0	1	3	0	2	3	3	1.0	0.6	1.0	inf	0.17857142857142858	3	['flag_combined_tox_risk']	True	0.35714285714285715	False
-hydrophobic_moment >= 0.25 AND helicity_proxy >= 0.6 AND flag_combined_tox_risk == 0	3	2	0	3	3	2	1.0	0.4	1.0	inf	0.3571428571428572	2	['flag_combined_tox_risk']	True	0.4761904761904763	False
-net_charge_ph7_4 >= 2.5 AND gravy <= 0.6 AND flag_combined_tox_risk == 0	3	1	0	4	3	1	1.0	0.2	1.0	inf	0.625	1	['flag_combined_tox_risk']	True	0.625	False

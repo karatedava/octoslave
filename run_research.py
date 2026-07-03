@@ -16,7 +16,7 @@ def main():
     p.add_argument("task_file", help="Path to a task file (the task is its contents)")
     p.add_argument("--working-dir", required=True)
     p.add_argument("--rounds", type=int, default=4, help="Max implementation/review rounds")
-    p.add_argument("--model", default=None, help="Model for all roles (default: config / kimi-k2.6)")
+    p.add_argument("--model", default=None, help="Model for all roles (default: config / kimi-k2.7)")
     p.add_argument("--manual", action="store_true",
                    help="Step mode: pause at gates for human approval (default: autonomous)")
     p.add_argument("--resume", action="store_true")
