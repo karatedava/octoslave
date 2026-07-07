@@ -694,8 +694,17 @@ def load_system_prompt(profile: str = "base", working_dir: str = None) -> str:
             content = content[1:]  # Remove just \
     if content.endswith('"""'):
         content = content[:-3]  # Remove closing """
+    # Collapse Python-style line continuations: a backslash immediately before a
+    # newline joins the two lines (the semantics these profiles were authored
+    # with). Without this the raw `\` characters leak verbatim into the live
+    # system prompt as stray noise in the middle of prose. Eat any whitespace on
+    # either side of the join and normalise to a single space so an indented
+    # continuation line doesn't produce a run of stray spaces. (No profile has a
+    # backslash-at-end-of-line inside a code fence, so this can't damage a real
+    # shell continuation.)
+    content = re.sub(r'[ \t]*\\\n[ \t]*', ' ', content)
     content = content.strip()
-    
+
     # Substitute placeholders
     wd = working_dir or Path.cwd().resolve()
     return content.format(working_dir=wd, date=date.today().isoformat())

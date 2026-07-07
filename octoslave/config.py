@@ -1005,6 +1005,105 @@ def ensure_codag_mcp_registered() -> bool:
         return False
 
 
+def _npx_available() -> bool:
+    """True when npx is reachable — on PATH or in the standard install spots
+    (a fresh Node install may not be on this process's PATH yet)."""
+    import shutil as _shutil
+    if _shutil.which("npx"):
+        return True
+    for cand in ("/opt/homebrew/bin/npx", "/usr/local/bin/npx",
+                 r"C:\Program Files\nodejs\npx.cmd"):
+        if Path(cand).exists():
+            return True
+    return False
+
+
+def try_install_node() -> bool:
+    """Best-effort, non-interactive install of Node.js (which ships npx) via
+    the platform's package manager. Never raises, never prompts; returns True
+    iff npx is available afterwards.
+
+    Linux only escalates when it can do so without a password prompt (running
+    as root, or sudo credentials already cached) — a hung sudo prompt inside a
+    GUI installer would look like a freeze.
+    """
+    import shutil as _shutil
+    import subprocess
+    import sys as _sys
+    if _npx_available():
+        return True
+    quiet = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    try:
+        if _sys.platform == "darwin":
+            if _shutil.which("brew"):
+                subprocess.run(["brew", "install", "node"], timeout=900, **quiet)
+        elif _sys.platform == "win32":
+            if _shutil.which("winget"):
+                subprocess.run(
+                    ["winget", "install", "-e", "--id", "OpenJS.NodeJS.LTS",
+                     "--silent", "--accept-package-agreements",
+                     "--accept-source-agreements"],
+                    timeout=900, **quiet)
+        elif _sys.platform.startswith("linux"):
+            if os.geteuid() == 0:
+                sudo: list[str] | None = []
+            elif _shutil.which("sudo"):
+                sudo = ["sudo", "-n"]
+            else:
+                sudo = None
+            if sudo is not None:
+                for mgr, args in (
+                    ("apt-get", ["install", "-y", "nodejs", "npm"]),
+                    ("dnf",     ["install", "-y", "nodejs", "npm"]),
+                    ("yum",     ["install", "-y", "nodejs", "npm"]),
+                    ("pacman",  ["-S", "--noconfirm", "nodejs", "npm"]),
+                    ("zypper",  ["install", "-y", "nodejs", "npm"]),
+                ):
+                    if _shutil.which(mgr):
+                        subprocess.run(sudo + [mgr] + args, timeout=900, **quiet)
+                        break
+    except Exception:
+        pass
+    return _npx_available()
+
+
+def ensure_filesystem_mcp_registered(path: str | None = None) -> bool:
+    """Register the filesystem MCP server in config.json if not already
+    registered, installing Node.js (for npx) first when it's missing.
+    Idempotent and safe to call repeatedly. Returns True iff a new
+    registration was written this call.
+
+    The entry is written even if the Node install fails: a server whose
+    command is missing is reported and skipped at MCP load time, and starts
+    working as soon as Node is installed — no re-registration needed.
+
+    ``path`` is the directory the server is allowed to touch; defaults to the
+    user's home directory so the agent can reach typical project folders.
+
+    Opt out by exporting OCTOSLAVE_NO_FS_MCP_REGISTER=1 before the installer
+    or wizard runs.
+    """
+    if os.environ.get("OCTOSLAVE_NO_FS_MCP_REGISTER") == "1":
+        return False
+    try:
+        from .mcp_registry import get_entry, build_config
+    except Exception:
+        return False
+    entry = get_entry("filesystem")
+    if entry is None:
+        return False
+    for existing in get_mcp_servers():
+        if (existing.get("name") or "").lower() == entry["id"]:
+            return False
+    try_install_node()  # best-effort; the entry below self-heals once npx exists
+    try:
+        server_cfg = build_config(entry, values={"path": path or str(Path.home())})
+        add_mcp_server(server_cfg)
+        return True
+    except Exception:
+        return False
+
+
 def remove_mcp_server(name: str) -> bool:
     """Remove an MCP server by name. Returns True if removed."""
     cfg = load_config()

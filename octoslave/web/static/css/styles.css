@@ -498,6 +498,40 @@ button {
 .mode-seg.disabled { opacity: .5; }
 .mode-seg-btn:disabled { cursor: not-allowed; }
 
+/* Gear next to the mode selector — opens the council-models popover.
+   Hidden in Standard mode (no council to configure). */
+.council-config-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  margin-left: 4px;
+  background: var(--border);
+  border: 1px solid var(--border-light);
+  border-radius: 9px;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: color .15s ease, border-color .15s ease;
+}
+.council-config-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+/* Dot = at least one role is pinned to a specific model (not Auto). */
+.council-config-dot {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px var(--bg);
+}
+
 #backend-select {
   width: 130px;
   font-weight: 500;
@@ -2399,6 +2433,25 @@ details.tool-block.tool-block-fail {
   color: var(--primary);
   font-weight: 600;
   text-align: center;
+}
+
+/* ── Council-models popover (shares the parallel-popover chrome) ── */
+.council-popover { width: 460px; }
+.council-popover .parallel-label {
+  flex: 0 0 195px;
+  line-height: 1.35;
+}
+.council-popover-note {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  line-height: 1.5;
+  padding-bottom: 2px;
+  border-bottom: 1px solid var(--border);
+}
+.council-popover-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 4px;
 }
 .parallel-cand-row select {
   height: 34px;

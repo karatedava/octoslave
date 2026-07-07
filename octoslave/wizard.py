@@ -568,6 +568,7 @@ class SetupWizard(_TkRoot):
             else:
                 save_config(api_key="", default_model=model, backend="ollama",
                             ollama_url=ollama)
+            self._register_default_mcp()
         except Exception:
             # Fallback: write minimal JSON directly
             _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -586,7 +587,42 @@ class SetupWizard(_TkRoot):
             else:
                 existing.update({"ollama_url": ollama, "default_model": model,
                                  "backend": "ollama"})
+            self._add_filesystem_mcp_raw(existing)
             _CONFIG_FILE.write_text(json.dumps(existing, indent=2))
+
+    @staticmethod
+    def _register_default_mcp():
+        """Best-effort: register the filesystem MCP server so the agent has
+        sandboxed file access out of the box (installing Node.js for npx
+        first if it's missing). Never blocks setup."""
+        try:
+            from octoslave.config import ensure_filesystem_mcp_registered  # type: ignore
+            ensure_filesystem_mcp_registered()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _add_filesystem_mcp_raw(cfg: dict):
+        """Same as _register_default_mcp but for the direct-JSON fallback path
+        (octoslave.config could not be imported). Mutates ``cfg`` in place.
+        Registers even without npx — the server connects automatically once
+        Node.js is installed."""
+        import os
+        if os.environ.get("OCTOSLAVE_NO_FS_MCP_REGISTER") == "1":
+            return
+        servers = cfg.get("mcp_servers")
+        if not isinstance(servers, list):
+            servers = []
+        if any(isinstance(s, dict) and (s.get("name") or "").lower() == "filesystem"
+               for s in servers):
+            return
+        servers.append({
+            "name": "filesystem",
+            "enabled": True,
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-filesystem", str(Path.home())],
+        })
+        cfg["mcp_servers"] = servers
 
 
 # ---------------------------------------------------------------------------

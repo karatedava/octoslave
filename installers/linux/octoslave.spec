@@ -32,6 +32,10 @@ hidden = [
     "octoslave.lab.agent_runtime", "octoslave.lab.director",
     "octoslave.lab.critic", "octoslave.lab.meeting",
     "octoslave.lab.foundry", "octoslave.lab.llm",
+    # octoslave Science (web research orchestrator) — imported lazily
+    "octoslave.science", "octoslave.science.session",
+    "octoslave.science.orchestrator", "octoslave.science.tools",
+    "octoslave.science.context",
     "fastapi", "fastapi.routing", "fastapi.middleware",
     "starlette", "starlette.routing", "starlette.responses",
     "starlette.staticfiles", "starlette.websockets",
