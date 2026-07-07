@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/css/styles.css?v=20260701a">
+  <link rel="stylesheet" href="/static/css/styles.css?v=20260706a">
 </head>
 <body>
 
@@ -45,14 +45,21 @@
       </svg>
       <span>Chat</span>
     </button>
-    <a class="nav-btn nav-link" href="/lab" title="Lab — autonomous research team">
+    <a class="nav-btn nav-link" href="/science" title="Science — conversational research orchestrator">
+      <svg class="nav-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M9 3h6"/><path d="M10 3v6.5L5.2 17a2 2 0 0 0 1.7 3h10.2a2 2 0 0 0 1.7-3L14 9.5V3"/>
+        <path d="M7.5 15h9"/>
+      </svg>
+      <span>Science</span>
+    </a>
+    <a class="nav-btn nav-link" href="/lab" title="Autonomous Research — self-organizing agent team">
       <svg class="nav-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="12" cy="12" r="2.2"/>
         <ellipse cx="12" cy="12" rx="10" ry="4.4"/>
         <ellipse cx="12" cy="12" rx="10" ry="4.4" transform="rotate(60 12 12)"/>
         <ellipse cx="12" cy="12" rx="10" ry="4.4" transform="rotate(120 12 12)"/>
       </svg>
-      <span>Lab</span>
+      <span>Autonomous Research</span>
     </a>
     <button class="nav-btn" data-tab="settings" title="Settings">
       <svg class="nav-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
@@ -114,6 +121,14 @@
         <button type="button" class="mode-seg-btn active" data-mode="improved" role="radio" aria-checked="true">🐙 Improved</button>
         <button type="button" class="mode-seg-btn" data-mode="ultra" role="radio" aria-checked="false">⚡ Ultra</button>
       </div>
+      <button type="button" class="council-config-btn" id="council-config-btn"
+              title="Council models — pick which model plays each role (Worker · Thinker · Verifier)">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l-.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+        <span class="council-config-dot" id="council-config-dot" style="display:none"></span>
+      </button>
       <div class="config-spacer"></div>
       <button class="btn-secondary btn-sm" id="chat-new-btn">New Chat</button>
       <span class="badge badge-idle" id="chat-status">idle</span>
@@ -227,6 +242,40 @@
           <span class="parallel-hint">leave blank to inherit</span>
         </div>
         <div class="parallel-rows" id="parallel-rows"></div>
+      </div>
+    </div>
+
+    <!-- Council-models config popover (Improved / Ultra modes) -->
+    <div class="parallel-popover council-popover" id="council-popover" style="display:none">
+      <div class="parallel-popover-head">
+        <span>🐙 Council models</span>
+        <button class="parallel-popover-close" id="council-popover-close" title="Close">×</button>
+      </div>
+      <div class="parallel-popover-body">
+        <div class="council-popover-note">
+          Pick which model plays each role. <strong>Auto</strong> resolves the
+          best available model per role from the live catalog. Diverse model
+          families catch different mistakes.
+        </div>
+        <label class="parallel-row">
+          <span class="parallel-label">🔧 Worker <span class="parallel-hint">drives the tool loop</span></span>
+          <select id="council-worker"><option value="">Auto</option></select>
+        </label>
+        <label class="parallel-row">
+          <span class="parallel-label">🧠 Thinker <span class="parallel-hint">plans &amp; course-corrects</span></span>
+          <select id="council-thinker"><option value="">Auto</option></select>
+        </label>
+        <label class="parallel-row">
+          <span class="parallel-label">🔍 Verifier <span class="parallel-hint">reviews actions &amp; completion</span></span>
+          <select id="council-verifier"><option value="">Auto</option></select>
+        </label>
+        <label class="parallel-row">
+          <span class="parallel-label">↳ Escalation <span class="parallel-hint">backup worker when stuck</span></span>
+          <select id="council-worker-alt"><option value="">Auto</option></select>
+        </label>
+        <div class="council-popover-actions">
+          <button class="btn-secondary btn-sm" id="council-reset-btn" type="button">Reset to Auto</button>
+        </div>
       </div>
     </div>
   </div>
@@ -451,7 +500,7 @@
 
 </main>
 
-<script type="module" src="/static/js/app.js?v=20260701a"></script>
+<script type="module" src="/static/js/app.js?v=20260706a"></script>
 
 </body>
 </html>

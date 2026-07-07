@@ -59,6 +59,10 @@ hidden = [
     "octoslave.lab.agent_runtime", "octoslave.lab.director",
     "octoslave.lab.critic", "octoslave.lab.meeting",
     "octoslave.lab.foundry", "octoslave.lab.llm",
+    # octoslave Science (web research orchestrator) — imported lazily
+    "octoslave.science", "octoslave.science.session",
+    "octoslave.science.orchestrator", "octoslave.science.tools",
+    "octoslave.science.context",
     # macOS launcher
     "octoslave.mac_launcher",
     # FastAPI / Starlette

@@ -340,6 +340,14 @@ function sendChat() {
   const mode = document.getElementById('mode-seg')?.dataset.mode || 'improved';
   const council = mode === 'improved' || mode === 'ultra';
   const ultra = mode === 'ultra';
+  // Per-role council model overrides (empty = auto-resolve on the backend).
+  let councilModels;
+  if (council && window.councilConfig) {
+    const picked = Object.fromEntries(
+      Object.entries(window.councilConfig).filter(([, v]) => v)
+    );
+    if (Object.keys(picked).length) councilModels = picked;
+  }
 
   // Parallel mode short-circuit: when the popover toggle is on, route to the
   // multi-agent handler with per-candidate model/profile selections.
@@ -367,7 +375,7 @@ function sendChat() {
   const type = window.appState.chatIsFirst ? 'chat' : 'chat_continue';
   window.appState.chatIsFirst = false;
 
-  sendMsg({ type, message: fullText, model, working_dir: dir, prompt_profile: profile, permission_mode: permMode, council, ultra, mode, remote_id: window.getRemoteId ? window.getRemoteId() : null });
+  sendMsg({ type, message: fullText, model, working_dir: dir, prompt_profile: profile, permission_mode: permMode, council, ultra, mode, council_models: councilModels, remote_id: window.getRemoteId ? window.getRemoteId() : null });
 }
 
 function appendUserMessage(text) {
@@ -922,6 +930,9 @@ function initApp() {
   // Parallel-agents popover
   initParallelPopover();
 
+  // Council-models popover (Improved / Ultra role → model dropdowns)
+  initCouncilPopover();
+
   // Send button doubles as a stop button while the agent is working.
   document.getElementById('chat-send-btn')?.addEventListener('click', () => {
     if (window.appState.running) stopChat();
@@ -969,6 +980,10 @@ function initApp() {
       b.classList.toggle('active', on);
       b.setAttribute('aria-checked', on ? 'true' : 'false');
     });
+    // The council-models gear only makes sense when a council will actually run.
+    const gear = document.getElementById('council-config-btn');
+    if (gear) gear.style.display = (mode === 'standard' || seg.classList.contains('disabled')) ? 'none' : 'inline-flex';
+    if (mode === 'standard') window.hideCouncilPopover?.();
   }
   document.getElementById('mode-seg')?.querySelectorAll('.mode-seg-btn').forEach((btn) => {
     btn.addEventListener('click', () => { if (!btn.disabled) _setMode(btn.dataset.mode); });
@@ -986,6 +1001,8 @@ function initApp() {
       if (b.dataset.mode !== 'standard') b.disabled = !ok;
     });
     if (!ok && seg.dataset.mode !== 'standard') _setMode('standard');
+    // Re-sync the gear with the (possibly unchanged) current mode.
+    _setMode(seg.dataset.mode);
     seg.title = ok
       ? 'Agent mode — Standard: one model. Improved: a council (Thinker · Worker · Verifier). Ultra: council + multi-model debate on the plan and completion (strongest, more tokens).'
       : 'Improved / Ultra need a cloud backend (e-INFRA / NIM). Not available on local Ollama.';
@@ -1824,6 +1841,147 @@ function initParallelPopover() {
       refreshParallelJudge();
     }
   });
+}
+
+// ──────────────────────────────────────────────────────────────
+// Council-models popover (Improved / Ultra modes)
+// ──────────────────────────────────────────────────────────────
+
+const COUNCIL_ROLES_UI = [
+  ['worker',     'council-worker'],
+  ['thinker',    'council-thinker'],
+  ['verifier',   'council-verifier'],
+  ['worker_alt', 'council-worker-alt'],
+];
+const COUNCIL_LS_KEY = 'octoslave-council-models';
+
+// Per-role overrides; '' = Auto (backend resolves from its preference chains).
+window.councilConfig = (() => {
+  try {
+    const saved = JSON.parse(localStorage.getItem(COUNCIL_LS_KEY) || '{}');
+    return {
+      worker: saved.worker || '', thinker: saved.thinker || '',
+      verifier: saved.verifier || '', worker_alt: saved.worker_alt || '',
+    };
+  } catch { return { worker: '', thinker: '', verifier: '', worker_alt: '' }; }
+})();
+
+function saveCouncilConfig() {
+  try { localStorage.setItem(COUNCIL_LS_KEY, JSON.stringify(window.councilConfig)); } catch {}
+}
+
+// Blue dot on the gear when any role is pinned (so a stale pick is visible).
+function refreshCouncilDot() {
+  const dot = document.getElementById('council-config-dot');
+  if (!dot) return;
+  const any = Object.values(window.councilConfig).some(Boolean);
+  dot.style.display = any ? 'block' : 'none';
+}
+
+function refreshCouncilSelects() {
+  const models = Array.from(document.getElementById('chat-model-select')?.options || [])
+    .map(o => o.value).filter(Boolean);
+  COUNCIL_ROLES_UI.forEach(([role, id]) => {
+    const sel = document.getElementById(id);
+    if (!sel) return;
+    const cur = window.councilConfig[role] || '';
+    let html = '<option value="">Auto</option>';
+    // Keep a pinned model visible even if it's not in the current catalog.
+    const pool = cur && !models.includes(cur) ? [cur, ...models] : models;
+    pool.forEach(m => {
+      html += `<option value="${esc(m)}"${m === cur ? ' selected' : ''}>${esc(m)}</option>`;
+    });
+    sel.innerHTML = html;
+    sel.value = cur;
+  });
+}
+
+function positionCouncilPopover() {
+  const btn = document.getElementById('council-config-btn');
+  const popover = document.getElementById('council-popover');
+  if (!btn || !popover) return;
+  const rect = btn.getBoundingClientRect();
+  const margin = 16;
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const width = Math.min(popover.offsetWidth || 420, vw - margin * 2);
+  popover.style.width = width + 'px';
+  // The gear lives in the top config bar, so open downward.
+  const maxH = Math.min(popover.scrollHeight || 400, vh - rect.bottom - 8 - margin);
+  popover.style.top = (rect.bottom + 8) + 'px';
+  popover.style.bottom = '';
+  popover.style.maxHeight = maxH + 'px';
+  let left = rect.right - width;   // right-align to the gear
+  if (left + width > vw - margin) left = vw - margin - width;
+  if (left < margin) left = margin;
+  popover.style.left = left + 'px';
+  popover.style.right = '';
+}
+
+function showCouncilPopover() {
+  const popover = document.getElementById('council-popover');
+  if (!popover) return;
+  let bd = document.getElementById('council-popover-backdrop');
+  if (!bd) {
+    bd = document.createElement('div');
+    bd.id = 'council-popover-backdrop';
+    bd.className = 'parallel-popover-backdrop';
+    bd.addEventListener('click', hideCouncilPopover);
+    document.body.appendChild(bd);
+  }
+  bd.style.display = 'block';
+  popover.style.display = 'flex';
+  refreshCouncilSelects();
+  requestAnimationFrame(() => requestAnimationFrame(positionCouncilPopover));
+}
+
+function hideCouncilPopover() {
+  const popover = document.getElementById('council-popover');
+  const bd = document.getElementById('council-popover-backdrop');
+  if (popover) popover.style.display = 'none';
+  if (bd) bd.remove();
+}
+window.hideCouncilPopover = hideCouncilPopover;
+
+function isCouncilPopoverVisible() {
+  const popover = document.getElementById('council-popover');
+  return !!popover && popover.style.display !== 'none';
+}
+
+function initCouncilPopover() {
+  const btn = document.getElementById('council-config-btn');
+  const popover = document.getElementById('council-popover');
+  if (!btn || !popover) return;
+
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (isCouncilPopoverVisible()) hideCouncilPopover();
+    else showCouncilPopover();
+  });
+  document.getElementById('council-popover-close')?.addEventListener('click', hideCouncilPopover);
+
+  COUNCIL_ROLES_UI.forEach(([role, id]) => {
+    document.getElementById(id)?.addEventListener('change', (e) => {
+      window.councilConfig[role] = e.target.value || '';
+      saveCouncilConfig();
+      refreshCouncilDot();
+    });
+  });
+
+  document.getElementById('council-reset-btn')?.addEventListener('click', () => {
+    window.councilConfig = { worker: '', thinker: '', verifier: '', worker_alt: '' };
+    saveCouncilConfig();
+    refreshCouncilSelects();
+    refreshCouncilDot();
+  });
+
+  window.addEventListener('resize', () => {
+    if (isCouncilPopoverVisible()) positionCouncilPopover();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && isCouncilPopoverVisible()) hideCouncilPopover();
+  });
+
+  refreshCouncilDot();
 }
 
 // ──────────────────────────────────────────────────────────────

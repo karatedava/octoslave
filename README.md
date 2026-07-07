@@ -112,15 +112,27 @@ ots run "summarise this paper" -i                # one-shot, then stay interacti
 
 ots run "refactor the auth module" --parallel 3  # 3 agents, Judge picks the winner
 
-# Autonomous Lab — a self-organizing team. Open the web UI and go to /lab,
+# Autonomous Research — a self-organizing team. Open the web UI and go to /lab,
 # or launch from the TUI:
 ots
 ◆ /long-research "calibration methods for large language models" --rounds 3
 ```
 
-> The **Lab** web UI (`ots web` → `http://127.0.0.1:7860/lab`) is the richest way to
-> run it: watch the team roster, live plan, and per-agent activity; open produced
-> files in the browser; and inject guidance at any time.
+### Three ways to work (web UI)
+
+`ots web` opens a browser UI at `http://127.0.0.1:7860` with three tabs in the
+sidebar, from lightest-touch to most autonomous:
+
+| Tab | What it is | Reach for it when… |
+|---|---|---|
+| 💬 **Chat** | A single agent you converse with — it plans, edits files, runs tools, one task at a time. Optional Improved / Ultra council for harder problems. | Everyday coding & analysis, quick questions, or iterating on one thing with tight, turn-by-turn control. |
+| 🧬 **Science** | A conversational **research orchestrator**. Chat-first, but it spins up specialists on demand, submits & polls HPC/cluster jobs, presents plots and tables **inline for comment-driven refinement**, curates messy data into **FAIR** datasets, and searches the literature. | Computational biology / data-heavy research where you want to stay in the loop and refine each output as it appears. |
+| 🧪 **Autonomous Research** | A **self-organizing team** run as a batch pipeline: a Director assembles up to 10 specialists, a Critic gates the plan, the team implements & reviews over rounds, then writes a self-contained HTML report. Runtime tool/agent "foundry". | You want to hand off a whole problem and let a team run it end-to-end (fully autonomous or with step-mode approval gates), then read the report. |
+
+All three share the same tools, models, and remote / MCP setup. Chat and
+Autonomous Research also have TUI/CLI entry points; Science is web-only.
+`http://127.0.0.1:7860/science` and `…/lab` open the Science and Autonomous
+Research tabs directly.
 
 ---
 
@@ -310,9 +322,9 @@ ots run "compare A vs B"     --parallel 3 --strategy merge  # synthesised → PA
 Each agent runs in an isolated copy of the working directory under `.parallel/run_{i}/`; the
 winner's files are promoted back. Diversity comes from rotating prompt profiles.
 
-### Autonomous Lab
+### Autonomous Research (the Lab)
 
-The Lab is a **dynamic, self-organizing research team** (inspired by Stanford's Virtual Lab).
+Autonomous Research (served at `/lab`) is a **dynamic, self-organizing research team** (inspired by Stanford's Virtual Lab).
 Instead of a fixed role list, a **Director** agent reads your task and assembles a custom team of
 up to **10 specialists** tailored to the problem — biology, ML, finance, writing, software,
 anything. The flow each run:
@@ -343,6 +355,35 @@ Everything is persisted under `<working_dir>/lab/`: `state.json`, live `plan.md`
 meeting transcripts in `meetings/`, organized work in `projects/<subproject>/`, any
 runtime-built tools in `tools/`, and the final `report.html`. All roles run on `kimi-k2.7` by
 default. Full contract: [docs/RESEARCH.md](docs/RESEARCH.md).
+
+### Science — a conversational research orchestrator
+
+Where the Lab runs a team as a batch pipeline, **Science** (web UI tab at `/science`) is
+**chat-first**: an orchestrator agent works *with* you turn by turn. It's built for computational
+biology and data-heavy research:
+
+- **Spins up specialists on demand** — like the Lab's Director, but interactively: it delegates a
+  bounded sub-task to a focused agent (Structural Biologist, Data Wrangler, …) and folds the result
+  back into the conversation.
+- **Presents outputs inline** — every plot, table, report, or dataset it produces appears as a card
+  in the chat. **Comment on it to refine** (the orchestrator regenerates that specific output), or
+  **edit** text/CSV/markdown outputs in place.
+- **Biology & chemistry tools** — the full domain toolbox (`bio_inspect`, `rdkit_describe`,
+  UniProt / PubChem / ChEMBL / PDB / AlphaFold / GEO / ENA lookups, `pdf_ocr`); connect an NVIDIA
+  BioNeMo model as an MCP server to call it as a tool.
+- **Cluster jobs** — offloads long computation to a remote HPC scheduler (Slurm/PBS) or a detached
+  background process, and polls it, so the conversation never blocks.
+- **FAIR & reproducible** — curates messy research data into documented datasets
+  (`datapackage.json`) and logs how every result was made to `science/PROVENANCE.md`.
+- **Knowledge search** — finds the most relevant current literature (Europe PMC) before committing
+  to an approach.
+
+```
+ots web   →   http://127.0.0.1:7860/science
+```
+
+State persists under `<working_dir>/science/` (`state.json`, `PROVENANCE.md`, job logs) so a
+session can be reopened and continued.
 
 ### Vault improve & batch
 
@@ -387,6 +428,13 @@ home directory, and the **Browse…** button navigates folders **on the remote h
 (no working directory is entered up front). The toggle is on the start screen and
 after every **New Chat**.
 
+**Too lazy to configure?** Ask OctoSlave to do it: in local mode, tell it e.g.
+*"add a remote host for yourself — host gpu.example.org, user me, id gpu01: verify
+key-based SSH works, append it to the `remotes` list in `~/.octoslave/config.json`,
+and test the connection"*. The config is re-read on every request, so the new host
+appears in the 🌐 Remote dropdown immediately. (The only thing it can't do is type
+your password — if key auth is missing it hands you the `ssh-copy-id` command.)
+
 **Transport & auth.** OctoSlave shells out to your system `ssh`/`scp`, so it honors
 `~/.ssh/config`, keys, ssh-agent and `ProxyJump`, with connection multiplexing for
 speed. Auth is **key/agent based** (no interactive password prompts), so a
@@ -405,7 +453,14 @@ them alongside the built-in ones — everywhere, including the research pipeline
 MCP client is **built in** (no extra dependency) and supports both **stdio** and **http** transports.
 Each tool is exposed as `mcp__<server>__<tool>`.
 
+**Web UI.** Open **Settings → MCP Tools**. The **Catalog** lists ~21 curated servers
+(Filesystem, Git, GitHub, Playwright browser, search, SQLite/Postgres, Slack, Notion, …) —
+click **install**, fill in the one or two things that are yours (a folder, a token), done.
+**+ Add a custom server** covers anything else (stdio command or http URL + headers), and
+**Your servers** shows live status, tool counts and per-server enable/remove.
+
 ```bash
+# TUI
 /mcp                       # list servers + live status
 /mcp registry              # browse the curated catalog (21 servers)
 /mcp install filesystem    # install a catalog server (prompts for inputs)
@@ -413,9 +468,18 @@ Each tool is exposed as `mcp__<server>__<tool>`.
 /mcp reconnect              # re-read config and reconnect
 ```
 
+**Too lazy to configure?** Ask OctoSlave to wire in its own tools: e.g. *"add the Playwright
+browser MCP server to your toolbox — look its command up in your built-in catalog
+(`octoslave.mcp_registry`), append the entry to `mcp_servers` in `~/.octoslave/config.json`,
+and check the runtime (npx/uvx) exists"*. Then one click on **Reconnect all** (or
+`/mcp reconnect`) picks it up — the config is re-read on reconnect, no restart.
+
 Servers are persisted in `~/.octoslave/config.json` under `mcp_servers`; anything added via the
 TUI or web Settings tab is shared between them. In `controlled` mode, MCP calls require
 confirmation; a server that fails to start is reported and skipped without blocking the rest.
+
+See [docs/MCP.md](docs/MCP.md) for the full guide (catalog, custom servers, schema,
+troubleshooting).
 
 ---
 
@@ -471,6 +535,7 @@ CryoSPARC-connected cryo-EM companion for structural biologists). Switch with
 | [docs/RESEARCH.md](docs/RESEARCH.md) | Long-research pipeline contract and per-role models |
 | [docs/VAULT_IMPROVE.md](docs/VAULT_IMPROVE.md) | Vault-improve pipeline |
 | [docs/REMOTE_EXECUTION.md](docs/REMOTE_EXECUTION.md) | Run the agent on a remote host over SSH |
+| [docs/MCP.md](docs/MCP.md) | Connect external tools via MCP (catalog, custom servers, lazy setup) |
 | [docs/PERMISSION_MODE.md](docs/PERMISSION_MODE.md) | Permission mode reference |
 | [docs/PROMPT_PROFILES.md](docs/PROMPT_PROFILES.md) | Prompt profile reference |
 | [docs/SCRAPING.md](docs/SCRAPING.md) | Web scraping / `crawl_tree` details |

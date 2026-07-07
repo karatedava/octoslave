@@ -50,17 +50,23 @@ SHARED_DIR = Path.home() / ".octoslave" / "shared"
 app = FastAPI(title="OctoSlave Web UI", docs_url=None, redoc_url=None)
 
 class _NoCacheAssets(BaseHTTPMiddleware):
-    """Force browsers to revalidate JS/CSS instead of serving stale copies.
+    """Force browsers to revalidate JS/CSS/HTML instead of serving stale copies.
 
     ES-module imports (import './components.js') don't carry the ?v= cache-buster
     on the entry point, and CSS edits can ship without a version bump — so without
-    this, an edit can be invisible until a hard refresh. ``no-cache`` still allows
-    304s via StaticFiles' ETag/Last-Modified, so it's cheap.
+    this, an edit can be invisible until a hard refresh. Crucially, the SPA
+    ``index.html`` (served for /lab and /science) references hashed asset files; if
+    a browser caches a stale index after a rebuild it points at deleted asset
+    hashes → a half-broken app (e.g. outputs never render). No-caching HTML too
+    makes rebuilds always take effect. ``no-cache`` still allows 304s via
+    StaticFiles' ETag/Last-Modified, so it's cheap.
     """
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
         path = request.url.path
-        if path.endswith('.js') or path.endswith('.css'):
+        ctype = response.headers.get("content-type", "")
+        if (path.endswith('.js') or path.endswith('.css') or path.endswith('.html')
+                or ctype.startswith("text/html")):
             response.headers['Cache-Control'] = 'no-cache'
         return response
 
@@ -74,6 +80,10 @@ if STATIC_DIR.exists():
 LAB_STATIC_DIR = Path(__file__).parent / "lab_static"
 if LAB_STATIC_DIR.exists():
     app.mount("/lab", StaticFiles(directory=str(LAB_STATIC_DIR), html=True), name="lab")
+    # The Science tab is the same React bundle (built assets live under /lab/);
+    # index.html here just picks the Science view by pathname. Serving it at
+    # /science needs no separate build.
+    app.mount("/science", StaticFiles(directory=str(LAB_STATIC_DIR), html=True), name="science")
 
 _ALLOWED_EXT = {
     ".html", ".htm", ".md", ".txt", ".json", ".csv",
@@ -153,6 +163,21 @@ def _save_chat(messages: list, model: str = "", chat_id: str = "") -> str:
 
 def _safe_chat_id(chat_id: str) -> bool:
     return chat_id.startswith("chat_") and "/" not in chat_id and ".." not in chat_id
+
+
+def _science_history(messages: list) -> list[dict]:
+    """Flatten an orchestrator message list into chat bubbles for rehydration
+    (user + assistant text only; system/tool/tool-call turns are dropped)."""
+    out = []
+    for m in messages or []:
+        role = m.get("role")
+        content = m.get("content")
+        if role not in ("user", "assistant") or not isinstance(content, str):
+            continue
+        if not content.strip():
+            continue
+        out.append({"role": role, "text": content.strip()})
+    return out
 
 # ---------------------------------------------------------------------------
 # Chat REST endpoints
@@ -460,6 +485,57 @@ async def view_file(file_path: str):
         ".sh": "text/plain; charset=utf-8",
     }
     return FileResponse(str(path), media_type=media.get(path.suffix, "application/octet-stream"))
+
+
+# ---------------------------------------------------------------------------
+# Science endpoints (edit a presented output inline)
+# ---------------------------------------------------------------------------
+
+_EDITABLE_EXT = {".md", ".txt", ".csv", ".tsv", ".json", ".html", ".htm",
+                 ".py", ".sh", ".yaml", ".yml", ".svg"}
+
+# Working dirs with an in-flight Science turn (process-wide). Lets the UI show a
+# "running" badge and guards against two connections driving the same session.
+_ACTIVE_SCIENCE: set[str] = set()
+
+
+@app.get("/api/science/sessions")
+async def science_sessions():
+    """List past/current Science sessions (most recent first) for the history UI."""
+    from ..science import index as _index
+    out = []
+    for s in _index.list_sessions():
+        out.append({**s, "running": s.get("working_dir") in _ACTIVE_SCIENCE})
+    return {"sessions": out}
+
+
+@app.delete("/api/science/sessions")
+async def science_forget(working_dir: str):
+    """Drop a session from the history index (does not delete its files)."""
+    from ..science import index as _index
+    return {"ok": _index.remove(working_dir)}
+
+
+@app.post("/api/science/save")
+async def science_save(payload: dict):
+    """Write edited text content back to a presented artifact file on disk.
+
+    Only text-like files are editable; images/PDFs are refined by commenting.
+    """
+    raw = (payload or {}).get("path", "")
+    content = (payload or {}).get("content")
+    if not raw or content is None:
+        return {"ok": False, "error": "path and content are required"}
+    path = Path(raw)
+    if path.suffix.lower() not in _EDITABLE_EXT:
+        return {"ok": False, "error": f"{path.suffix} is not editable in place"}
+    if not path.exists() or not path.is_file():
+        return {"ok": False, "error": "file not found"}
+    try:
+        path.write_text(content)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "path": str(path.resolve()), "size": len(content)}
 
 
 # ---------------------------------------------------------------------------
@@ -1000,13 +1076,26 @@ async def ws_endpoint(websocket: WebSocket):
                 use_council = mode in ("improved", "ultra")
                 use_ultra = mode == "ultra" or bool(msg.get("ultra", False))
                 council_roles = None
+                # Per-role model overrides from the UI (worker/thinker/verifier/
+                # worker_alt). Empty values mean "auto" — resolve_council_roles
+                # falls back to its preference chains for those roles.
+                council_overrides = msg.get("council_models") or {}
+                if not isinstance(council_overrides, dict):
+                    council_overrides = {}
+                council_overrides = {
+                    k: v.strip() for k, v in council_overrides.items()
+                    if k in ("worker", "thinker", "verifier", "worker_alt")
+                    and isinstance(v, str) and v.strip()
+                }
                 if use_council and council_available(cfg):
                     try:
-                        council_roles, council_notes = resolve_council_roles(client, cfg, {})
+                        council_roles, council_notes = resolve_council_roles(client, cfg, council_overrides)
                         tag = "⚡ ultra council" if use_ultra else "🐙 council"
                         extra = ""
+                        if council_roles.get("worker_alt"):
+                            extra += " · escalation: " + council_roles["worker_alt"]
                         if use_ultra and council_roles.get("debate"):
-                            extra = " · debate: " + ", ".join(council_roles["debate"])
+                            extra += " · debate: " + ", ".join(council_roles["debate"])
                         await send({
                             "type": "info",
                             "text": (
@@ -1287,6 +1376,130 @@ async def ws_endpoint(websocket: WebSocket):
                 threading.Thread(target=followup_fn, daemon=True).start()
                 await stream_events()
                 state["lab_session"] = None
+
+            # ---- science (conversational research orchestrator) ----
+            elif mtype == "science_load":
+                working_dir = msg.get("working_dir") or state["working_dir"]
+                state["working_dir"] = working_dir
+                from ..science.session import ScienceSession
+                sess = ScienceSession.load(working_dir)
+                if sess is None:
+                    await send({"type": "science_state", "exists": False,
+                                "working_dir": working_dir})
+                else:
+                    state["science_session"] = sess
+                    await send({"type": "science_state", "exists": True,
+                                "working_dir": working_dir,
+                                "task": sess.task,
+                                "running": sess.working_dir in _ACTIVE_SCIENCE,
+                                "history": _science_history(sess.messages),
+                                "snapshot": sess.snapshot()})
+
+            elif mtype in ("science_message", "science_comment"):
+                if state["running"]:
+                    await send({"type": "error", "text": "A task is already running."})
+                    continue
+
+                working_dir = msg.get("working_dir") or state["working_dir"]
+                state["working_dir"] = working_dir
+
+                cfg = load_config()
+                if state.get("backend"):
+                    cfg["backend"] = state["backend"]
+                _resolved = resolve_backend(cfg)
+                client = make_client(_resolved["api_key"], _resolved["base_url"])
+                model = msg.get("model") or state.get("model") or cfg.get("default_model")
+
+                remote_id = msg.get("remote_id") if "remote_id" in msg else state.get("remote_id")
+                state["remote_id"] = remote_id
+                remote = get_remote(None, remote_id) if remote_id else None
+
+                from ..science.session import ScienceSession
+                from ..science.orchestrator import run_science_turn
+
+                sess = state.get("science_session")
+                want = str(Path(working_dir).expanduser().resolve())
+                if want in _ACTIVE_SCIENCE:
+                    await send({"type": "info",
+                                "text": "This session is still working — wait for the "
+                                        "current turn to finish before sending more."})
+                    continue
+                if sess is None or sess.working_dir != want:
+                    sess = ScienceSession.load(working_dir)
+
+                # Build the turn's user message (a comment refines a specific output).
+                refine_id = None
+                if mtype == "science_comment":
+                    if sess is None:
+                        await send({"type": "error", "text": "No science session for this directory."})
+                        continue
+                    comment = (msg.get("text") or "").strip()
+                    art = sess.get_artifact(msg.get("artifact_id", ""))
+                    if not comment:
+                        continue
+                    if art:
+                        refine_id = art.id
+                        sess.comment_artifact(art.id, comment)
+                        user_message = (
+                            f"The user commented on the presented output `{art.rel}` "
+                            f"(kind: {art.kind}): \"{comment}\". Refine that specific "
+                            f"output accordingly, then call present_output on the "
+                            f"updated file so they see the new version.")
+                    else:
+                        user_message = comment
+                    echo = comment
+                else:
+                    user_message = (msg.get("message") or "").strip()
+                    if not user_message:
+                        continue
+                    if sess is None:
+                        sess = ScienceSession(task=user_message,
+                                              working_dir=working_dir,
+                                              model=model or "")
+                    elif not sess.task:
+                        sess.task = user_message
+                    echo = user_message
+
+                sess.remote_id = remote_id
+                state["science_session"] = sess
+                state["running"] = True
+                _ACTIVE_SCIENCE.add(want)
+                # Record in the history index up front, so the session is
+                # reopenable even mid-run (before the first turn saves).
+                try:
+                    from ..science import index as _science_index
+                    _science_index.record(sess.working_dir, sess.task or echo)
+                except Exception:
+                    pass
+                await send({"type": "science_user", "text": echo,
+                            "artifact_id": msg.get("artifact_id")})
+
+                def science_fn(um=user_message, sc=sess, cl=client, md=model,
+                               rmt=remote, wd_key=want, rid=refine_id):
+                    display.set_event_callback(make_emit())
+                    interrupt.register()
+                    state["agent_ident"] = threading.get_ident()
+                    try:
+                        run_science_turn(sc, um, cl, md,
+                                         permission_mode="autonomous",
+                                         emit=make_emit(), remote=rmt,
+                                         refresh_artifact_id=rid)
+                    except interrupt.StopRequested:
+                        loop.call_soon_threadsafe(
+                            event_q.put_nowait,
+                            {"type": "science_reply", "text": "⏹ Stopped.", "stopped": True})
+                    except Exception as exc:
+                        loop.call_soon_threadsafe(
+                            event_q.put_nowait, {"type": "error", "text": str(exc)})
+                    finally:
+                        _ACTIVE_SCIENCE.discard(wd_key)
+                        interrupt.unregister()
+                        state["agent_ident"] = None
+                        display.clear_event_callback()
+                        loop.call_soon_threadsafe(event_q.put_nowait, {"type": "_sentinel"})
+
+                threading.Thread(target=science_fn, daemon=True).start()
+                await stream_events()
 
     except WebSocketDisconnect:
         pass

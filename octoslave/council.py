@@ -60,7 +60,14 @@ from .agent import (
     load_session_memory,
     _rt,
 )
-from .tools import execute_tool, all_tool_definitions, valid_tool_names, init_mcp, configure_execution
+from .tools import (
+    execute_tool,
+    all_tool_definitions,
+    valid_tool_names,
+    init_mcp,
+    configure_execution,
+    running_background_processes,
+)
 from .config import (
     load_config,
     resolve_backend,
@@ -218,7 +225,15 @@ def _verifier_gate_completion(
         "Only say DONE if the task's deliverable was actually produced and verified "
         "THIS session. Pre-existing files, or the worker's assertion that something "
         "'already works', are NOT evidence — if the task asks to build, run, test, "
-        "fix, or produce something and none of that happened, answer REVISE. "
+        "fix, or produce something and none of that happened, answer REVISE.\n"
+        "The following are NOT completion — answer REVISE if the worker did only these:\n"
+        "  - oriented, inspected, or set up the environment (checked which tools/"
+        "binaries/GPUs exist, read files, printed versions) without carrying out the task;\n"
+        "  - launched or scheduled work and left it unfinished — a job that is still "
+        "running, or output not yet collected and used, is not a delivered result;\n"
+        "  - announced FUTURE work instead of doing it. Treat forward-looking phrasing "
+        "('I'll check on it', 'next check in a few minutes', 'will start X once it "
+        "completes', 'then I will…') as an admission the task is NOT finished.\n"
         "Be terse."
     )
     raw = _simple_completion(client, verifier_model, [
@@ -509,6 +524,7 @@ def _council_loop(
     work_actions = 0   # of those, state-changing ones (writes/edits/commands/bg runs)
     inspect_actions = 0  # of those, read-only ones (reads/greps/lists/searches/…)
     nudged_no_work = False  # pushed back on a "done" claim that did zero real work yet
+    bg_wait_nudges = 0  # times we've told the worker to wait on an in-flight background job
     empty_start = 0    # consecutive no-tool turns before any work has begun
     edit_epoch = 0           # ++ on each successful edit; identical actions across the
     sig_epoch: dict = {}     # same epoch (no edit between) are a stuck repeat
@@ -642,6 +658,37 @@ def _council_loop(
                 )})
                 continue
 
+            # A background job the worker launched is still running — the task's
+            # result depends on it, so "done" here is premature (the classic
+            # "I'll check on it later" stop that ends the turn-based loop before
+            # the deliverable exists). Don't complete: make the worker actually
+            # wait for the job to finish and consume its output. Bounded so a job
+            # that never terminates can't trap the loop forever.
+            bg_running = running_background_processes()
+            if bg_running and bg_wait_nudges < 3:
+                bg_wait_nudges += 1
+                listing = "\n".join(
+                    f"  - {b['id']} (running {b['elapsed']}s): {b['command'][:80]}"
+                    for b in bg_running
+                )
+                display.print_info(
+                    f"{_TAG['worker']} claims completion, but a background job is still "
+                    f"running — directing it to wait for the result."
+                )
+                messages.append({"role": "user", "content": (
+                    "You cannot declare the task complete: a background job you started is "
+                    "STILL RUNNING and its output is part of the deliverable:\n" + listing + "\n\n"
+                    "Do NOT poll once and stop, and do NOT promise to 'check later' — this loop "
+                    "will not resume on its own. Actually WAIT for it to finish in a single "
+                    "blocking step, e.g. run a bash command that blocks until the process exits "
+                    "(a `while kill -0 <pid> 2>/dev/null; do sleep <n>; done` loop, or `wait`, "
+                    "with a timeout large enough to cover the whole run). Then read its output "
+                    "with check_process, do the downstream analysis, and produce the final "
+                    "deliverable. Only report completion once the job has finished and you have "
+                    "used its results."
+                )})
+                continue
+
             # Genuine completion claim -> Verifier gate.
             completion_rounds += 1
             if completion_rounds > _MAX_COMPLETION_ROUNDS:
@@ -657,6 +704,12 @@ def _council_loop(
                     " It produced, changed, and ran NOTHING — it only inspected existing files. "
                     "If the task requires building, running, testing, fixing, or producing anything, "
                     "it is NOT complete."
+                )
+            if bg_running:
+                evidence += (
+                    " A background job it launched is STILL RUNNING (" +
+                    ", ".join(b["id"] for b in bg_running) +
+                    "); any deliverable that depends on that job's output does not exist yet."
                 )
             if completion_panel and len(completion_panel) >= 2:
                 display.print_info(

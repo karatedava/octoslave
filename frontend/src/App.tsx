@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { LabSocket } from "./ws";
+import { Nav } from "./Nav";
 import type { Agent, ActivityItem, Decision } from "./types";
 
 const PHASES = [
@@ -328,7 +329,8 @@ export default function App() {
   return (
     <div className="app">
       <header className="topbar">
-        <div className="brand">🧬 OctoSlave <span>Lab</span></div>
+        <div className="brand">🧬 OctoSlave <span>Autonomous Research</span></div>
+        <Nav current="lab" />
         <div className="phasebar">
           {PHASES.map(([key, label]) => (
             <div

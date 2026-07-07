@@ -27,6 +27,10 @@
 #                        (used by the `compress_log` tool — optional)
 #   OCTOSLAVE_NO_TESSERACT  set to 1 to skip installing the tesseract OCR engine
 #                        (used by the image_ocr / pdf_ocr tools — optional)
+#   OCTOSLAVE_NO_NODE    set to 1 to skip installing Node.js (npx powers the
+#                        filesystem MCP server and other npx-based servers)
+#   OCTOSLAVE_NO_FS_MCP_REGISTER  set to 1 to skip auto-registering the
+#                        filesystem MCP server in ~/.octoslave/config.json
 #
 
 set -euo pipefail
@@ -39,6 +43,7 @@ OCTOSLAVE_NO_PIPX="${OCTOSLAVE_NO_PIPX:-0}"
 OCTOSLAVE_VENV_DIR="${OCTOSLAVE_VENV_DIR:-$HOME/.local/share/octoslave-venv}"
 OCTOSLAVE_NO_CODAG="${OCTOSLAVE_NO_CODAG:-0}"
 OCTOSLAVE_NO_TESSERACT="${OCTOSLAVE_NO_TESSERACT:-0}"
+OCTOSLAVE_NO_NODE="${OCTOSLAVE_NO_NODE:-0}"
 
 # ── Pretty output helpers ─────────────────────────────────────────────────
 bold()   { printf "\033[1m%s\033[0m\n" "$*"; }
@@ -241,6 +246,22 @@ install_codag() {
 }
 install_codag
 
+# Find a Python that can import octoslave. pipx puts the venv under
+# ~/.local/share/pipx/venvs/octoslave/bin/python; the venv fallback uses
+# $OCTOSLAVE_VENV_DIR/bin/python. Echoes the path, or nothing if not found.
+find_ots_python() {
+    local cand
+    for cand in \
+        "$HOME/.local/share/pipx/venvs/octoslave/bin/python" \
+        "$OCTOSLAVE_VENV_DIR/bin/python"; do
+        if [ -x "$cand" ] && "$cand" -c "import octoslave.config" >/dev/null 2>&1; then
+            echo "$cand"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Register codag's MCP server (wrap / compact / health, plus tail_* log-tailers
 # for any installed log CLIs — docker/kubectl/aws/gh/vercel; tail tools whose
 # CLI is missing are pruned automatically at load) in ~/.octoslave/config.json
@@ -254,18 +275,8 @@ register_codag_mcp() {
     if ! command -v codag >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/codag" ]; then
         return 0  # codag missing — nothing to register
     fi
-    # Find a Python that can import octoslave. pipx puts the venv under
-    # ~/.local/share/pipx/venvs/octoslave/bin/python; the venv fallback uses
-    # $OCTOSLAVE_VENV_DIR/bin/python.
-    local OTS_PY=""
-    for cand in \
-        "$HOME/.local/share/pipx/venvs/octoslave/bin/python" \
-        "$OCTOSLAVE_VENV_DIR/bin/python"; do
-        if [ -x "$cand" ] && "$cand" -c "import octoslave.config" >/dev/null 2>&1; then
-            OTS_PY="$cand"
-            break
-        fi
-    done
+    local OTS_PY
+    OTS_PY="$(find_ots_python || true)"
     if [ -z "$OTS_PY" ]; then
         info "  (could not locate octoslave's Python — skipping MCP auto-register; will happen on first compress_log call)"
         return 0
@@ -275,6 +286,82 @@ register_codag_mcp() {
     fi
 }
 register_codag_mcp
+
+# Install Node.js (ships npx — powers the filesystem MCP server and every
+# other npx-based catalog server). Best-effort across the common package
+# managers; never fails the install. Skip with OCTOSLAVE_NO_NODE=1.
+install_node() {
+    if [ "$OCTOSLAVE_NO_NODE" = "1" ]; then
+        info "skipping Node.js install (OCTOSLAVE_NO_NODE=1)"
+        return 0
+    fi
+    if command -v npx >/dev/null 2>&1; then
+        green "✓ npx already installed at $(command -v npx)"
+        return 0
+    fi
+    info "installing Node.js (npx powers the filesystem MCP server)"
+
+    local os; os="$(uname -s)"
+    if [ "$os" = "Darwin" ]; then
+        if command -v brew >/dev/null 2>&1; then
+            if brew install node >/dev/null 2>&1; then
+                green "✓ Node.js installed"
+                return 0
+            fi
+        else
+            yellow "  Homebrew not found — install Node with: brew install node"
+            return 0
+        fi
+    elif [ "$os" = "Linux" ]; then
+        # Use sudo only when not already root and sudo exists.
+        local SUDO=""
+        if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+        fi
+        if command -v apt-get >/dev/null 2>&1; then
+            $SUDO apt-get update -qq >/dev/null 2>&1 || true
+            $SUDO apt-get install -y nodejs npm >/dev/null 2>&1 && { green "✓ Node.js installed"; return 0; }
+        elif command -v dnf >/dev/null 2>&1; then
+            $SUDO dnf install -y nodejs npm >/dev/null 2>&1 && { green "✓ Node.js installed"; return 0; }
+        elif command -v yum >/dev/null 2>&1; then
+            $SUDO yum install -y nodejs npm >/dev/null 2>&1 && { green "✓ Node.js installed"; return 0; }
+        elif command -v pacman >/dev/null 2>&1; then
+            $SUDO pacman -S --noconfirm nodejs npm >/dev/null 2>&1 && { green "✓ Node.js installed"; return 0; }
+        elif command -v zypper >/dev/null 2>&1; then
+            $SUDO zypper install -y nodejs npm >/dev/null 2>&1 && { green "✓ Node.js installed"; return 0; }
+        fi
+    fi
+    yellow "  could not auto-install Node.js — the filesystem MCP server will stay"
+    yellow "  inactive until you install Node 18+ (https://nodejs.org), then it"
+    yellow "  connects automatically on the next start."
+    return 0
+}
+install_node
+
+# Register the filesystem MCP server (sandboxed read/write/search over $HOME)
+# in ~/.octoslave/config.json so the agent has file tools out of the box.
+# The entry is written even if Node is still missing — it self-heals as soon
+# as npx appears. Idempotent. Skip with OCTOSLAVE_NO_FS_MCP_REGISTER=1.
+register_filesystem_mcp() {
+    if [ "${OCTOSLAVE_NO_FS_MCP_REGISTER:-0}" = "1" ]; then
+        info "skipping filesystem MCP registration (OCTOSLAVE_NO_FS_MCP_REGISTER=1)"
+        return 0
+    fi
+    local OTS_PY
+    OTS_PY="$(find_ots_python || true)"
+    if [ -z "$OTS_PY" ]; then
+        info "  (could not locate octoslave's Python — add the server later with '/mcp install filesystem')"
+        return 0
+    fi
+    if "$OTS_PY" -c "from octoslave.config import ensure_filesystem_mcp_registered; print('registered' if ensure_filesystem_mcp_registered() else 'already-registered')" 2>/dev/null | grep -q '^registered$'; then
+        if command -v npx >/dev/null 2>&1; then
+            green "✓ filesystem MCP server registered (sandboxed file access under \$HOME)"
+        else
+            yellow "✓ filesystem MCP server registered — activates once Node 18+ is installed"
+        fi
+    fi
+}
+register_filesystem_mcp
 
 # ── 6b. Install tesseract OCR engine (optional — powers image_ocr / pdf_ocr) ──
 #

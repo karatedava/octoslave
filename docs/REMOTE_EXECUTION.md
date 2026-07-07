@@ -20,6 +20,49 @@ pymupdf…), and any output pushed back. Network tools (`web_search`, `web_fetch
 
 ---
 
+## Quick setup (web UI, step by step)
+
+1. **Start the web UI** (`ots web`) and open **Settings → Remote hosts (SSH)**
+   — or just click **🌐 Remote** next to the working-directory picker; with no
+   host configured it jumps straight to that card.
+2. **Add** a host: fill in an **id** (short handle, e.g. `gpu01`), **name**,
+   **host**, **SSH user** (blank = your ssh default), **port** (default 22) and
+   optionally an **identity file**. No working directory is asked for here.
+3. Click **Test connection**. If it fails, see
+   [Authentication](#authentication) — the usual fix is `ssh-copy-id <host>`
+   (key auth) or `ssh-add <key>` (passphrase key not in the agent).
+4. Go back to the start screen (or **New Chat**), flip the toggle to
+   **🌐 Remote**, and pick the host in the dropdown.
+5. You start in the remote **home** directory — use **Browse…** to navigate
+   folders *on the remote host* and pick your working directory. Done: `bash`
+   and file tools now run on that machine.
+
+### The lazy way: ask OctoSlave to set itself up
+
+OctoSlave can do steps 1–3 *for you*. While still in **local** mode (the
+default), paste something like this into the chat:
+
+> Set up a new remote host for yourself. Host `gpu.example.org`, user `me`,
+> call it `gpu01`.
+> 1. First verify key-based SSH works: `ssh -o BatchMode=yes me@gpu.example.org true`.
+>    If it doesn't, check whether I have a key in `~/.ssh`, generate one if
+>    needed, and tell me the exact `ssh-copy-id` command to run myself (you
+>    can't type my password).
+> 2. Then add it to `~/.octoslave/config.json`: append to the top-level
+>    `"remotes"` list an object with keys `id`, `name`, `host`, `user`, `port`
+>    (number), `remote_dir` and `identity_file` (both may be `""`). Keep the
+>    rest of the file intact.
+> 3. Re-run the connectivity test and confirm it's green.
+
+The agent edits the config, probes the connection, and reports back. The web
+UI reads `~/.octoslave/config.json` fresh on every request, so the new host
+shows up in the **🌐 Remote** dropdown immediately — no restart needed. The
+one thing the agent *cannot* do is type your password: if key auth isn't set
+up yet, it will prepare everything and hand you the single `ssh-copy-id`
+command to run.
+
+---
+
 ## How it connects
 
 OctoSlave shells out to your **system `ssh`/`scp`**, so it inherits everything

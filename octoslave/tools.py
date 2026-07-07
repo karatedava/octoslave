@@ -1693,6 +1693,33 @@ def _check_process(working_dir: str, id: str = None, tail_lines: int = 50) -> tu
     return header + _read_bg_log(info, tail_lines), True
 
 
+def running_background_processes() -> list[dict]:
+    """Public: background jobs started this session that are STILL running.
+
+    Returns ``[{"id", "command", "elapsed"}, …]`` (elapsed in whole seconds).
+    Used by the council loop to refuse a "task complete" claim while a job the
+    worker launched is still in flight — otherwise a turn-based loop would end
+    with the real deliverable never produced. Never raises."""
+    out: list[dict] = []
+    with _bg_lock:
+        items = list(_BG_PROCS.items())
+    for proc_id, info in items:
+        try:
+            if info.get("remote"):
+                alive = _remote_bg_alive(info)
+            else:
+                alive = info["proc"].poll() is None
+        except Exception:
+            alive = False
+        if alive:
+            out.append({
+                "id": proc_id,
+                "command": info.get("command", ""),
+                "elapsed": int(_time.time() - info.get("started", _time.time())),
+            })
+    return out
+
+
 def _stop_process(id: str, working_dir: str) -> tuple[str, bool]:
     info = _BG_PROCS.get(id)
     if not info:
