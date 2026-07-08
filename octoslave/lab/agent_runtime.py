@@ -148,13 +148,13 @@ def run_agent_task(
         # Re-resolve the offered tools each turn so a tool the agent just built
         # via request_tool (granted back to spec.tools) becomes callable now.
         tools = tools_for_agent(spec)
-        messages = _proactive_trim(messages, label=spec.name)
+        messages = _proactive_trim(messages, label=spec.name, client=client, model=model)
         try:
             response = _stream_turn(client, model, messages, tools)
         except BadRequestError as e:
             err = str(e)
             if _is_context_window_error(err):
-                trimmed = _compact_and_trim(messages, groups=10)
+                trimmed = _compact_and_trim(messages, groups=10, client=client, model=model)
                 if len(trimmed) < len(messages):
                     messages = trimmed
                     iteration -= 1

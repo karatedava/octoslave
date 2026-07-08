@@ -224,10 +224,52 @@ _OLLAMA_NUM_CTX_MAX = int(os.environ.get("OCTOSLAVE_OLLAMA_NUM_CTX_MAX", "32768"
 # Proactive context-budget. The agent estimates total tokens via chars/4 and
 # compacts message history BEFORE sending when this threshold is exceeded —
 # instead of waiting for the API to return a 400. Default ~96K tokens fits a
-# Kimi K2 / 128K-window safely. Override with OCTOSLAVE_SOFT_CONTEXT_TOKENS.
-# For local Ollama models this is overridden at run time to track the (much
-# smaller) real window — see configure_runtime / _RT.
+# Kimi K2 / 128K-window safely. Raise it via config.json `soft_context_tokens`
+# or the OCTOSLAVE_SOFT_CONTEXT_TOKENS env var (env wins) — see
+# _resolve_soft_budget, which configure_runtime consults for non-local runs.
+# This module constant is only the import-time fallback. For local Ollama models
+# the budget is instead auto-sized to the real window (configure_runtime / _RT).
 _SOFT_CONTEXT_BUDGET = int(os.environ.get("OCTOSLAVE_SOFT_CONTEXT_TOKENS", "96000"))
+
+# Hysteresis for the proactive trimmer. Trimming is *triggered* when the
+# estimate crosses the soft budget, but once triggered it compacts down to
+# this fraction of the budget — leaving headroom so the next few turns don't
+# immediately re-cross it. Without this, the trimmer stops the instant it dips
+# under budget (~just below the line) and then re-fires on almost every turn as
+# each new assistant/tool message nudges it back over — a sawtooth glued to the
+# boundary. 0.8 → many turns of headroom between trims. Override with
+# OCTOSLAVE_TRIM_TARGET_RATIO (clamped to a sane 0.3–0.99 range).
+_TRIM_TARGET_RATIO = min(
+    0.99, max(0.3, float(os.environ.get("OCTOSLAVE_TRIM_TARGET_RATIO", "0.8")))
+)
+
+# Observation pruning. Tool outputs (file reads, bash dumps, search hits)
+# dominate token count and go stale the moment a later turn supersedes them, so
+# the cheapest way to reclaim context is to elide the BODIES of the largest,
+# oldest tool results — keeping every assistant reasoning step and the message
+# pairing intact. This runs BEFORE any turn-level compaction; it often keeps a
+# run under budget with zero loss of reasoning and zero LLM calls.
+#   _PRUNE_MIN_RESULT_CHARS — never bother eliding results smaller than this
+#     (the stub itself costs a line).
+#   _PRUNE_KEEP_RECENT — always keep the bodies of the N most recent tool
+#     results intact; the model is most likely still reasoning over them.
+_PRUNE_MIN_RESULT_CHARS = 800
+_PRUNE_KEEP_RECENT = 4
+
+# System prompt for LLM-based turn summarization (hybrid compaction). Used only
+# for capable remote models; local/weak models fall back to the mechanical
+# head/tail summary. Kept terse and structured so the summary stays dense.
+_COMPACT_SUMMARY_SYSTEM = (
+    "You compress an AI agent's earlier work into a dense hand-off note so the "
+    "agent can keep working without re-reading the full history. Preserve only "
+    "what changes future decisions. Output plain text under these headings, "
+    "omitting any that are empty:\n"
+    "FACTS: concrete findings, values, file paths, and results learned.\n"
+    "CHANGES: files created/edited and what changed.\n"
+    "DECISIONS: choices made and why.\n"
+    "OPEN: unresolved threads, failures, or next steps.\n"
+    "Be specific (names, numbers, paths). No preamble, no restating the task."
+)
 
 # Path to prompt profiles directory
 PROMPT_PROFILES_DIR = Path(__file__).parent / "prompt_profiles"
@@ -310,12 +352,29 @@ def _ollama_extra_body() -> dict:
     return body
 
 
+def _resolve_soft_budget() -> int:
+    """Non-local proactive-trim budget, in priority order: the
+    OCTOSLAVE_SOFT_CONTEXT_TOKENS env var, then config.json's
+    ``soft_context_tokens``, then the built-in default. Resolved per run (inside
+    configure_runtime) so a config edit — or a long-lived web process — picks up
+    a new value without a restart. load_config already applies env-over-file
+    precedence; falls back to the import-time constant on any error."""
+    try:
+        val = load_config().get("soft_context_tokens")
+        if val:
+            return max(2048, int(val))
+    except Exception:
+        pass
+    return _SOFT_CONTEXT_BUDGET
+
+
 def configure_runtime(client, model: str, prompt_profile: str) -> bool:
     """Set per-thread runtime knobs based on the backend. Returns True for local
     (Ollama) runs. For local: auto-size num_ctx, then derive a soft trim budget
     (75% of the real window, so the proactive trimmer fires BEFORE Ollama
     silently truncates) and a per-tool-result cap (~1/3 of the window, so one
-    big read can't overflow). For everything else: keep the defaults verbatim."""
+    big read can't overflow). For non-local: the trim budget comes from
+    _resolve_soft_budget() (env var / config.json / default)."""
     if _is_ollama_client(client):
         meta = _ollama_model_info(client, model)
         num_ctx = meta["num_ctx"]
@@ -330,7 +389,7 @@ def configure_runtime(client, model: str, prompt_profile: str) -> bool:
         set_tool_profile("local")
         return True
     _RT.num_ctx = None
-    _RT.soft_budget = _SOFT_CONTEXT_BUDGET
+    _RT.soft_budget = _resolve_soft_budget()
     _RT.tool_result_chars = MAX_TOOL_RESULT_CHARS
     _RT.ollama_thinking = False
     # Non-local runs keep the full tool surface. We propagate the prompt-profile
@@ -781,26 +840,110 @@ def _estimated_tokens(messages: list[dict]) -> int:
     return total // 4
 
 
+def _observation_stub(body: str) -> str:
+    """One-line replacement for an elided tool-result body. Keeps the first
+    non-empty line (usually a headline / path / status) so the model can still
+    tell what the observation was and re-fetch it if needed."""
+    first = next((ln.strip() for ln in body.splitlines() if ln.strip()), "")
+    ell = "…" if len(first) > 120 else ""
+    kb = max(1, round(len(body) / 1024))
+    return (
+        f"[observation elided to save context — ~{kb} KB; "
+        f"first line: {first[:120]}{ell}. Re-run the tool if you need it again.]"
+    )
+
+
+def _prune_stale_observations(messages: list[dict], target: int) -> tuple[list[dict], int, int]:
+    """Reclaim context by eliding the BODIES of the largest, oldest tool-result
+    messages down to a one-line stub — deterministic, no LLM call, and it never
+    removes a message (so it can't orphan an assistant ``tool_calls``). Only
+    ``role == 'tool'`` content is touched.
+
+    Protects ``messages[:2]`` (system + first user), the most recent
+    ``_PRUNE_KEEP_RECENT`` observations (likely still in active use), and any
+    result already stubbed. Elides largest-first (most tokens reclaimed per
+    stub) until the estimate is at/under ``target`` or candidates run out.
+
+    Returns ``(messages, pruned_count, tokens_reclaimed)``; ``messages`` is a
+    fresh list when anything changed, otherwise the original object."""
+    est = _estimated_tokens(messages)
+    if est <= target:
+        return messages, 0, 0
+    candidates = [
+        i for i, m in enumerate(messages)
+        if i >= 2 and m.get("role") == "tool" and not m.get("_pruned")
+        and len(m.get("content") or "") >= _PRUNE_MIN_RESULT_CHARS
+    ]
+    if len(candidates) <= _PRUNE_KEEP_RECENT:
+        return messages, 0, 0
+    # Keep the most recent observations intact; prune from the rest.
+    prunable = candidates[:-_PRUNE_KEEP_RECENT]
+    prunable.sort(key=lambda i: len(messages[i].get("content") or ""), reverse=True)
+    out = list(messages)
+    need = est - target  # tokens still to reclaim
+    pruned = 0
+    reclaimed = 0
+    for i in prunable:
+        if need <= 0:
+            break
+        body = out[i].get("content") or ""
+        stub = _observation_stub(body)
+        gained = max(0, (len(body) - len(stub)) // 4)
+        m = dict(out[i])
+        m["content"] = stub
+        m["_pruned"] = True
+        out[i] = m
+        pruned += 1
+        reclaimed += gained
+        need -= gained
+    if pruned == 0:
+        return messages, 0, 0
+    return out, pruned, reclaimed
+
+
 def _proactive_trim(
     messages: list[dict],
     soft_budget: int | None = None,
     label: str = "",
+    client: OpenAI | None = None,
+    model: str | None = None,
 ) -> list[dict]:
-    """If estimated tokens > soft_budget, compact in a loop until under budget
-    or no more groups can be compacted. Returns the trimmed list (or original
-    if no trim was needed / possible). Logs each round it actually trimmed.
+    """Bring the estimated token count at/under the *trim target*
+    (soft_budget * _TRIM_TARGET_RATIO) when it has crossed the soft budget.
+    Returns the trimmed list (or the original if no trim was needed / possible).
+
+    The gap between the trigger (soft_budget) and the stop condition (target) is
+    deliberate hysteresis: trimming only to just-under-budget makes the trimmer
+    re-fire on nearly every turn, so once we cross the budget we shrink down to
+    target and coast for many turns before crossing again.
+
+    Two-tier compaction:
+      1. Observation pruning — elide the bodies of the largest, oldest tool
+         results (deterministic, no LLM call, keeps all reasoning). Often enough
+         on its own.
+      2. Turn compaction — if still over target, summarise the oldest
+         assistant-turn groups. With a capable remote ``client``/``model`` this
+         is an LLM summary; otherwise a mechanical head/tail digest.
 
     soft_budget defaults to the per-thread runtime budget (small for local
     Ollama models, _SOFT_CONTEXT_BUDGET for everything else)."""
     if soft_budget is None:
         soft_budget = _rt("soft_budget", _SOFT_CONTEXT_BUDGET)
     est = _estimated_tokens(messages)
+    # Trigger at the budget, but compact down to the lower target for headroom.
     if est <= soft_budget:
         return messages
+    target = max(1024, int(soft_budget * _TRIM_TARGET_RATIO))
+
+    # Tier 1: cheap, lossless-for-reasoning observation pruning.
+    messages, pruned, _ = _prune_stale_observations(messages, target)
+    est = _estimated_tokens(messages)
+
+    # Tier 2: turn-level compaction only if pruning didn't get us there.
     rounds = 0
     groups = 6
-    while est > soft_budget:
-        trimmed = _compact_and_trim(messages, groups=groups)
+    while est > target:
+        trimmed = _compact_and_trim(messages, groups=groups, client=client, model=model)
         if len(trimmed) >= len(messages):
             # Nothing left to compact — surrender to the API and let the
             # reactive branch handle the hard failure.
@@ -816,27 +959,115 @@ def _proactive_trim(
         groups = min(groups * 2, 64)
         if rounds >= 50:
             break
-    if rounds > 0:
+
+    if pruned or rounds:
         tag = f"[{label}] " if label else ""
+        parts = []
+        if pruned:
+            parts.append(f"pruned {pruned} stale observation(s)")
+        if rounds:
+            parts.append(f"{rounds} summary pass(es)")
         msg = (
-            f"{tag}Proactive context trim: {rounds} pass(es), "
-            f"~{est:,} tokens remaining (soft budget {soft_budget:,})."
+            f"{tag}Proactive context trim: {', '.join(parts)}, "
+            f"~{est:,} tokens remaining "
+            f"(trimmed to target {target:,}, soft budget {soft_budget:,})."
         )
         display.print_info(msg)
         try:
-            logger.log_info(msg, rounds=rounds, est_tokens=est, soft_budget=soft_budget)
+            logger.log_info(msg, pruned=pruned, rounds=rounds, est_tokens=est,
+                            trim_target=target, soft_budget=soft_budget)
         except Exception:
             pass
     return messages
 
 
-def _compact_and_trim(messages: list[dict], groups: int = 6) -> list[dict]:
-    """
-    Replace the oldest N complete assistant-turn groups with a compact text
-    summary instead of silently discarding them.  Preserves messages[:2]
-    (system prompt + first user message).
+def _mechanical_summary(turns_to_compact: list[dict], removed: int) -> str:
+    """Deterministic head/tail digest of a block of evicted turns — no LLM call.
 
-    Falls back to pure deletion when there is nothing to compact.
+    Keeps enough content that the model can still recall what it learned:
+    assistant notes (≤400 chars), each tool call with its key argument, and for
+    every tool result the first ~3 lines (headline) plus the last ~3 (errors /
+    exit codes / result keys tend to live at the end)."""
+    lines = [f"[COMPACTED HISTORY — {removed} earlier turn(s) summarised to save context]"]
+    for msg in turns_to_compact:
+        if msg.get("role") == "assistant":
+            txt = (msg.get("content") or "").strip()
+            if txt:
+                snippet = txt if len(txt) <= 400 else txt[:400] + "…"
+                lines.append(f"  [note: {snippet}]")
+            for tc in msg.get("tool_calls") or []:
+                name = tc["function"]["name"]
+                try:
+                    args = json.loads(tc["function"]["arguments"])
+                    label = (
+                        args.get("path") or args.get("file_path") or
+                        args.get("command") or args.get("query") or
+                        args.get("pattern") or args.get("url") or
+                        json.dumps(args)[:60]
+                    )
+                    label = str(label)
+                    if len(label) > 90:
+                        label = label[:90] + "…"
+                    lines.append(f"  called: {name}({label})")
+                except Exception:
+                    lines.append(f"  called: {name}(...)")
+        elif msg.get("role") == "tool":
+            content = (msg.get("content") or "").strip()
+            if not content:
+                continue
+            content_lines = [ln for ln in content.splitlines() if ln.strip()]
+            head_lines = content_lines[:3]
+            tail_lines = content_lines[-3:] if len(content_lines) > 6 else []
+            head = " | ".join(ln.strip()[:160] for ln in head_lines)
+            if head:
+                lines.append(f"    → {head[:480]}")
+            if tail_lines:
+                tail = " | ".join(ln.strip()[:160] for ln in tail_lines)
+                lines.append(f"    ⚠ {tail[:480]}")
+    return "\n".join(lines)
+
+
+def _llm_summary(client: OpenAI, model: str, turns_to_compact: list[dict], removed: int) -> str:
+    """Distill an evicted turn block into a dense structured hand-off note via a
+    tool-free completion. Feeds the model the mechanical digest as source
+    material (bounded, cheap) rather than the raw turns, so the prompt size is
+    predictable. Returns "" on empty output or any error so the caller falls
+    back to the mechanical summary."""
+    digest = _mechanical_summary(turns_to_compact, removed)
+    prompt = [
+        {"role": "system", "content": _COMPACT_SUMMARY_SYSTEM},
+        {"role": "user", "content": "Compress this earlier work:\n\n" + digest},
+    ]
+    try:
+        out = _simple_completion(client, model, prompt, max_tokens=500).strip()
+    except Exception:
+        # Any failure (transport, or a user Stop surfacing as StopRequested) —
+        # fall back to the mechanical summary. A pending stop is honoured by the
+        # loop's between-turn interrupt check.
+        return ""
+    if not out:
+        return ""
+    return (
+        f"[COMPACTED HISTORY — {removed} earlier turn(s) summarised to save context]\n"
+        + out
+    )
+
+
+def _compact_and_trim(
+    messages: list[dict],
+    groups: int = 6,
+    client: OpenAI | None = None,
+    model: str | None = None,
+) -> list[dict]:
+    """
+    Replace the oldest N complete assistant-turn groups with a compact summary
+    instead of silently discarding them. Preserves messages[:2] (system prompt +
+    first user message).
+
+    With a capable remote ``client``/``model`` the summary is LLM-authored
+    (structured, higher fidelity); for local/weak models — or if the LLM call
+    fails — it falls back to a mechanical head/tail digest. Returns the original
+    list unchanged when there is nothing to compact.
     """
     system = messages[:2]
     rest = list(messages[2:])
@@ -863,53 +1094,14 @@ def _compact_and_trim(messages: list[dict], groups: int = 6) -> list[dict]:
     if not turns_to_compact:
         return messages
 
-    # Build a compact text log of the removed turns so information isn't lost.
-    # Keep enough content that the model can still recall what it learned —
-    # earlier versions of this summary lost too much (150 chars / 120 chars)
-    # and the model would re-run the same searches after a compaction.
-    lines = [f"[COMPACTED HISTORY — {removed} earlier turn(s) summarised to save context]"]
-    for msg in turns_to_compact:
-        if msg.get("role") == "assistant":
-            txt = (msg.get("content") or "").strip()
-            if txt:
-                # 400 chars is enough to keep a short rationale / partial result
-                snippet = txt if len(txt) <= 400 else txt[:400] + "…"
-                lines.append(f"  [note: {snippet}]")
-            for tc in msg.get("tool_calls") or []:
-                name = tc["function"]["name"]
-                try:
-                    args = json.loads(tc["function"]["arguments"])
-                    label = (
-                        args.get("path") or args.get("file_path") or
-                        args.get("command") or args.get("query") or
-                        args.get("pattern") or args.get("url") or
-                        json.dumps(args)[:60]
-                    )
-                    label = str(label)
-                    if len(label) > 90:
-                        label = label[:90] + "…"
-                    lines.append(f"  called: {name}({label})")
-                except Exception:
-                    lines.append(f"  called: {name}(...)")
-        elif msg.get("role") == "tool":
-            content = (msg.get("content") or "").strip()
-            if not content:
-                continue
-            # Keep the first ~3 lines (often the headline / summary) AND the
-            # last ~3 non-empty lines (often the error / exit code / final
-            # result) — same head-plus-tail strategy as the bash truncator,
-            # because errors and result keys tend to live at the end.
-            content_lines = [ln for ln in content.splitlines() if ln.strip()]
-            head_lines = content_lines[:3]
-            tail_lines = content_lines[-3:] if len(content_lines) > 6 else []
-            head = " | ".join(ln.strip()[:160] for ln in head_lines)
-            if head:
-                lines.append(f"    → {head[:480]}")
-            if tail_lines:
-                tail = " | ".join(ln.strip()[:160] for ln in tail_lines)
-                lines.append(f"    ⚠ {tail[:480]}")
+    # LLM summary for capable remote models; mechanical digest otherwise.
+    summary_text = ""
+    if client is not None and model and not _is_ollama_client(client):
+        summary_text = _llm_summary(client, model, turns_to_compact, removed)
+    if not summary_text:
+        summary_text = _mechanical_summary(turns_to_compact, removed)
 
-    summary_msg = {"role": "user", "content": "\n".join(lines)}
+    summary_msg = {"role": "user", "content": summary_text}
     return system + [summary_msg] + remaining
 
 
@@ -1383,7 +1575,7 @@ def _robust_stream(
     (council.py) share identical robustness. Behaviour is intentionally unchanged.
     """
     import time as _time
-    messages = _proactive_trim(messages)
+    messages = _proactive_trim(messages, client=client, model=model)
     try:
         response = _stream_completion(client, model, messages, force_tool=force_tool)
         state["rate"] = 0
@@ -1394,7 +1586,7 @@ def _robust_stream(
         err_str = str(e)
         logger.log_error(f"BadRequestError on turn {iteration}", exc=e)
         if _is_context_window_error(err_str):
-            compacted = _compact_and_trim(messages, groups=10)
+            compacted = _compact_and_trim(messages, groups=10, client=client, model=model)
             if len(compacted) < len(messages):
                 display.print_info(
                     f"Context window exceeded — compacted oldest turns "

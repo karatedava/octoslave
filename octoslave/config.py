@@ -15,6 +15,11 @@ OLLAMA_BASE_URL = "http://localhost:11434/v1"
 NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NIM_DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b"
 
+# Default proactive context-trim budget (tokens) for non-local backends.
+# Fits a 128K-window model safely. Raise via config.json `soft_context_tokens`
+# or the OCTOSLAVE_SOFT_CONTEXT_TOKENS env var (env wins).
+DEFAULT_SOFT_CONTEXT_TOKENS = 196000
+
 # Built-in backends are first-class — they have dedicated config keys and
 # helpers (e.g. Ollama auto-discovery). Anything else is a user-defined
 # OpenAI-compatible provider stored in `custom_providers`.
@@ -572,6 +577,10 @@ def load_config() -> dict:
         "backend": "einfra",        # "einfra" | "ollama" | "nim" | <custom-id>
         "ollama_url": OLLAMA_BASE_URL,
         "permission_mode": "autonomous",  # "autonomous" | "controlled" | "supervised"
+        # Proactive context-trim budget (tokens) for NON-local backends. Set to
+        # ~75–80% of the model's real window (e.g. 192000 for a 256K Kimi). Local
+        # Ollama backends ignore this — they auto-size from the detected window.
+        "soft_context_tokens": DEFAULT_SOFT_CONTEXT_TOKENS,
         "nim_api_key": "",
         "nim_url": NIM_BASE_URL,
         "role_models_einfra": {},
@@ -598,6 +607,11 @@ def load_config() -> dict:
         config["nim_api_key"] = os.environ["OCTOSLAVE_NIM_API_KEY"]
     if os.environ.get("OCTOSLAVE_NIM_URL"):
         config["nim_url"] = os.environ["OCTOSLAVE_NIM_URL"]
+    if os.environ.get("OCTOSLAVE_SOFT_CONTEXT_TOKENS"):
+        try:
+            config["soft_context_tokens"] = int(os.environ["OCTOSLAVE_SOFT_CONTEXT_TOKENS"])
+        except ValueError:
+            pass
 
     if CONFIG_FILE.exists():
         try:
@@ -616,6 +630,12 @@ def load_config() -> dict:
             for key, env_var in _env_keys.items():
                 if not os.environ.get(env_var) and saved.get(key):
                     config[key] = saved[key]
+            # Soft context budget — int, env var wins over the file value.
+            if not os.environ.get("OCTOSLAVE_SOFT_CONTEXT_TOKENS") and saved.get("soft_context_tokens"):
+                try:
+                    config["soft_context_tokens"] = int(saved["soft_context_tokens"])
+                except (ValueError, TypeError):
+                    pass
             # Custom providers list — only loaded from file
             providers = saved.get("custom_providers")
             if isinstance(providers, list):

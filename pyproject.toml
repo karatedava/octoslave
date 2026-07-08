@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "octoslave"
-version = "3.0.0"
+version = "3.1.0"
 description = "Autonomous AI research & coding assistant — terminal + web UI, multi-agent parallel mode, e-INFRA CZ / NVIDIA NIM / Ollama backends"
 readme = "README.md"
 license = { file = "LICENSE" }
