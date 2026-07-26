@@ -98,8 +98,16 @@ _MAX_COMPLETION_ROUNDS = 3
 # classic stuck loop (e.g. running `tsc`/tests repeatedly without changing code).
 # Soft = re-strategize + switch family; hard = stop the loop. Re-runs that follow
 # a real edit are productive and never counted (the streak resets on each edit).
-_REPEAT_LOOP_SOFT = 3
-_REPEAT_LOOP_HARD = 6
+_REPEAT_LOOP_SOFT = 3    # nudge the CURRENT worker to stop repeating (no switch yet)
+_REPEAT_LOOP_SWITCH = 5  # only if it ignored the nudge and kept repeating → switch family
+_REPEAT_LOOP_HARD = 7    # still stuck after the nudge AND the switch → verify, then stop
+# Re-reading files it already has, accumulated across the session, at/above which
+# the worker is probably spinning. This does NOT end the task — it triggers a
+# verifier check, and continues unless completion is confirmed.
+_REDUNDANT_LIMIT = 8
+# How many times the stuck-loop guard may verify-and-recover before it gives up
+# and stops honestly (with a wrap-up), so a genuinely stuck run still terminates.
+_MAX_STUCK_RECOVERIES = 5
 # Tools whose successful execution counts as a real state change (resets streaks).
 _EDIT_TOOLS = frozenset({"write_file", "edit_file", "apply_patch"})
 
@@ -205,18 +213,22 @@ def _verifier_gate_completion(
     task: str,
     messages: list[dict],
     evidence: str = "",
+    plan: str = "",
 ) -> tuple[bool, str]:
     """Verifier grades the finished work. Returns ``(done, note)``.
 
     DONE -> finish. REVISE -> Worker gets another round. ``evidence`` summarises
     what the Worker actually did this session (e.g. that it only *inspected*
     files and produced nothing) — the transcript alone can be talked past by a
-    confident but premature "done", so this hard signal anchors the grade."""
+    confident but premature "done", so this hard signal anchors the grade.
+    ``plan`` is the concrete step list the worker committed to up front, so the
+    grader can check that EVERY step actually happened, not just some."""
     transcript = _recent_text(messages, n=10)
     prompt = (
         f"You are the VERIFIER. The WORKER says it is finished. Independently grade "
         f"completion against the task.\n\n"
         f"TASK:\n{task}\n\n"
+        + (f"THE PLAN THE WORKER COMMITTED TO (every step must be done):\n{plan[:1500]}\n\n" if plan else "")
         + (f"SESSION ACTIVITY (ground truth, not the worker's claim):\n{evidence}\n\n" if evidence else "")
         + f"WHAT THE WORKER DID (recent transcript):\n{transcript[:4000]}\n\n"
         "Reply with EXACTLY one of:\n"
@@ -226,6 +238,9 @@ def _verifier_gate_completion(
         "THIS session. Pre-existing files, or the worker's assertion that something "
         "'already works', are NOT evidence — if the task asks to build, run, test, "
         "fix, or produce something and none of that happened, answer REVISE.\n"
+        "Grade the WHOLE task, not part of it. If the task (or the plan above) has "
+        "several parts or steps and only SOME are done, answer REVISE and name the "
+        "first unfinished part — partial progress is NOT completion.\n"
         "The following are NOT completion — answer REVISE if the worker did only these:\n"
         "  - oriented, inspected, or set up the environment (checked which tools/"
         "binaries/GPUs exist, read files, printed versions) without carrying out the task;\n"
@@ -234,14 +249,24 @@ def _verifier_gate_completion(
         "  - announced FUTURE work instead of doing it. Treat forward-looking phrasing "
         "('I'll check on it', 'next check in a few minutes', 'will start X once it "
         "completes', 'then I will…') as an admission the task is NOT finished.\n"
+        "When unsure, answer REVISE — it only costs another round.\n"
         "Be terse."
     )
-    raw = _simple_completion(client, verifier_model, [
+    grader_msgs = [
         {"role": "system", "content": "You are a strict completion grader. One verdict, no preamble."},
         {"role": "user", "content": prompt},
-    ], max_tokens=200).strip()
+    ]
+    # The completion decision is critical, so a transient drop shouldn't decide
+    # it — retry once before giving up.
+    raw = _simple_completion(client, verifier_model, grader_msgs, max_tokens=200).strip()
     if not raw:
-        return True, ""
+        raw = _simple_completion(client, verifier_model, grader_msgs, max_tokens=200).strip()
+    if not raw:
+        # Fail SAFE, not open: an empty verdict means the grader call dropped
+        # (common on a flaky connection) — do NOT read that as approval, or the
+        # task ends unverified mid-work. Ask for another round; the completion-
+        # round cap still bounds this so a persistent outage can't loop forever.
+        return False, "completion could not be verified (grader did not respond) — continue the task"
     head = raw.splitlines()[0].strip()
     if head.upper().startswith("REVISE"):
         reason = head.split(":", 1)[1].strip() if ":" in head else raw[len("REVISE"):].strip()
@@ -256,6 +281,7 @@ def _debate_completion(
     task: str,
     messages: list[dict],
     evidence: str = "",
+    plan: str = "",
 ) -> tuple[bool, str]:
     """Completion gate as a debate: a diverse panel of critics each grades the
     finished work in ISOLATION, then the aggregator resolves their verdicts.
@@ -266,7 +292,7 @@ def _debate_completion(
     lone over-strict critic can't deadlock progress. Returns ``(done, note)``."""
     verdicts: list[tuple[str, bool, str]] = []
     for m in panel:
-        done, note = _verifier_gate_completion(client, m, task, messages, evidence=evidence)
+        done, note = _verifier_gate_completion(client, m, task, messages, evidence=evidence, plan=plan)
         verdicts.append((m, done, note))
     # Unanimous DONE → finish without spending an aggregator call.
     if all(d for _, d, _ in verdicts):
@@ -280,6 +306,7 @@ def _debate_completion(
         f"graded the WORKER's finished work; some raised concerns. Decide the FINAL "
         f"verdict: is the deliverable actually complete and correct for the task?\n\n"
         f"TASK:\n{task}\n\n"
+        + (f"THE PLAN THE WORKER COMMITTED TO (every step must be done):\n{plan[:1500]}\n\n" if plan else "")
         + (f"SESSION ACTIVITY (ground truth):\n{evidence}\n\n" if evidence else "")
         + f"WHAT THE WORKER DID (recent transcript):\n{transcript[:3500]}\n\n"
         f"CRITIC CONCERNS:\n" + "\n".join(concerns) + "\n\n"
@@ -300,6 +327,50 @@ def _debate_completion(
         reason = head.split(":", 1)[1].strip() if ":" in head else raw[len("REVISE"):].strip()
         return False, reason or "work appears incomplete"
     return True, ""
+
+
+def _run_completion_gate(
+    client: OpenAI,
+    roles: dict[str, str],
+    completion_panel: list[str] | None,
+    task: str,
+    messages: list[dict],
+    evidence: str,
+    plan: str,
+) -> tuple[bool, str]:
+    """Grade completion, using the ultra debate panel when available (>=2 critics)
+    else the single Verifier. Shared by the worker's own 'done' claim and by the
+    stuck-loop guards, so neither can END the task without the verifier's sign-off."""
+    if completion_panel and len(completion_panel) >= 2:
+        display.print_info(
+            f"{_TAG['verifier']} debating completion across "
+            f"[bold]{', '.join(completion_panel)}[/bold]…"
+        )
+        return _debate_completion(
+            client, completion_panel, roles["verifier"], task, messages, evidence=evidence, plan=plan
+        )
+    display.print_info(f"{_TAG['verifier']} reviewing completion…")
+    return _verifier_gate_completion(
+        client, roles["verifier"], task, messages, evidence=evidence, plan=plan
+    )
+
+
+def _final_summary(client: OpenAI, model: str, task: str, messages: list[dict]) -> None:
+    """Print a short wrap-up of what was actually accomplished when the loop is
+    forced to stop WITHOUT a clean verifier-approved completion (a stuck loop or
+    an exhausted retry budget). Leaves the user with an honest overview instead of
+    a bare 'Done', which matters most for long unattended (e.g. overnight) runs."""
+    try:
+        summary = _simple_completion(client, model, messages + [{"role": "user", "content": (
+            "We are stopping the session here. In 3-6 sentences, summarise for the user: "
+            "what you actually accomplished on this task, and what (if anything) is still "
+            "unfinished or would need another session. Be honest and concrete — this is the "
+            f"only wrap-up the user will see.\n\nTask: {task[:400]}"
+        )}], max_tokens=450).strip()
+    except Exception:
+        summary = ""
+    if summary:
+        display.print_summary(summary)
 
 
 def _thinker_consult(
@@ -520,6 +591,7 @@ def _council_loop(
     stall = 0  # consecutive non-productive worker turns (text-only / botched)
     seen_calls: dict[tuple, int] = {}
     redundant = 0
+    stuck_recoveries = 0  # verify-and-recover attempts from re-read / loop spinning
     actions_taken = 0  # tool calls actually executed in this loop (NOT orientation)
     work_actions = 0   # of those, state-changing ones (writes/edits/commands/bg runs)
     inspect_actions = 0  # of those, read-only ones (reads/greps/lists/searches/…)
@@ -530,6 +602,7 @@ def _council_loop(
     sig_epoch: dict = {}     # same epoch (no edit between) are a stuck repeat
     sig_streak: dict = {}
     repeat_warned = False     # nudged the current repeat-streak already
+    repeat_switched = False   # already switched family for the current repeat-streak
     end_reason = "completed"
 
     def _escalate_worker(reason: str) -> None:
@@ -711,19 +784,9 @@ def _council_loop(
                     ", ".join(b["id"] for b in bg_running) +
                     "); any deliverable that depends on that job's output does not exist yet."
                 )
-            if completion_panel and len(completion_panel) >= 2:
-                display.print_info(
-                    f"{_TAG['verifier']} debating completion across "
-                    f"[bold]{', '.join(completion_panel)}[/bold]…"
-                )
-                done, note = _debate_completion(
-                    client, completion_panel, roles["verifier"], task, messages, evidence=evidence
-                )
-            else:
-                display.print_info(f"{_TAG['verifier']} reviewing completion…")
-                done, note = _verifier_gate_completion(
-                    client, roles["verifier"], task, messages, evidence=evidence
-                )
+            done, note = _run_completion_gate(
+                client, roles, completion_panel, task, messages, evidence, plan
+            )
             if done:
                 display.print_info(f"{_TAG['verifier']} [bold #7fd88f]approved[/bold #7fd88f] — task complete.")
                 display.print_done(iteration)
@@ -742,7 +805,11 @@ def _council_loop(
             if strat:
                 display.print_plan(strat)
                 guidance = f"{note}\n\nPlanner's correction:\n{strat}"
-            _escalate_worker("completion was rejected")
+            # Give the current worker the correction first; only switch family if
+            # it has now had completion rejected more than once — the same model
+            # with concrete feedback usually fixes its own gap without a swap.
+            if completion_rounds >= 2:
+                _escalate_worker("completion rejected repeatedly")
             messages.append({"role": "user", "content": (
                 f"The verifier reviewed your work and it is NOT done yet. Fix this and continue:\n"
                 f"{guidance}\n\nMake the concrete change now using tools."
@@ -815,7 +882,11 @@ def _council_loop(
                 continue
             display.print_tool_call(name, args)
             logger.log_tool_call(tc.get("id", ""), name, args)
-            result, success = execute_tool(name, args, working_dir, permission_mode)
+            display.tool_activity_start(name, args, permission_mode)
+            try:
+                result, success = execute_tool(name, args, working_dir, permission_mode)
+            finally:
+                display.tool_activity_end()
             # Track substantive vs read-only activity so the completion gate knows
             # whether the worker actually DID the task or merely inspected files.
             if _is_work_tool(name):
@@ -871,13 +942,35 @@ def _council_loop(
 
         # ---- Stuck re-running the same action with no edits between ------------
         if turn_repeat >= _REPEAT_LOOP_HARD:
-            display.print_error(
-                f"Worker repeated the same action {turn_repeat}× with no change between runs "
-                f"— stopping to avoid an endless loop."
+            # A tight loop (soft-loop re-strategize + escalation already fired). Do
+            # NOT claim the task is done — verify first; if the verifier agrees it is
+            # complete, finish cleanly, otherwise stop HONESTLY with a wrap-up of
+            # what was actually accomplished rather than a misleading "done".
+            display.print_info(
+                f"{_TAG['worker']} repeated the same action {turn_repeat}× with no change "
+                f"— checking whether the task is actually complete before stopping."
             )
+            evidence = (
+                f"The worker is stuck repeating the same action {turn_repeat}× with nothing "
+                f"changing between runs. It ran {work_actions} state-changing action(s) this session."
+            )
+            done, _note = _run_completion_gate(
+                client, roles, completion_panel, task, messages, evidence, plan
+            )
+            if done:
+                display.print_info(f"{_TAG['verifier']} [bold #7fd88f]approved[/bold #7fd88f] — task complete.")
+                end_reason = "completed"
+            else:
+                display.print_error(
+                    "Stopping: the worker is stuck in a loop and the task is not complete. "
+                    "Send another message to continue from here."
+                )
+                _final_summary(client, active_worker, task, messages)
+                end_reason = "looping"
             display.print_done(iteration)
-            end_reason = "looping"
             break
+        # First: tell the CURRENT worker to stop repeating and re-strategize —
+        # give it a real chance to correct itself before changing anything else.
         if turn_repeat >= _REPEAT_LOOP_SOFT and not repeat_warned:
             repeat_warned = True
             display.print_info(
@@ -893,15 +986,60 @@ def _council_loop(
                 + (f". Planner's guidance: {note}" if note else "")
                 + ". If the task is already complete, stop and say so."
             )})
-            _escalate_worker("repeating the same action")
+        # Only if it IGNORED that nudge and kept repeating do we switch family —
+        # switching mid-thought loses the current model's context, so it's a last
+        # resort, not the first response to a repeat.
+        elif turn_repeat >= _REPEAT_LOOP_SWITCH and not repeat_switched:
+            repeat_switched = True
+            _escalate_worker("kept repeating after being asked to stop")
         elif turn_repeat <= 1:
-            repeat_warned = False  # streak broken by a real edit / new action — re-arm
+            repeat_warned = False     # streak broken by a real edit / new action — re-arm
+            repeat_switched = False
 
-        if redundant >= 5:
-            display.print_info("Stopping: repeated calls without new progress (task likely complete).")
-            display.print_done(iteration)
-            end_reason = "redundant_calls"
-            break
+        if redundant >= _REDUNDANT_LIMIT:
+            # Re-reading things it already has is NOT proof the task is done — this
+            # was the old false "task likely complete" stop. Verify first; only end
+            # if the verifier confirms completion. Otherwise reset the counter and
+            # push the worker to make real progress, so a long, legitimately busy
+            # session is never cut short. Bounded by _MAX_STUCK_RECOVERIES so a
+            # genuinely stuck run still terminates — honestly, with a wrap-up.
+            redundant = 0
+            seen_calls.clear()
+            evidence = (
+                f"This session the worker ran {inspect_actions} inspection action(s) and "
+                f"{work_actions} state-changing action(s), and keeps re-reading files it "
+                f"already has without making new changes."
+            )
+            done, note = _run_completion_gate(
+                client, roles, completion_panel, task, messages, evidence, plan
+            )
+            if done:
+                display.print_info(f"{_TAG['verifier']} [bold #7fd88f]approved[/bold #7fd88f] — task complete.")
+                display.print_done(iteration)
+                end_reason = "completed"
+                break
+            stuck_recoveries += 1
+            if stuck_recoveries > _MAX_STUCK_RECOVERIES:
+                display.print_error(
+                    "Stopping: the worker keeps repeating work without making new progress "
+                    "and the task is not verified complete. Send another message to continue."
+                )
+                _final_summary(client, active_worker, task, messages)
+                display.print_done(iteration)
+                end_reason = "no_progress"
+                break
+            display.print_info(f"{_TAG['verifier']} says work remains: [dim]{note[:160]}[/dim]")
+            # Nudge the current worker first; only switch family if a nudge already
+            # failed to break the spin (2nd recovery onward).
+            if stuck_recoveries >= 2:
+                _escalate_worker("still stuck re-reading after being redirected")
+            messages.append({"role": "user", "content": (
+                "You keep re-reading files you already have without changing anything — that will "
+                "not advance the task, and the verifier confirms it is NOT done: " + note + "\n"
+                "Stop re-reading. Make the next CONCRETE change now (write/edit a file, run the "
+                "code, produce or fix the deliverable). Do not inspect what you have already seen."
+            )})
+            continue
 
         display.print_separator()
     else:
@@ -960,13 +1098,16 @@ def run_council_agent(
 
     configure_execution(remote)
     init_mcp(working_dir=working_dir)
-    # Worker model drives tool knobs; council only runs on cloud backends so this
-    # is a no-op for context sizing but keeps _rt() consistent.
+    # Size the runtime context budget from the WORKER model's real window (it
+    # drives the accumulating tool-loop history). Thinker/Verifier/aggregator
+    # consults build their own bounded prompts, so they need no per-call sizing;
+    # worker escalation to a different-family model is handled inside
+    # _proactive_trim, which caps the budget at the active model's window.
     configure_runtime(client, roles["worker"], prompt_profile)
 
     system_prompt = load_system_prompt(prompt_profile, working_dir)
     if enable_memory:
-        mem = load_session_memory(working_dir, query=task)
+        mem = load_session_memory(working_dir, query=task, remote=remote)
         if mem:
             system_prompt = system_prompt + f"\n\n{mem}"
 

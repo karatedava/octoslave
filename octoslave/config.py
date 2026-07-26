@@ -15,9 +15,13 @@ OLLAMA_BASE_URL = "http://localhost:11434/v1"
 NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NIM_DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b"
 
-# Default proactive context-trim budget (tokens) for non-local backends.
-# Fits a 128K-window model safely. Raise via config.json `soft_context_tokens`
-# or the OCTOSLAVE_SOFT_CONTEXT_TOKENS env var (env wins).
+# Fallback proactive context-trim budget (tokens) for non-local backends, used
+# ONLY when the model's real window can't be resolved (no live catalog window and
+# an unknown family). Normally the budget is auto-sized to a fraction of the
+# model's actual window (see agent.configure_runtime / resolve_context_window) so
+# large-window models like GLM 5.x (~1M) are exploited instead of being capped.
+# The config.json `soft_context_tokens` key (or OCTOSLAVE_SOFT_CONTEXT_TOKENS) is
+# an optional manual CAP on the auto-sized budget — 0 means "auto".
 DEFAULT_SOFT_CONTEXT_TOKENS = 196000
 
 # Built-in backends are first-class — they have dedicated config keys and
@@ -45,6 +49,7 @@ KNOWN_MODELS = [
     "glm-4.7",
     "glm-5",
     "glm-5.1",
+    "glm-5.2",
     "thinker",
     "coder",
     "agentic",
@@ -158,7 +163,7 @@ COUNCIL_ROLE_PREFERENCES: dict[str, list[str]] = {
 # whose family differs from the resolved Worker wins; if none differ, escalation
 # is simply disabled (graceful).
 COUNCIL_WORKER_ESCALATION: list[str] = [
-    "kimi-k2.6","glm-5.2","deepseek-v3.2-thinking"
+    "kimi-k2.6","glm-5.2","kimi-k2.7"
 ]
 
 # ---------------------------------------------------------------------------
@@ -168,11 +173,13 @@ COUNCIL_WORKER_ESCALATION: list[str] = [
 # a critical solution), which an aggregator then synthesizes into one stronger
 # answer. Isolation between panelists preserves diversity (prevents "orchestration
 # collapse"); the synthesis harvests the union of their strengths — the mechanism
-# that lets a non-frontier pool exceed any single model. kimi/glm prioritized,
-# with one different-family reasoner for genuine diversity. Resolved against the
-# live catalog; deduped by family so the panel is actually diverse.
+# that lets a non-frontier pool exceed any single model. kimi/glm only — no
+# deepseek in the pool. Resolved against the live catalog; deduped by family, so
+# with only two distinct families configured the panel settles at kimi-k2.7 +
+# glm-5.2 (the trailing kimi-k2.7 entry is a same-family safety net, not a third
+# opinion — it never survives the dedup unless glm-5.2 is unavailable).
 COUNCIL_DEBATE_MODELS: list[str] = [
-    "kimi-k2.7", "glm-5.2", "deepseek-v3.2-thinking",
+    "kimi-k2.7", "glm-5.2", "kimi-k2.7",
 ]
 # How many panelists to actually use (kept small for latency/cost).
 COUNCIL_DEBATE_PANEL = 3
@@ -208,6 +215,75 @@ def _model_family(model: str) -> str:
         if fam in m:
             return fam
     return m.split("-")[0] if m else ""
+
+
+# ---------------------------------------------------------------------------
+# Per-model context windows (non-local backends)
+#
+# The proactive-trim budget is auto-sized to a fraction of the model's real
+# context window (see agent.configure_runtime). The live /v1/models catalog is
+# the source of truth when it advertises a window; these static maps are the
+# fallback for gateways that don't. Exact model id wins over family; family over
+# DEFAULT_CONTEXT_WINDOW. GLM 5.x ships a ~1M window; kimi-k2 ~256K; the older
+# glm-4.7 is only ~200K, so it needs an exact-id override below the glm family.
+# ---------------------------------------------------------------------------
+
+MODEL_CONTEXT_WINDOWS: dict[str, int] = {
+    "glm-4.7": 200_000,
+}
+
+FAMILY_CONTEXT_WINDOWS: dict[str, int] = {
+    "kimi":     256_000,
+    "glm":      1_000_000,
+    "deepseek": 128_000,
+    "qwen":     256_000,
+    "llama":    128_000,
+    "mistral":  128_000,
+    "gemma":    128_000,
+    "gpt":      128_000,
+}
+
+DEFAULT_CONTEXT_WINDOW = 128_000
+
+# Fields an OpenAI-compatible /v1/models entry may use to advertise its window.
+_WINDOW_FIELDS = (
+    "context_length", "max_model_len", "max_context_length",
+    "max_input_tokens", "context_window",
+)
+
+
+def parse_model_windows(models_payload: dict) -> dict[str, int]:
+    """Extract ``{model_id: context_window}`` from a /v1/models JSON payload.
+
+    Tolerant of gateways that omit the window (the entry is simply absent) and
+    of the several field names providers use for it (see _WINDOW_FIELDS)."""
+    out: dict[str, int] = {}
+    for m in (models_payload or {}).get("data", []):
+        mid = m.get("id")
+        if not mid:
+            continue
+        for f in _WINDOW_FIELDS:
+            v = m.get(f)
+            if isinstance(v, int) and v > 0:
+                out[mid] = v
+                break
+    return out
+
+
+def resolve_context_window(model: str, live: dict[str, int] | None = None) -> int:
+    """Best-known context window (tokens) for a non-local model.
+
+    Priority: the live catalog value (from parse_model_windows), then an exact
+    model-id override, then the family default, then DEFAULT_CONTEXT_WINDOW."""
+    if live and live.get(model):
+        return live[model]
+    m = (model or "").lower()
+    if m in MODEL_CONTEXT_WINDOWS:
+        return MODEL_CONTEXT_WINDOWS[m]
+    fam = _model_family(model)
+    if fam in FAMILY_CONTEXT_WINDOWS:
+        return FAMILY_CONTEXT_WINDOWS[fam]
+    return DEFAULT_CONTEXT_WINDOW
 
 
 def resolve_council_models(
@@ -577,10 +653,12 @@ def load_config() -> dict:
         "backend": "einfra",        # "einfra" | "ollama" | "nim" | <custom-id>
         "ollama_url": OLLAMA_BASE_URL,
         "permission_mode": "autonomous",  # "autonomous" | "controlled" | "supervised"
-        # Proactive context-trim budget (tokens) for NON-local backends. Set to
-        # ~75–80% of the model's real window (e.g. 192000 for a 256K Kimi). Local
-        # Ollama backends ignore this — they auto-size from the detected window.
-        "soft_context_tokens": DEFAULT_SOFT_CONTEXT_TOKENS,
+        # Optional manual CAP (tokens) on the proactive-trim budget for NON-local
+        # backends. 0 = auto: the budget auto-sizes to ~80% of the model's real
+        # window (so GLM 5.x's ~1M window is used, Kimi's ~256K, etc.). A positive
+        # value caps the auto-sized budget — handy to bound latency/cost on a huge
+        # window. Local Ollama backends ignore this (they auto-size natively).
+        "soft_context_tokens": 0,
         "nim_api_key": "",
         "nim_url": NIM_BASE_URL,
         "role_models_einfra": {},

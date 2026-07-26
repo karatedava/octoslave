@@ -70,7 +70,7 @@ class AgentSpec:
     expertise: str                  # what they're expert in (free text)
     goal: str                       # what they're here to accomplish
     tools: list[str] = field(default_factory=list)
-    model: str = ""                 # filled from config default (kimi-k2.6) if blank
+    model: str = ""                 # filled from config default (kimi-k2.7) if blank
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     status: str = AGENT_IDLE
     icon: str = "🧪"
@@ -92,7 +92,7 @@ class AgentSpec:
 class LabSession:
     task: str
     working_dir: str
-    model: str = ""                          # default model for all roles (kimi-k2.6)
+    model: str = ""                          # default model for all roles (kimi-k2.7)
     autonomous: bool = True                  # True = run without pausing at gates
     phase: str = LabPhase.INIT
     status: str = "idle"                     # idle | running | paused | complete | stopped

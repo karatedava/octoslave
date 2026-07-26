@@ -27,7 +27,10 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from .. import display
 from .. import interrupt
 from ..display import resolve_permission, resolve_user_response
-from ..agent import continue_agent, make_client, run_agent, list_prompt_profiles
+from ..agent import (
+    continue_agent, make_client, run_agent, list_prompt_profiles,
+    save_session_memory,
+)
 from ..council import (
     resolve_council_roles, run_council_agent, continue_council_agent, council_available,
 )
@@ -137,7 +140,8 @@ def _chat_title(messages: list) -> str:
             return m["content"][:80]
     return "Untitled"
 
-def _save_chat(messages: list, model: str = "", chat_id: str = "") -> str:
+def _save_chat(messages: list, model: str = "", chat_id: str = "",
+               working_dir: str = "", remote_id: str | None = None) -> str:
     CHATS_DIR.mkdir(parents=True, exist_ok=True)
     now = datetime.now().isoformat(timespec="seconds")
     if chat_id and _safe_chat_id(chat_id):
@@ -154,6 +158,11 @@ def _save_chat(messages: list, model: str = "", chat_id: str = "") -> str:
         "id": chat_id,
         "title": _chat_title(messages),
         "model": model,
+        # Persist the execution context so reopening the chat restores where it
+        # ran — the working directory and, for a remote (SSH) session, which host
+        # so it reconnects to the same directory instead of falling back to local.
+        "working_dir": working_dir or ".",
+        "remote_id": remote_id,
         "created_at": created_at,
         "updated_at": now,
         "messages": messages,
@@ -1134,6 +1143,22 @@ async def ws_endpoint(websocket: WebSocket):
                         else:
                             result = continue_agent(state["messages"], txt, mdl, wd, client, pm, remote=rmt)
                         state["messages"] = result
+                        # Persist a project-scoped task-outcome record so a later
+                        # chat in the same working directory recalls it (the TUI
+                        # does this after each turn; the web layer previously only
+                        # loaded memory, never saved it — so council mode, whose
+                        # worker rarely calls `remember`, left no memory file).
+                        # run_agent / run_council_agent both LOAD this on the next
+                        # new task. Best-effort; never fail the run over it.
+                        try:
+                            if load_config().get("enable_memory", True):
+                                # Pass the remote explicitly: run_agent/run_council
+                                # already reset this thread's execution target in
+                                # their finally, so memory must be told where the
+                                # work ran to land in the same working directory.
+                                save_session_memory(wd, txt, status="completed", remote=rmt)
+                        except Exception:
+                            pass
                     except interrupt.StopRequested:
                         # Stop requested during a phase that calls the model
                         # directly (orientation / planning). The main loop handles
@@ -1254,7 +1279,11 @@ async def ws_endpoint(websocket: WebSocket):
             elif mtype == "save_chat":
                 if state["messages"]:
                     existing_id = msg.get("chat_id", "")
-                    chat_id = _save_chat(state["messages"], state.get("model", ""), existing_id)
+                    chat_id = _save_chat(
+                        state["messages"], state.get("model", ""), existing_id,
+                        working_dir=state.get("working_dir", "."),
+                        remote_id=state.get("remote_id"),
+                    )
                     await send({"type": "chat_saved", "id": chat_id})
                 else:
                     await send({"type": "chat_saved", "id": None})
@@ -1272,10 +1301,43 @@ async def ws_endpoint(websocket: WebSocket):
                     data = json.loads(f.read_text())
                     state["messages"] = data["messages"]
                     state["model"]    = data.get("model", state.get("model", ""))
+
+                    # Restore the execution context this chat ran in: working
+                    # directory and, if it was a remote (SSH) session, the same
+                    # host — so a follow-up continues where it left off instead of
+                    # silently running local in the wrong directory.
+                    saved_wd = data.get("working_dir") or "."
+                    saved_remote = data.get("remote_id")
+                    effective_remote = saved_remote
+                    if saved_remote and get_remote(None, saved_remote) is None:
+                        # The remote was removed since this chat was saved.
+                        effective_remote = None
+                        await send({
+                            "type": "info",
+                            "text": (
+                                f"⚠ This chat ran on remote '{saved_remote}', which is no "
+                                "longer configured — reopened in local mode. Re-add the "
+                                "remote to continue on the same host."
+                            ),
+                        })
+                    state["working_dir"] = saved_wd
+                    state["remote_id"] = effective_remote
+                    if effective_remote:
+                        remote = get_remote(None, effective_remote)
+                        await send({
+                            "type": "info",
+                            "text": (
+                                f"⇅ reconnected to remote {remote.get('name')} "
+                                f"({remote.get('host')}:{saved_wd})"
+                            ),
+                        })
+
                     await send({"type": "chat_loaded",
                                 "id": chat_id,
                                 "messages": data["messages"],
-                                "model": data.get("model", "")})
+                                "model": data.get("model", ""),
+                                "working_dir": saved_wd,
+                                "remote_id": effective_remote})
                 except Exception as exc:
                     await send({"type": "error", "text": f"Failed to load chat: {exc}"})
 

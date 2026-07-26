@@ -1261,6 +1261,11 @@ details.tool-block.tool-block-fail {
   content: 'thinking\2026';
   letter-spacing: 0.02em;
 }
+/* When a thinking model is actively streaming its reasoning trace, replace the
+   static "thinking…" with a live character count so the wait shows progress. */
+.waiting-for-response[data-reasoning-label]::after {
+  content: attr(data-reasoning-label);
+}
 @keyframes think-pulse {
   0%, 100% { box-shadow: 0 0 0 0   rgba(250, 178, 131, 0.5); transform: scale(1); }
   50%      { box-shadow: 0 0 0 6px rgba(250, 178, 131, 0);   transform: scale(1.18); }

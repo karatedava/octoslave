@@ -454,6 +454,83 @@ def print_tool_call(name: str, args: dict):
         console.print(f"    [dim]↳ \"{_escape(args.get('query', ''))}\"[/dim]")
 
 
+# ---------------------------------------------------------------------------
+# Tool-execution activity indicator
+#
+# Between `print_tool_call` and `print_tool_result` the tool actually runs —
+# and that can take a long time (a `bash` command may block up to an hour, a
+# `web_fetch` several seconds, an MCP call indefinitely). The streaming spinner
+# only covers the model's thinking, so without this the user stares at a printed
+# tool call with no sign of life. This starts a lightweight elapsed-time spinner
+# that only appears after a short delay, so instant tools (read_file, list_dir,
+# glob) finish before it ever draws and produce no visual noise.
+# ---------------------------------------------------------------------------
+
+_tool_activity = _threading.local()
+
+# Don't draw the spinner until the tool has been running this long — keeps fast
+# tool calls silent while still surfacing anything that actually stalls.
+_TOOL_SPIN_DELAY = 1.2
+
+# Tools that block on user interaction — a spinner would clobber their prompt.
+_NO_SPIN_TOOLS = frozenset({"ask_user"})
+
+
+def _tool_spinning(stop_event: _threading.Event, icon: str, label: str) -> None:
+    # If the tool finishes within the grace period, never draw anything.
+    if stop_event.wait(timeout=_TOOL_SPIN_DELAY):
+        return
+    start = _time.monotonic() - _TOOL_SPIN_DELAY
+    i = 0
+    while not stop_event.wait(timeout=0.1):
+        frame = _SPINNER_FRAMES[i % len(_SPINNER_FRAMES)]
+        elapsed = int(_time.monotonic() - start)
+        tail = f"  {label}" if label else ""
+        sys.stdout.write(f"{_SPINNER_CLEAR}    {frame} {icon} running… {elapsed}s{tail}")
+        sys.stdout.flush()
+        i += 1
+    sys.stdout.write(_SPINNER_CLEAR)
+    sys.stdout.flush()
+
+
+def tool_activity_start(name: str, args: dict | None = None,
+                        permission_mode: str = "autonomous") -> None:
+    """Signal that a tool call has begun executing.
+
+    CLI: start a delayed elapsed-time spinner so long-running tools show life.
+    Web / silent (parallel-worker) mode: no-op — the web client animates the
+    pending tool block itself, and silenced threads emit nothing.
+
+    Only spins in autonomous mode: controlled/supervised modes prompt the user
+    for permission on the console, and a spinner would clobber that prompt (and
+    silence isn't a concern when the user is being actively asked).
+    """
+    _tool_activity.stop = None
+    _tool_activity.thread = None
+    if (_silent() or getattr(_tl, "emit", None) is not None
+            or name in _NO_SPIN_TOOLS or permission_mode != "autonomous"):
+        return
+    stop = _threading.Event()
+    icon = _TOOL_ICONS.get(name, "⚙")
+    label = _tool_summary(name, args or {})[:60] if args else ""
+    t = _threading.Thread(target=_tool_spinning, args=(stop, icon, label), daemon=True)
+    _tool_activity.stop = stop
+    _tool_activity.thread = t
+    t.start()
+
+
+def tool_activity_end() -> None:
+    """Stop the tool-execution spinner started by ``tool_activity_start``."""
+    stop = getattr(_tool_activity, "stop", None)
+    if stop is not None:
+        stop.set()
+        t = getattr(_tool_activity, "thread", None)
+        if t is not None:
+            t.join(timeout=0.3)
+    _tool_activity.stop = None
+    _tool_activity.thread = None
+
+
 def print_tool_result(name: str, result: str, success: bool):
     from rich.markup import escape as _escape
     _emit({"type": "tool_result", "name": name, "ok": success,
@@ -539,6 +616,19 @@ def print_error(msg: str):
     if _silent():
         return
     err_console.print(f"[tool.err]Error:[/tool.err] {msg}")
+
+
+def print_summary(text: str):
+    """Render a final wrap-up of what was accomplished — used when a run is forced
+    to stop without a clean completion (stuck loop / exhausted retries) so the user
+    still gets an honest overview instead of a bare 'Done'."""
+    _emit({"type": "info", "text": "📋 Session summary:\n" + text})
+    if _silent():
+        return
+    console.print()
+    console.print("  [bold #9d7cd8]📋 Session summary[/bold #9d7cd8]")
+    console.print(Markdown(text))
+    console.print()
 
 
 def print_done(iterations: int):

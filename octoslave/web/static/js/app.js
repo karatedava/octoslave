@@ -55,6 +55,7 @@ function handleServerMessage(msg) {
     case 'models':        populateModelSelects(msg.list || []); break;
     case 'stream_start':  onStreamStart(); break;
     case 'token':         onToken(msg.text); break;
+    case 'reasoning':     onReasoning(msg.text); break;
     case 'stream_end':    onStreamEnd(); break;
     case 'tool_call':     onToolCall(msg); break;
     case 'tool_result':   onToolResult(msg.name, msg.ok, msg.preview); break;
@@ -418,6 +419,7 @@ function ensureAssistantBubble() {
 }
 
 function onStreamStart() {
+  window._reasoningChars = 0;
   ensureAssistantBubble();
   if (currentAssistantBubble) {
     currentAssistantBubble.classList.remove('streaming-cursor');
@@ -425,10 +427,29 @@ function onStreamStart() {
   }
 }
 
+// Thinking models (kimi / deepseek-thinking on e-INFRA, thinking Ollama models)
+// stream their reasoning trace before any visible content or tool call. Surface
+// it as a live "thinking… (N chars)" label on the waiting bubble so a long
+// reasoning turn shows progress instead of a frozen "thinking…" dot. The trace
+// text itself is not shown — only that the model is actively reasoning.
+function onReasoning(text) {
+  ensureAssistantBubble();
+  const b = currentAssistantBubble;
+  if (!b) return;
+  window._reasoningChars = (window._reasoningChars || 0) + (text ? text.length : 0);
+  if (!streamBuffer) {
+    b.classList.remove('streaming-cursor');
+    b.classList.add('waiting-for-response');
+    b.setAttribute('data-reasoning-label',
+      `thinking… (${window._reasoningChars.toLocaleString()} chars)`);
+  }
+}
+
 function onToken(text) {
   // Transition from waiting indicator to live streaming on first token
   if (currentAssistantBubble && currentAssistantBubble.classList.contains('waiting-for-response')) {
     currentAssistantBubble.classList.remove('waiting-for-response');
+    currentAssistantBubble.removeAttribute('data-reasoning-label');
     currentAssistantBubble.classList.add('streaming-cursor');
   }
   ensureAssistantBubble();
@@ -438,9 +459,11 @@ function onToken(text) {
 }
 
 function onStreamEnd() {
+  window._reasoningChars = 0;
   if (currentAssistantBubble) {
     currentAssistantBubble.classList.remove('streaming-cursor');
     currentAssistantBubble.classList.remove('waiting-for-response');
+    currentAssistantBubble.removeAttribute('data-reasoning-label');
     currentAssistantBubble.innerHTML = renderMarkdown(streamBuffer);
   }
   currentAssistantBubble = null;
@@ -480,7 +503,19 @@ function onToolCall(msg) {
   currentToolCallsDiv.appendChild(toolBlock);
   scrollToBottom(document.getElementById('chat-messages'));
 
-  window.appState.pendingToolCall = { element: toolBlock, name };
+  // Live elapsed-time counter on the pending block so a long-running tool
+  // (bash, web_fetch, an MCP call) shows it's still working instead of a
+  // static "running…". Only starts labelling after ~2s so fast tools stay
+  // quiet; cleared in onToolResult / onDone.
+  const detailEl = toolBlock.querySelector('.tool-detail');
+  const startedAt = performance.now();
+  const timer = setInterval(() => {
+    if (!detailEl || !detailEl.classList.contains('pending')) return;
+    const s = Math.floor((performance.now() - startedAt) / 1000);
+    if (s >= 2) detailEl.textContent = `running… ${s}s`;
+  }, 500);
+
+  window.appState.pendingToolCall = { element: toolBlock, name, timer };
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -603,7 +638,8 @@ function renderWebFetchPreview(p) {
 
 function onToolResult(name, ok, preview) {
   if (!window.appState.pendingToolCall) return;
-  const { element } = window.appState.pendingToolCall;
+  const { element, timer } = window.appState.pendingToolCall;
+  if (timer) clearInterval(timer);
   const detail = element.querySelector('.tool-detail');
   if (detail) {
     detail.className = `tool-detail ${ok ? 'ok' : 'fail'}`;
@@ -633,6 +669,12 @@ function onPlan(text) {
 
 function onDone(iterations, stopped) {
   setChatRunning(false);
+  // Clear any still-running tool timer (e.g. stopped mid-execution).
+  if (window.appState.pendingToolCall && window.appState.pendingToolCall.timer) {
+    clearInterval(window.appState.pendingToolCall.timer);
+    window.appState.pendingToolCall = null;
+  }
+  window._reasoningChars = 0;
   appendChatInfo(stopped
     ? `⏹ Stopped (${iterations} iteration${iterations !== 1 ? 's' : ''}) — refine and send to continue.`
     : `✓ Done (${iterations} iteration${iterations !== 1 ? 's' : ''})`);
@@ -679,10 +721,20 @@ function onChatLoaded(msg) {
   window.appState.currentChatId = msg.id || null;
   window.appState.chatIsFirst = false;
 
+  // Restore the execution context this chat ran in: working directory and,
+  // for a remote session, the same SSH host — so a follow-up continues in the
+  // right place. The server already restored its own state on load_chat; here
+  // we set the UI directly (NOT via setRemoteMode, which would re-resolve the
+  // remote's home dir and overwrite the saved working directory).
+  if (typeof msg.working_dir === 'string') window.setWorkingDir(msg.working_dir);
+  window.appState.remoteId = msg.remote_id || null;
+  window.renderExecToggle?.();
+
   // Clear and rebuild chat UI
   const container = document.getElementById('chat-messages');
   container.innerHTML = '';
-  
+  window._lastTodoCard = null;  // the old card node was just detached
+
   msg.messages.forEach(m => {
     if (m.role === 'user') {
       const div = document.createElement('div');
@@ -761,16 +813,19 @@ function onTodos(msg) {
     </div>
     <ul class="todo-list">${rows}</ul>`;
 
-  // Reuse the most recent todo card if it's still the last meaningful block,
-  // otherwise append a fresh one so progress reads top-to-bottom.
+  // Keep a single todo card and move it to the bottom on every update, so the
+  // full, current checklist is always visible at the live edge of the chat.
+  // (Previously it was updated in place — after tool calls scrolled it off the
+  // top, later updates re-rendered the list off-screen and the user only saw
+  // the bare "todo_write" tool call at the bottom, never the updated list.)
   let card = window._lastTodoCard;
-  if (!card || !card.parentElement) {
+  if (!card) {
     card = document.createElement('div');
     card.className = 'msg msg-todos';
-    container.appendChild(card);
     window._lastTodoCard = card;
   }
   card.innerHTML = `<div class="todo-card">${inner}</div>`;
+  container.appendChild(card);  // relocates the existing node to the end
   scrollToBottom(container);
 }
 

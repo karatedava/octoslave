@@ -20,12 +20,15 @@ from openai import OpenAI, BadRequestError
 
 from .. import display
 from ..agent import (
+    _RT,
     _cap_result,
     _compact_and_trim,
+    _handle_context_overflow,
     _is_context_window_error,
     _is_retryable_error,
     _proactive_trim,
     _stream_completion,
+    independent_soft_budget,
 )
 from ..tools import all_tool_definitions, execute_tool
 from .llm import strip_tool_markup
@@ -126,6 +129,28 @@ def run_agent_task(
     display.print_agent_banner(spec.name, model, 0, 0)
     _ev("start", role=spec.role, tools=spec.tools)
 
+    # Size the context-trim budget to THIS specialist's own model window. Lab and
+    # Science never call configure_runtime, so without this the thread-local budget
+    # is the module default (~96K) — throttling a large-window specialist (e.g. GLM
+    # ~1M) to a fraction of its capacity. A specialist owns its message history, so
+    # save/restore the ambient thread-local: in Science the orchestrator's own
+    # run_agent loop calls this NESTED on the same thread, and must get its budget
+    # back when the specialist returns.
+    _had_budget = hasattr(_RT, "soft_budget")
+    _prev_budget = getattr(_RT, "soft_budget", None)
+    _sb = independent_soft_budget(client, model)
+    if _sb:
+        _RT.soft_budget = _sb
+
+    def _restore_budget():
+        if _had_budget:
+            _RT.soft_budget = _prev_budget
+        elif hasattr(_RT, "soft_budget"):
+            try:
+                delattr(_RT, "soft_budget")
+            except Exception:
+                pass
+
     t0 = time.time()
     iteration = 0
     final_text = ""
@@ -154,8 +179,8 @@ def run_agent_task(
         except BadRequestError as e:
             err = str(e)
             if _is_context_window_error(err):
-                trimmed = _compact_and_trim(messages, groups=10, client=client, model=model)
-                if len(trimmed) < len(messages):
+                trimmed, progressed = _handle_context_overflow(messages, client, model)
+                if progressed:
                     messages = trimmed
                     iteration -= 1
                     continue
@@ -178,6 +203,7 @@ def run_agent_task(
             break
         except KeyboardInterrupt:
             display.stream_end(False)
+            _restore_budget()
             raise
 
         content = response["content"]
@@ -262,6 +288,7 @@ def run_agent_task(
             pass
     display.print_agent_done(spec.name, time.time() - t0, iteration)
     _ev("done", iterations=iteration)
+    _restore_budget()
     return messages, final_text
 
 

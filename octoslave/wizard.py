@@ -44,18 +44,19 @@ _NIM_URL    = "https://integrate.api.nvidia.com/v1"
 _OLLAMA_URL = "http://localhost:11434/v1"
 
 _EINFRA_MODELS = [
+    "kimi-k2.7",
     "kimi-k2.6",
+    "glm-5.2",
+    "glm-5.1",
     "deepseek-v3.2",
     "deepseek-v3.2-thinking",
     "qwen3.5",
     "qwen3.5-122b",
     "qwen3-coder",
     "qwen3-coder-30b",
-    "kimi-k2.5",
     "mistral-medium-3.5",
     "llama-4-scout-17b-16e-instruct",
     "gemma4",
-    "glm-5",
 ]
 
 _NIM_MODELS = [

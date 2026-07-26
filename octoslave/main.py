@@ -80,7 +80,8 @@ _HISTORY_FILE = Path.home() / ".octoslave" / "history"
               help="Permission mode: autonomous (default), controlled (ask before all edits), or supervised (ask before file edits only)")
 @click.option("-v", "--verbose", is_flag=True, default=False, help="Verbose mode: show full diffs, complete tool output, and bash commands live")
 @click.option("--no-plan", "disable_plan", is_flag=True, default=False, help="Skip the upfront planning step")
-@click.option("--verify", is_flag=True, default=False, help="Run a verification pass after each task to grade completion")
+@click.option("--verify/--no-verify", default=True,
+              help="Self-check completion after each task and automatically fix anything found incomplete (on by default)")
 @click.option("--no-memory", "disable_memory", is_flag=True, default=False, help="Do not load or save project memory")
 @click.option("--remote", "remote_id", default=None, help="Run tools on a configured remote host over SSH (see `/remote`)")
 @click.pass_context
@@ -132,7 +133,8 @@ def cli(ctx, model, working_dir, api_key, base_url, local, prompt_profile, permi
 @click.option("-v", "--verbose", is_flag=True, default=False, help="Verbose mode: show full diffs, complete tool output, and bash commands live")
 @click.option("-n", "--new-project", is_flag=True, default=False, help="Create a new project dir in ~/octoslave/projects/ for output")
 @click.option("--no-plan", "disable_plan", is_flag=True, default=False, help="Skip the upfront planning step")
-@click.option("--verify", is_flag=True, default=False, help="Run a verification pass after the task to grade completion")
+@click.option("--verify/--no-verify", default=True,
+              help="Self-check completion after the task and automatically fix anything found incomplete (on by default)")
 @click.option("--no-memory", "disable_memory", is_flag=True, default=False, help="Do not load or save project memory")
 @click.option("--parallel", "parallel_n", type=int, default=1,
               help="Run N agents on the same task in parallel and pick/merge a winner (default: 1)")
@@ -167,7 +169,7 @@ def run(task, model, working_dir, api_key, base_url, local, prompt_profile, inte
       ots run "write a report" -n                # auto-create project dir
       ots run "reorganize notes" -v
       ots run "refactor auth module" --no-plan   # skip planning step
-      ots run "fix the bug" --verify             # grade completion after
+      ots run "fix the bug" --no-verify          # skip the self-check/fix pass after
       ots run "quick task" --no-memory           # don't load/save project memory
     """
     if verbose:
@@ -283,7 +285,7 @@ def run(task, model, working_dir, api_key, base_url, local, prompt_profile, inte
         # Memory: persist as one outcome rather than one per candidate.
         if enable_memory:
             note = f"parallel({parallel_n}, {strategy}) — {result.get('reason', '')[:160]}"
-            save_session_memory(cfg["working_dir"], task, status="completed", note=note)
+            save_session_memory(cfg["working_dir"], task, status="completed", note=note, remote=remote)
         if interactive:
             _repl_loop(client, cfg, messages)
         return
@@ -302,15 +304,17 @@ def run(task, model, working_dir, api_key, base_url, local, prompt_profile, inte
         status = "completed"
         note = ""
         if verify_out:
-            v = verify_out[0].upper()
+            # verify_out may hold several grades if self-correction ran (e.g.
+            # PARTIAL then DONE after a fix pass) — the LAST one is the final word.
+            v = verify_out[-1].upper()
             if v.startswith("DONE"):
                 status = "done"
             elif v.startswith("PARTIAL"):
                 status = "partial"
             elif v.startswith("FAILED"):
                 status = "failed"
-            note = verify_out[0][:200]
-        save_session_memory(cfg["working_dir"], task, status=status, note=note)
+            note = verify_out[-1][:200]
+        save_session_memory(cfg["working_dir"], task, status=status, note=note, remote=remote)
 
     if interactive:
         _repl_loop(client, cfg, messages)
@@ -569,7 +573,7 @@ def improved_run(ctx, task, working_dir, prompt_profile, interactive, permission
         )
 
     if enable_memory:
-        save_session_memory(cfg["working_dir"], task, status="completed", note="")
+        save_session_memory(cfg["working_dir"], task, status="completed", note="", remote=cfg.get("remote"))
 
     if interactive:
         _repl_loop(client, cfg, messages)
@@ -1005,7 +1009,7 @@ def _interactive(ctx_obj: dict):
     cfg["verbose"] = ctx_obj.get("verbose", False)
     cfg["explicit_dir"] = bool(ctx_obj.get("working_dir"))
     cfg["enable_plan"] = ctx_obj.get("enable_plan", True)
-    cfg["enable_verify"] = ctx_obj.get("enable_verify", False)
+    cfg["enable_verify"] = ctx_obj.get("enable_verify", True)
     cfg["enable_memory"] = ctx_obj.get("enable_memory", True)
 
     # Resolve a --remote target: execute tools on the remote host and start in
@@ -1080,7 +1084,7 @@ def _repl_loop(client, cfg: dict, messages: list[dict]):
         "permission_mode": cfg.get("permission_mode", "autonomous"),
         "verbose": cfg.get("verbose", False),
         "enable_plan":   cfg.get("enable_plan", True),
-        "enable_verify": cfg.get("enable_verify", False),
+        "enable_verify": cfg.get("enable_verify", True),
         "enable_memory": cfg.get("enable_memory", True),
         "current_plan":  "",   # last generated plan (shown by /show-plan)
         "council":       cfg.get("council", False),         # improved (council) mode on?
@@ -1187,15 +1191,17 @@ def _repl_loop(client, cfg: dict, messages: list[dict]):
                     _status = "completed"
                     _note = ""
                     if verify_out:
-                        v = verify_out[0].upper()
+                        # Last grade wins — self-correction may have run several
+                        # (e.g. PARTIAL then DONE after a fix pass).
+                        v = verify_out[-1].upper()
                         if v.startswith("DONE"):
                             _status = "done"
                         elif v.startswith("PARTIAL"):
                             _status = "partial"
                         elif v.startswith("FAILED"):
                             _status = "failed"
-                        _note = verify_out[0][:200]
-                    save_session_memory(state["working_dir"], user_input, status=_status, note=_note)
+                        _note = verify_out[-1][:200]
+                    save_session_memory(state["working_dir"], user_input, status=_status, note=_note, remote=state.get("remote"))
         except KeyboardInterrupt:
             display.console.print("\n[dim]Interrupted.[/dim]")
             messages = []
@@ -1380,20 +1386,33 @@ def _handle_slash(cmd: str, state: dict, cfg: dict, messages: list, client) -> s
     if name == "/memory":
         raw = arg.strip()
         sub = raw.lower()
-        mf = memory_file(state["working_dir"])
+        _rmt = state.get("remote")
         if sub == "clear":
-            if mf.exists():
-                mf.unlink()
-                display.print_info(f"Project memory cleared ({mf}).")
+            # Delete the memory file where the work runs (remote host or local).
+            if _rmt:
+                from .agent import _remote_memory_path
+                from .remote import RemoteSession
+                rp = _remote_memory_path(state["working_dir"])
+                sess = RemoteSession.get(_rmt)
+                if sess.exists(rp):
+                    sess.run(f"rm -f {__import__('shlex').quote(rp)}", None, timeout=30)
+                    display.print_info(f"Project memory cleared ({rp} on {_rmt.get('name')}).")
+                else:
+                    display.print_info("No project memory file to clear.")
             else:
-                display.print_info("No project memory file to clear.")
+                mf = memory_file(state["working_dir"])
+                if mf.exists():
+                    mf.unlink()
+                    display.print_info(f"Project memory cleared ({mf}).")
+                else:
+                    display.print_info("No project memory file to clear.")
         elif sub.startswith("forget"):
             query = raw[len("forget"):].strip()
             if not query:
                 display.print_info("Usage: /memory forget <description of the insight to remove>")
             else:
                 from .agent import delete_memory_insight
-                removed = delete_memory_insight(state["working_dir"], query)
+                removed = delete_memory_insight(state["working_dir"], query, remote=_rmt)
                 if removed:
                     display.print_info("Removed from memory:")
                     for r in removed:
@@ -1408,7 +1427,7 @@ def _handle_slash(cmd: str, state: dict, cfg: dict, messages: list, client) -> s
             display.print_info("Project memory enabled.")
         else:
             # Show current memory
-            mem = load_session_memory(state["working_dir"])
+            mem = load_session_memory(state["working_dir"], remote=_rmt)
             if mem:
                 display.console.print()
                 display.console.print(mem)
@@ -1434,12 +1453,12 @@ def _handle_slash(cmd: str, state: dict, cfg: dict, messages: list, client) -> s
         sub = arg.strip().lower()
         if sub == "off":
             state["enable_verify"] = False
-            display.print_info("Verification step disabled.")
+            display.print_info("Self-check/fix step disabled.")
         elif sub == "on":
             state["enable_verify"] = True
-            display.print_info("Verification step enabled.")
+            display.print_info("Self-check/fix step enabled.")
         else:
-            status = "[bold green]ON[/bold green]" if state.get("enable_verify", False) else "[bold red]OFF[/bold red]"
+            status = "[bold green]ON[/bold green]" if state.get("enable_verify", True) else "[bold red]OFF[/bold red]"
             display.console.print(f"[dim]Verify:[/dim] {status}  [dim]Use /verify on|off to toggle[/dim]")
         return "ok"
 
@@ -2617,7 +2636,7 @@ def _make_toolbar(state: dict):
     else:
         perm_short = "supv"
     plan_short = "plan:on" if state.get("enable_plan", True) else "plan:off"
-    verify_short = "verify:on" if state.get("enable_verify", False) else "verify:off"
+    verify_short = "verify:on" if state.get("enable_verify", True) else "verify:off"
     mem_short = "mem:on" if state.get("enable_memory", True) else "mem:off"
     if state.get("council"):
         roles = state.get("council_roles") or {}

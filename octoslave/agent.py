@@ -26,7 +26,13 @@ from . import display
 from . import logger
 from . import interrupt
 from .tools import TOOL_DEFINITIONS, execute_tool, all_tool_definitions, valid_tool_names, set_tool_profile
-from .config import load_config, OLLAMA_BASE_URL
+from .config import (
+    load_config,
+    OLLAMA_BASE_URL,
+    DEFAULT_SOFT_CONTEXT_TOKENS,
+    parse_model_windows,
+    resolve_context_window,
+)
 
 
 def _extract_text_tool_calls(content: str) -> tuple[list[dict], str]:
@@ -180,7 +186,32 @@ def _looks_like_tool_attempt(content: str, valid_names) -> bool:
     return False
 
 
-MAX_ITERATIONS = 400
+# Sentinel returned by _resolve_max_iterations() when no cap is configured —
+# the loop's `while iteration < MAX_ITERATIONS` simply never trips.
+_NO_ITERATION_LIMIT = float("inf")
+
+
+def _resolve_max_iterations() -> int | float:
+    """Safety cap on loop iterations (single + council). Configurable: env
+    OCTOSLAVE_MAX_ITERATIONS overrides config.json 'max_iterations'. There is no
+    default cap — an autonomous run (e.g. overnight, or a long research task) is
+    allowed to keep going for as long as the model keeps making progress; the
+    real backstops are the context-window budget, the redundant-call/stuck
+    detector, and wall-clock/cost, not an arbitrary turn count. Set either
+    override to opt back into a hard ceiling (clamped to a sane floor so a
+    small value can't stall the loop after only a couple of turns)."""
+    for src in (os.environ.get("OCTOSLAVE_MAX_ITERATIONS"),
+                load_config().get("max_iterations")):
+        if src is None or src == "":
+            continue
+        try:
+            return max(20, int(src))
+        except (ValueError, TypeError):
+            continue
+    return _NO_ITERATION_LIMIT
+
+
+MAX_ITERATIONS = _resolve_max_iterations()
 
 
 def _is_retryable_error(exc: Exception) -> bool:
@@ -231,6 +262,16 @@ _OLLAMA_NUM_CTX_MAX = int(os.environ.get("OCTOSLAVE_OLLAMA_NUM_CTX_MAX", "32768"
 # the budget is instead auto-sized to the real window (configure_runtime / _RT).
 _SOFT_CONTEXT_BUDGET = int(os.environ.get("OCTOSLAVE_SOFT_CONTEXT_TOKENS", "96000"))
 
+# Fraction of a non-local model's REAL context window used as the proactive-trim
+# budget. The window is resolved per-model (live /v1/models catalog, else the
+# static family map in config) and the budget auto-sizes to this fraction of it,
+# so large-window models (GLM 5.x ~1M) actually use their capacity instead of a
+# flat cap, while headroom is left for the response + token-estimate drift.
+# Override with OCTOSLAVE_CONTEXT_WINDOW_RATIO (clamped 0.3–0.95).
+_CONTEXT_WINDOW_RATIO = min(
+    0.95, max(0.3, float(os.environ.get("OCTOSLAVE_CONTEXT_WINDOW_RATIO", "0.8")))
+)
+
 # Hysteresis for the proactive trimmer. Trimming is *triggered* when the
 # estimate crosses the soft budget, but once triggered it compacts down to
 # this fraction of the budget — leaving headroom so the next few turns don't
@@ -241,6 +282,28 @@ _SOFT_CONTEXT_BUDGET = int(os.environ.get("OCTOSLAVE_SOFT_CONTEXT_TOKENS", "9600
 # OCTOSLAVE_TRIM_TARGET_RATIO (clamped to a sane 0.3–0.99 range).
 _TRIM_TARGET_RATIO = min(
     0.99, max(0.3, float(os.environ.get("OCTOSLAVE_TRIM_TARGET_RATIO", "0.8")))
+)
+
+# Adaptive budget backoff. A real API context-window error is ground truth that
+# our soft budget over-estimated the usable window — usually because the chars/4
+# estimate UNDER-counts dense content (code, GROMACS/numeric dumps, .gro/.ndx
+# files tokenize far denser than 4 chars/token), sometimes because the configured
+# window was optimistic. On each such error we ratchet the per-thread soft budget
+# down to this fraction of the CURRENT estimate, so subsequent proactive trims
+# keep the history clear and the reactive path stops firing every turn. It's
+# monotonic and iterative: repeated errors converge on a safe budget within a
+# turn or two, then stop. Env override OCTOSLAVE_REACTIVE_BUDGET_BACKOFF.
+_REACTIVE_BUDGET_BACKOFF = min(
+    0.95, max(0.4, float(os.environ.get("OCTOSLAVE_REACTIVE_BUDGET_BACKOFF", "0.8")))
+)
+# Never ratchet the adaptive budget below this absolute floor (fits a system
+# prompt + first user message + a little working room). The EFFECTIVE floor is
+# tied to the configured budget (see _adaptive_budget_floor) so a large-window
+# model can't be collapsed to a tiny one; this constant only backstops tiny
+# local budgets. Fraction of the configured budget the backoff may not go under.
+_MIN_ADAPTIVE_BUDGET = 8192
+_ADAPTIVE_FLOOR_FRACTION = min(
+    0.9, max(0.1, float(os.environ.get("OCTOSLAVE_ADAPTIVE_FLOOR_FRACTION", "0.5")))
 )
 
 # Observation pruning. Tool outputs (file reads, bash dumps, search hits)
@@ -352,20 +415,66 @@ def _ollama_extra_body() -> dict:
     return body
 
 
-def _resolve_soft_budget() -> int:
-    """Non-local proactive-trim budget, in priority order: the
-    OCTOSLAVE_SOFT_CONTEXT_TOKENS env var, then config.json's
-    ``soft_context_tokens``, then the built-in default. Resolved per run (inside
-    configure_runtime) so a config edit — or a long-lived web process — picks up
-    a new value without a restart. load_config already applies env-over-file
-    precedence; falls back to the import-time constant on any error."""
+# Live context-window catalog for non-local backends, keyed by endpoint
+# base_url. Probed once per endpoint from /v1/models (the same catalog the model
+# list comes from), so switching between kimi and glm in one process costs a
+# single fetch. Empty dict cached on failure — resolve_context_window then falls
+# back to the static family map.
+_REMOTE_WINDOW_CACHE: dict[str, dict[str, int]] = {}
+
+
+def _remote_window_catalog(client) -> dict[str, int]:
+    """{model_id: context_window} advertised by the endpoint's /v1/models,
+    cached per base_url. Best-effort — returns {} on any error."""
+    base = str(getattr(client, "base_url", "")).rstrip("/")
+    if base in _REMOTE_WINDOW_CACHE:
+        return _REMOTE_WINDOW_CACHE[base]
+    windows: dict[str, int] = {}
+    try:
+        import urllib.request
+        api_key = getattr(client, "api_key", "") or ""
+        req = urllib.request.Request(
+            f"{base}/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            windows = parse_model_windows(json.load(resp))
+    except Exception:
+        windows = {}
+    _REMOTE_WINDOW_CACHE[base] = windows
+    return windows
+
+
+def _remote_model_window(client, model: str) -> int:
+    """Resolved context window (tokens) for a non-local model: the live
+    /v1/models value if the catalog advertises one, else the static family map
+    (config.resolve_context_window)."""
+    return resolve_context_window(model, _remote_window_catalog(client))
+
+
+def _resolve_soft_budget(window: int | None = None) -> int:
+    """Non-local proactive-trim budget.
+
+    By default the budget auto-sizes to _CONTEXT_WINDOW_RATIO of the model's real
+    ``window`` so large-window models (GLM 5.x ~1M) are actually used instead of a
+    flat cap. ``soft_context_tokens`` (env var or config.json) is an OPTIONAL
+    MANUAL CAP: 0/absent means "auto", any positive value caps the auto-sized
+    budget at that many tokens (useful to bound latency/cost on a huge window).
+    When the window is unknown, an explicit cap wins, else the fallback default.
+    Resolved per run (inside configure_runtime) so a config edit — or a long-lived
+    web process — picks up a new value without a restart; load_config applies
+    env-over-file precedence."""
+    cap: int | None = None
     try:
         val = load_config().get("soft_context_tokens")
-        if val:
-            return max(2048, int(val))
+        if val and int(val) > 0:
+            cap = max(2048, int(val))
     except Exception:
         pass
-    return _SOFT_CONTEXT_BUDGET
+    if window:
+        auto = max(2048, int(window * _CONTEXT_WINDOW_RATIO))
+        return min(auto, cap) if cap else auto
+    return cap or DEFAULT_SOFT_CONTEXT_TOKENS
 
 
 def configure_runtime(client, model: str, prompt_profile: str) -> bool:
@@ -373,8 +482,10 @@ def configure_runtime(client, model: str, prompt_profile: str) -> bool:
     (Ollama) runs. For local: auto-size num_ctx, then derive a soft trim budget
     (75% of the real window, so the proactive trimmer fires BEFORE Ollama
     silently truncates) and a per-tool-result cap (~1/3 of the window, so one
-    big read can't overflow). For non-local: the trim budget comes from
-    _resolve_soft_budget() (env var / config.json / default)."""
+    big read can't overflow). For non-local: resolve the model's real context
+    window (live /v1/models catalog, else the static family map) and auto-size the
+    trim budget to _CONTEXT_WINDOW_RATIO of it, unless soft_context_tokens pins an
+    explicit override (see _resolve_soft_budget)."""
     if _is_ollama_client(client):
         meta = _ollama_model_info(client, model)
         num_ctx = meta["num_ctx"]
@@ -389,8 +500,17 @@ def configure_runtime(client, model: str, prompt_profile: str) -> bool:
         set_tool_profile("local")
         return True
     _RT.num_ctx = None
-    _RT.soft_budget = _resolve_soft_budget()
-    _RT.tool_result_chars = MAX_TOOL_RESULT_CHARS
+    # Resolve the model's real window (live /v1/models, else static family map)
+    # and auto-size the trim budget to a fraction of it — so a ~1M-window GLM run
+    # keeps a much larger history than a 256K Kimi run instead of both sharing one
+    # flat cap. An explicit soft_context_tokens override still wins (see
+    # _resolve_soft_budget). Grow the per-tool-result cap on genuinely large
+    # windows too (never below MAX_TOOL_RESULT_CHARS), so a big read isn't
+    # needlessly truncated when there's room to spare.
+    window = _remote_model_window(client, model)
+    _RT.window = window
+    _RT.soft_budget = _resolve_soft_budget(window)
+    _RT.tool_result_chars = max(MAX_TOOL_RESULT_CHARS, min(200_000, window * 4 // 16))
     _RT.ollama_thinking = False
     # Non-local runs keep the full tool surface. We propagate the prompt-profile
     # name so profile-scoped toolboxes (e.g. "cryouncle" → CryoSPARC tools) are
@@ -399,6 +519,23 @@ def configure_runtime(client, model: str, prompt_profile: str) -> bool:
     _RT.tool_profile = prompt_profile
     set_tool_profile(prompt_profile)
     return False
+
+
+def independent_soft_budget(client, model: str) -> int | None:
+    """Per-model proactive-trim budget for an INDEPENDENT agent run that has its
+    own message history and never went through configure_runtime — e.g. a Lab or
+    Science specialist (run via lab.agent_runtime.run_agent_task).
+
+    Remote: auto-size from the model's real window (manual cap respected), exactly
+    like configure_runtime does for a single-agent run. Local Ollama: 75% of the
+    probed window. Returns None only when nothing can be resolved, so the caller
+    keeps whatever ambient thread-local budget is in effect."""
+    try:
+        if _is_ollama_client(client):
+            return max(2048, int(_ollama_model_info(client, model)["num_ctx"] * 0.75))
+        return _resolve_soft_budget(_remote_model_window(client, model))
+    except Exception:
+        return None
 
 
 def list_prompt_profiles() -> list[str]:
@@ -431,6 +568,33 @@ PROJECT_MEMORY_FILENAME = "memory.md"
 def memory_file(working_dir: str) -> Path:
     """Path to the project-scoped memory file for ``working_dir``."""
     return Path(working_dir) / PROJECT_MEMORY_DIR / PROJECT_MEMORY_FILENAME
+
+
+def _remote_memory_path(working_dir: str) -> str:
+    """POSIX path of the memory file on a remote host (no local Path semantics —
+    a remote working dir must never be mangled by the local OS's path rules)."""
+    base = (working_dir or ".").rstrip("/")
+    return f"{base}/{PROJECT_MEMORY_DIR}/{PROJECT_MEMORY_FILENAME}"
+
+
+def _memory_backend(remote: dict | None = None):
+    """Resolve where project memory lives: a ``RemoteSession`` when the work is
+    happening on a remote host, else ``None`` for the local filesystem.
+
+    Priority: an explicit ``remote`` config (used by after-run saves, once the
+    thread's execution target has already been reset) → the thread's currently
+    active execution target (set for the duration of a run and while the
+    ``remember`` tool executes) → local. So memory always lands in the working
+    directory on the same machine the tools ran on.
+    """
+    try:
+        if remote:
+            from .remote import RemoteSession
+            return RemoteSession.get(remote)
+        from .tools import _remote as _active_remote
+        return _active_remote()
+    except Exception:
+        return None
 _SESSION_MAX_ENTRIES = 20   # session outcomes retained on disk
 _INSIGHT_MAX_ENTRIES = 40   # agent-authored insights retained on disk
 _RECALL_SESSIONS = 4        # session entries injected into a prompt
@@ -485,17 +649,28 @@ def _mem_relevance(query_tokens: set[str], entry: dict) -> float:
     return overlap / (len(et) ** 0.5 + 1.0)
 
 
-def _parse_memory_entries(working_dir: str) -> list[dict]:
+def _parse_memory_entries(working_dir: str, remote: dict | None = None) -> list[dict]:
     """Parse the project memory file into a chronological list of entry dicts.
     Each has a 'kind' of 'session' or 'insight'. Tolerant of missing fields and
-    of older files that predate the insight format. Never raises."""
-    mf = memory_file(working_dir)
-    if not mf.exists():
-        return []
-    try:
-        text = mf.read_text(encoding="utf-8")
-    except OSError:
-        return []
+    of older files that predate the insight format. Never raises. Reads from the
+    remote host when the work is running there (see ``_memory_backend``)."""
+    sess = _memory_backend(remote)
+    if sess is not None:
+        rp = _remote_memory_path(working_dir)
+        try:
+            if not sess.exists(rp):
+                return []
+            text = sess.read_text(rp)
+        except Exception:
+            return []
+    else:
+        mf = memory_file(working_dir)
+        if not mf.exists():
+            return []
+        try:
+            text = mf.read_text(encoding="utf-8")
+        except OSError:
+            return []
     entries: list[dict] = []
     for block in text.split("---"):
         block = block.strip()
@@ -547,16 +722,17 @@ def _select_memory(pool: list[dict], query_tokens: set[str], k: int) -> list[dic
     return pool[-k:]
 
 
-def load_session_memory(working_dir: str, query: str | None = None) -> str:
+def load_session_memory(working_dir: str, query: str | None = None,
+                        remote: dict | None = None) -> str:
     """
     Return a formatted block of relevant prior context (for the PROJECT at
     ``working_dir``) for system-prompt injection. When `query` (the current
     task) is given, entries are ranked by lexical relevance to it; otherwise the
     most recent entries are used. Returns empty string when there is nothing to
-    recall.
+    recall. Reads from the remote host when the work is running there.
     """
     try:
-        entries = _parse_memory_entries(working_dir)
+        entries = _parse_memory_entries(working_dir, remote=remote)
         if not entries:
             return ""
         insights = [e for e in entries if e["kind"] == "insight"]
@@ -610,29 +786,35 @@ def _serialize_memory_entry(e: dict) -> str:
     ])
 
 
-def _write_memory(working_dir: str, entries: list[dict]) -> None:
+def _write_memory(working_dir: str, entries: list[dict], remote: dict | None = None) -> None:
     """Trim each kind to its cap (keeping the most recent) and rewrite the
     project memory file in chronological order. Rewriting wholesale keeps
     per-kind trimming correct — insights are never evicted to make room for
-    session outcomes."""
+    session outcomes. Writes to the remote host when the work is running there."""
     sessions = [e for e in entries if e.get("kind") == "session"][-_SESSION_MAX_ENTRIES:]
     insights = [e for e in entries if e.get("kind") == "insight"][-_INSIGHT_MAX_ENTRIES:]
     keep = {id(e) for e in sessions} | {id(e) for e in insights}
     ordered = [e for e in entries if id(e) in keep]
 
+    body = "\n".join(_serialize_memory_entry(e) for e in ordered)
+    text = "# OctoSlave Project Memory\n\n" + body + ("\n" if body else "")
+
+    sess = _memory_backend(remote)
+    if sess is not None:
+        # write_text creates the .octo parent dir on the remote automatically.
+        sess.write_text(_remote_memory_path(working_dir), text)
+        return
     mf = memory_file(working_dir)
     mf.parent.mkdir(parents=True, exist_ok=True)
-    body = "\n".join(_serialize_memory_entry(e) for e in ordered)
-    mf.write_text(
-        "# OctoSlave Project Memory\n\n" + body + ("\n" if body else ""),
-        encoding="utf-8",
-    )
+    mf.write_text(text, encoding="utf-8")
 
 
-def save_session_memory(working_dir: str, task: str, status: str = "completed", note: str = "") -> None:
-    """Record one task-outcome entry for the project, trimming history to cap."""
+def save_session_memory(working_dir: str, task: str, status: str = "completed",
+                        note: str = "", remote: dict | None = None) -> None:
+    """Record one task-outcome entry for the project, trimming history to cap.
+    Persists to the remote host when the work is running there."""
     try:
-        entries = _parse_memory_entries(working_dir)
+        entries = _parse_memory_entries(working_dir, remote=remote)
         entries.append({
             "kind": "session",
             "date": _date_cls.today().isoformat(),
@@ -640,15 +822,18 @@ def save_session_memory(working_dir: str, task: str, status: str = "completed", 
             "status": status,
             "note": note[:300].replace(chr(10), " "),
         })
-        _write_memory(working_dir, entries)
+        _write_memory(working_dir, entries, remote=remote)
     except Exception:
         pass
 
 
-def save_memory_insight(working_dir: str, content: str, tags=None) -> bool:
+def save_memory_insight(working_dir: str, content: str, tags=None,
+                       remote: dict | None = None) -> bool:
     """Persist an agent-authored insight (the `remember` tool) to project memory.
     Returns True on success. Multi-line content is allowed; a lone `---` line is
-    defused so it can't be mistaken for a block separator on the next read."""
+    defused so it can't be mistaken for a block separator on the next read.
+    The `remember` tool runs mid-task, so ``remote`` is usually left None and the
+    active execution target routes it to the remote host automatically."""
     content = (content or "").strip()
     if not content:
         return False
@@ -661,7 +846,7 @@ def save_memory_insight(working_dir: str, content: str, tags=None) -> bool:
     else:
         tag_str = ""
     try:
-        entries = _parse_memory_entries(working_dir)
+        entries = _parse_memory_entries(working_dir, remote=remote)
         # Supersede near-duplicate insights instead of appending, so re-stating
         # or updating a fact keeps memory concise rather than bloating it.
         new_tok = _mem_tokenize(content)
@@ -676,13 +861,14 @@ def save_memory_insight(working_dir: str, content: str, tags=None) -> bool:
             "tags": tag_str[:120],
             "text": content,
         })
-        _write_memory(working_dir, kept)
+        _write_memory(working_dir, kept, remote=remote)
         return True
     except Exception:
         return False
 
 
-def delete_memory_insight(working_dir: str, query: str, max_remove: int = 3) -> list[str]:
+def delete_memory_insight(working_dir: str, query: str, max_remove: int = 3,
+                         remote: dict | None = None) -> list[str]:
     """Remove agent insights that match ``query`` (the `forget` tool / `/memory
     forget`). Returns the texts of removed insights (empty if none matched).
 
@@ -692,7 +878,7 @@ def delete_memory_insight(working_dir: str, query: str, max_remove: int = 3) -> 
     if not query:
         return []
     try:
-        entries = _parse_memory_entries(working_dir)
+        entries = _parse_memory_entries(working_dir, remote=remote)
     except Exception:
         return []
     qtok = _mem_tokenize(query)
@@ -712,7 +898,7 @@ def delete_memory_insight(working_dir: str, query: str, max_remove: int = 3) -> 
     removed = [e.get("text", "").strip() for _, _, e in scored[:max_remove]]
     kept = [e for e in entries if id(e) not in drop_ids]
     try:
-        _write_memory(working_dir, kept)
+        _write_memory(working_dir, kept, remote=remote)
     except Exception:
         return []
     return removed
@@ -929,6 +1115,17 @@ def _proactive_trim(
     Ollama models, _SOFT_CONTEXT_BUDGET for everything else)."""
     if soft_budget is None:
         soft_budget = _rt("soft_budget", _SOFT_CONTEXT_BUDGET)
+        # In council/ultra mode the runtime budget is sized once from the WORKER
+        # model, but the active model here may differ (worker escalation to a
+        # different-family alternate). Never let the trim budget exceed what the
+        # ACTIVE model's own window can hold — otherwise a large-window worker's
+        # accumulated history could overflow a smaller-window escalate and force
+        # the reactive path to clean it up mid-turn. Only ever tightens: on the
+        # single-model path the active model IS the one the budget was sized for,
+        # so this is a no-op there.
+        if model and client is not None and not _is_ollama_client(client):
+            win_budget = int(_remote_model_window(client, model) * _CONTEXT_WINDOW_RATIO)
+            soft_budget = min(soft_budget, max(2048, win_budget))
     est = _estimated_tokens(messages)
     # Trigger at the budget, but compact down to the lower target for headroom.
     if est <= soft_budget:
@@ -1105,6 +1302,67 @@ def _compact_and_trim(
     return system + [summary_msg] + remaining
 
 
+def _adaptive_budget_floor() -> int:
+    """Lowest the adaptive backoff may drive the soft budget. Tied to the
+    CONFIGURED budget (env/config.json/default via _resolve_soft_budget) so a
+    large-window model can't be ratcheted down to a tiny one by a run of
+    under-counted overflows — a 192K session floors near 96K, a 96K one near 48K.
+    The absolute _MIN_ADAPTIVE_BUDGET only matters for genuinely small budgets
+    (e.g. local models). Local Ollama runs keep their own auto-sized budget as
+    the reference so the floor scales with the real window there too."""
+    configured = _rt("num_ctx", None)
+    configured = int(configured * 0.75) if configured else _resolve_soft_budget()
+    return max(_MIN_ADAPTIVE_BUDGET, int(configured * _ADAPTIVE_FLOOR_FRACTION))
+
+
+def _handle_context_overflow(
+    messages: list[dict],
+    client: OpenAI | None = None,
+    model: str | None = None,
+) -> tuple[list[dict], bool]:
+    """React to a real API context-window error.
+
+    The API is ground truth that our soft budget over-estimated the usable
+    window (the chars/4 estimate under-counts dense code/numeric content, or the
+    configured window was optimistic). So we ratchet the per-thread soft budget
+    DOWN to a fraction of the current estimate — future proactive trims then keep
+    the history clear and this reactive path stops firing every turn — and
+    compact down to that budget now via the normal prune+summarise pipeline.
+
+    The backoff can't go below _adaptive_budget_floor() (a fraction of the
+    configured budget), so a large-window model is never collapsed to a tiny one.
+
+    Returns ``(messages, progressed)``. ``progressed`` is False only when nothing
+    could be reclaimed (e.g. the immovable system + first-user messages already
+    exceed the window), which the caller treats as fatal."""
+    est_before = _estimated_tokens(messages)
+    prev = _rt("soft_budget", _SOFT_CONTEXT_BUDGET)
+    lowered = max(_adaptive_budget_floor(), int(est_before * _REACTIVE_BUDGET_BACKOFF))
+    if lowered < prev:
+        _RT.soft_budget = lowered
+        display.print_info(
+            f"Context window exceeded — lowering the context budget to "
+            f"~{lowered:,} tokens for the rest of this session (was ~{prev:,})."
+        )
+        try:
+            logger.log_info("Adaptive context budget lowered after API overflow.",
+                            soft_budget=lowered, previous=prev, est_tokens=est_before)
+        except Exception:
+            pass
+
+    # Compact to the (possibly just-lowered) budget: prune stale observations
+    # first, then summarise oldest turns — same pipeline as the proactive path.
+    budget = _rt("soft_budget", _SOFT_CONTEXT_BUDGET)
+    compacted = _proactive_trim(messages, soft_budget=budget, client=client, model=model)
+    if _estimated_tokens(compacted) < est_before:
+        return compacted, True
+
+    # Proactive pipeline couldn't help (already at the floor) — last-resort
+    # whole-turn drop so we still make progress if anything remains.
+    compacted = _compact_and_trim(messages, groups=10, client=client, model=model)
+    return compacted, len(compacted) < len(messages)
+
+
 def make_client(api_key: str, base_url: str) -> OpenAI:
     # Ollama doesn't require a real API key; use a placeholder so the SDK
     # doesn't raise a missing-key error.
@@ -1190,6 +1448,14 @@ _ORIENT_PROMPT = (
     "and reply with just the word READY."
 )
 
+# How many read-only rounds a capable remote model gets to explore before it
+# must plan. A round can contain several tool calls (models often batch a few
+# reads per turn), so this is a generous ceiling rather than a literal call
+# count — raised from an earlier 5 because a genuinely large repo, dataset, or
+# multi-paper research task needs more than a handful of reads to ground a plan
+# in specifics rather than guesses. Tune with OCTOSLAVE_ORIENT_MAX_ROUNDS.
+_ORIENT_MAX_ROUNDS = max(1, int(os.environ.get("OCTOSLAVE_ORIENT_MAX_ROUNDS", "8")))
+
 
 def _orientation_phase(
     client: OpenAI,
@@ -1197,7 +1463,7 @@ def _orientation_phase(
     messages: list[dict],
     working_dir: str,
     permission_mode: str,
-    max_rounds: int = 5,
+    max_rounds: int = _ORIENT_MAX_ROUNDS,
 ) -> list[dict]:
     """Let the model look around with read-only tools before it plans.
 
@@ -1223,6 +1489,7 @@ def _orientation_phase(
                 tools=orient_tools,
             )
         except Exception as e:  # noqa: BLE001 — orientation is best-effort
+            display.stream_end(False)  # close the stream so the UI leaves "thinking…"
             display.print_info(f"Orientation ended early ({type(e).__name__}).")
             break
 
@@ -1256,10 +1523,26 @@ def _orientation_phase(
                                             "use only read-only tools. Save it for after the plan."})
                 continue
             display.print_tool_call(name, args)
-            result, success = execute_tool(name, args, working_dir, permission_mode)
+            display.tool_activity_start(name, args, permission_mode)
+            try:
+                result, success = execute_tool(name, args, working_dir, permission_mode)
+            finally:
+                display.tool_activity_end()
             result = _cap_result(result, name)
             display.print_tool_result(name, result, success)
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+    else:
+        # Loop ran out of rounds while the model was still actively exploring
+        # (never emitted a no-tool-calls "READY" turn to break out). Tell it
+        # plainly so the plan is grounded in what it saw rather than silently
+        # cut off mid-thought with no acknowledgement that time is up.
+        messages.append({
+            "role": "user",
+            "content": (
+                "Orientation budget reached. Write the plan now using what "
+                "you have already seen — do not call any more tools."
+            ),
+        })
 
     return messages
 
@@ -1303,6 +1586,25 @@ def _planning_step(
         {"role": "assistant", "content": plan_text},
     ]
     return messages, plan_text
+
+
+# How many times the self-verify pass may send the model back to fix its own
+# work before giving up and reporting whatever grade it last got. Bounded so a
+# model that keeps grading itself PARTIAL/FAILED (or a genuinely unfixable gap)
+# can't turn one task into an unbounded number of extra loop passes.
+_MAX_VERIFY_CORRECTIONS = 2
+
+
+def _verify_grade(verdict: str) -> str:
+    """Extract the DONE/PARTIAL/FAILED prefix from a `_verify_completion` reply.
+    Returns "" if the reply didn't start with one of the three (treated as
+    inconclusive by the caller, so it doesn't loop forever chasing a malformed
+    grade)."""
+    v = (verdict or "").strip().upper()
+    for grade in ("DONE", "PARTIAL", "FAILED"):
+        if v.startswith(grade):
+            return grade
+    return ""
 
 
 def _verify_completion(
@@ -1470,7 +1772,7 @@ def run_agent(
     # Inject session memory into system prompt when available, ranked by
     # relevance to the current task.
     if enable_memory:
-        memory_ctx = load_session_memory(working_dir, query=task)
+        memory_ctx = load_session_memory(working_dir, query=task, remote=remote)
         if memory_ctx:
             system_prompt = system_prompt + f"\n\n{memory_ctx}"
 
@@ -1507,15 +1809,36 @@ def run_agent(
         # Main agent loop
         messages = _agent_loop(messages, model, working_dir, client, permission_mode)
 
-        # Post-loop verification pass
+        # Post-loop self-verification, WITH self-correction: a grade of PARTIAL
+        # or FAILED sends the model back into the main loop to fix exactly what
+        # it flagged, then re-grades — instead of just reporting the gap and
+        # stopping (which used to leave "verify" purely cosmetic). Bounded by
+        # _MAX_VERIFY_CORRECTIONS so a stubborn gap can't loop forever.
         if enable_verify:
-            display.print_info("Verifying…")
-            verdict = _verify_completion(messages, task, client, model)
-            if verdict:
+            for _round in range(_MAX_VERIFY_CORRECTIONS + 1):
+                display.print_info("Verifying…")
+                verdict = _verify_completion(messages, task, client, model)
+                if not verdict:
+                    break
                 logger.log_verify(verdict)
                 display.print_verify(verdict)
                 if verify_out is not None:
                     verify_out.append(verdict)
+                grade = _verify_grade(verdict)
+                if grade != "PARTIAL" and grade != "FAILED":
+                    break
+                if _round == _MAX_VERIFY_CORRECTIONS:
+                    break
+                display.print_info("Self-check found unfinished work — continuing to fix it.")
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"Self-check result: {verdict}\n"
+                        "Address exactly what is missing or wrong, then stop — do not "
+                        "redo work that is already correct."
+                    ),
+                })
+                messages = _agent_loop(messages, model, working_dir, client, permission_mode)
     finally:
         configure_execution(None)
 
@@ -1577,7 +1900,16 @@ def _robust_stream(
     import time as _time
     messages = _proactive_trim(messages, client=client, model=model)
     try:
-        response = _stream_completion(client, model, messages, force_tool=force_tool)
+        try:
+            response = _stream_completion(client, model, messages, force_tool=force_tool)
+        except BaseException:
+            # The stream started (stream_start fired) but errored/was interrupted
+            # before its normal close, so stream_end never ran — the CLI spinner
+            # would keep spinning and the web UI would stay stuck on "thinking…"
+            # across the retry. Reset the visual stream, then let the handlers
+            # below classify the error and decide retry/fatal/interrupt.
+            display.stream_end(False)
+            raise
         state["rate"] = 0
         state["timeout"] = 0
         state["conn"] = 0
@@ -1586,11 +1918,11 @@ def _robust_stream(
         err_str = str(e)
         logger.log_error(f"BadRequestError on turn {iteration}", exc=e)
         if _is_context_window_error(err_str):
-            compacted = _compact_and_trim(messages, groups=10, client=client, model=model)
-            if len(compacted) < len(messages):
+            compacted, progressed = _handle_context_overflow(messages, client, model)
+            if progressed:
                 display.print_info(
-                    f"Context window exceeded — compacted oldest turns "
-                    f"(~{_estimated_tokens(compacted):,} tokens left) and retrying."
+                    f"Compacted (~{_estimated_tokens(compacted):,} tokens left) "
+                    f"and retrying."
                 )
                 logger.log_info(
                     "Context window exceeded — compacted and retrying.",
@@ -1703,6 +2035,7 @@ def _agent_loop(
     _text_only_total = 0  # total text-only responses across the whole run
     _botched_attempts = 0  # consecutive unparseable text-format tool-call attempts
     _redundant_calls = 0  # total tool calls whose (name, args) had been seen before
+    _stuck_recoveries = 0  # times we've reset + nudged out of a redundant-call spin
     _consecutive_error_turns = 0  # turns in a row where at least one tool failed
 
     while iteration < MAX_ITERATIONS:
@@ -1846,7 +2179,11 @@ def _agent_loop(
 
             display.print_tool_call(name, args)
             logger.log_tool_call(tc.get("id", ""), name, args)
-            result, success = execute_tool(name, args, working_dir, permission_mode)
+            display.tool_activity_start(name, args, permission_mode)
+            try:
+                result, success = execute_tool(name, args, working_dir, permission_mode)
+            finally:
+                display.tool_activity_end()
 
             if not success:
                 _turn_had_error = True
@@ -1915,16 +2252,31 @@ def _agent_loop(
             )
             messages.append({"role": "user", "content": nudge})
 
-        # Hard stop if the agent is making sustained redundant calls — strong
-        # signal that the task is complete and the model is just looping.
+        # Sustained redundant calls: the model is spinning (re-reading what it
+        # already has). This is NOT proof the task is done, so don't stop with a
+        # misleading "complete" — reset, and push it to either finish cleanly or
+        # make real progress. Give it several such recoveries (each needs a fresh
+        # streak) before an honest stop, so a long, legitimately busy run — or an
+        # overnight one — is never cut short by this heuristic alone.
         if _redundant_calls >= 5:
-            display.print_info(
-                "Stopping: agent has made repeated calls without new progress "
-                "(task likely complete)."
-            )
-            display.print_done(iteration)
-            _end_reason = "redundant_calls"
-            break
+            _redundant_calls = 0
+            _tool_call_counts.clear()
+            _stuck_recoveries += 1
+            if _stuck_recoveries > 4:
+                display.print_info(
+                    "Stopping: the agent keeps repeating work without new progress. "
+                    "Send another message to continue from here."
+                )
+                display.print_done(iteration)
+                _end_reason = "no_progress"
+                break
+            messages.append({"role": "user", "content": (
+                "You keep repeating actions and re-reading files you already have — that does not "
+                "advance the task. If the task is genuinely complete, say so plainly and stop. "
+                "Otherwise STOP repeating and make the next CONCRETE change now (write_file, "
+                "edit_file, or run code that does new work)."
+            )})
+            continue
 
         display.print_separator()
     else:
