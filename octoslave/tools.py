@@ -683,6 +683,13 @@ def remote_label() -> str | None:
     return cfg.get("name") or cfg.get("host") or cfg.get("id")
 
 
+def active_remote_cfg() -> dict | None:
+    """The remote config this thread's tools route to, or None when local. Lets a
+    prompt builder describe the active remote without threading it through every
+    call (execution routing is already thread-local via configure_execution)."""
+    return getattr(_EXEC, "remote_cfg", None)
+
+
 def _remote_resolve(path: str, working_dir: str) -> str:
     """Resolve ``path`` against the remote working dir using POSIX semantics.
 
@@ -694,6 +701,42 @@ def _remote_resolve(path: str, working_dir: str) -> str:
     if posixpath.isabs(path):
         return posixpath.normpath(path)
     return posixpath.normpath(posixpath.join(working_dir, path))
+
+
+# local working_dir → real remote directory, per remote host (probe/mkdir once).
+_REMOTE_WD_MAP: dict[tuple, str] = {}
+
+
+def _remote_cwd(working_dir: str) -> str:
+    """Map a session's (local) working_dir to a REAL directory on the active
+    remote host.
+
+    In whole-session-remote mode the agent's working_dir is a LOCAL absolute path
+    that does not exist on the remote, so ``cd``/``mkdir`` of it fail (or, worse,
+    try to create ``/private`` etc.). Instead we run in
+    ``<remote_dir or $HOME>/octoslave/<basename>`` — created once and cached. A
+    working_dir that already exists on the remote (the user gave a real remote
+    path) is used unchanged. No-op when execution is local."""
+    sess = _remote()
+    if sess is None or not working_dir:
+        return working_dir
+    cfg = active_remote_cfg() or {}
+    key = (cfg.get("id") or cfg.get("host") or "", working_dir)
+    hit = _REMOTE_WD_MAP.get(key)
+    if hit:
+        return hit
+    try:
+        if posixpath.isabs(working_dir) and sess.is_dir(working_dir):
+            _REMOTE_WD_MAP[key] = working_dir
+            return working_dir
+        base = (cfg.get("remote_dir") or "").strip() or sess.home()
+        name = posixpath.basename(working_dir.rstrip("/")) or "session"
+        rwd = posixpath.normpath(posixpath.join(base, "octoslave", name))
+        sess.mkdirs(rwd)
+        _REMOTE_WD_MAP[key] = rwd
+        return rwd
+    except Exception:
+        return working_dir
 
 
 def _format_bash_output(stdout: str, stderr: str, returncode: int) -> str:
@@ -985,6 +1028,13 @@ def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str =
     err = _validate_required_args(name, args)
     if err is not None:
         return err, False
+
+    # When the whole session runs on a remote host, translate the local session
+    # working_dir into a real remote directory so every tool (bash, file ops,
+    # cluster-job submission) resolves paths and `cd`s somewhere that exists.
+    # No-op for local execution.
+    if _remote() is not None:
+        working_dir = _remote_cwd(working_dir)
 
     try:
         if name == "read_file":

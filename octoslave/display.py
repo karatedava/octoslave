@@ -223,6 +223,25 @@ _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _SPINNER_CLEAR  = "\r\x1b[2K"
 
 
+def _fit_status(text: str) -> str:
+    """Clip a one-line status string (spinner) to the terminal width and strip
+    embedded newlines. Critical for the carriage-return redraw: ``\\r\\x1b[2K``
+    only clears the cursor's row, so if the status is long enough to WRAP (e.g. a
+    long bash command in the tail) the wrapped remainder is never erased, the
+    cursor drifts downward, and every frame leaves a residue — the spinner
+    "spams" the whole window. Keeping the line within one row guarantees the
+    redraw stays in place."""
+    text = text.replace("\r", " ").replace("\n", " ")
+    try:
+        width = console.width
+    except Exception:
+        width = 80
+    limit = max(1, width - 1)
+    if len(text) > limit:
+        text = text[:limit - 1] + "…"
+    return text
+
+
 def _spinning(stop_event: _threading.Event, spin: dict) -> None:
     """Background thread: animate a waiting indicator until stop_event is set.
 
@@ -235,11 +254,12 @@ def _spinning(stop_event: _threading.Event, spin: dict) -> None:
         frame = _SPINNER_FRAMES[i % len(_SPINNER_FRAMES)]
         elapsed = int(i * 0.1)
         if spin.get("reasoning"):
-            sys.stdout.write(
-                f"\r\x1b[2K  {frame} 💭 thinking… {elapsed}s ({spin.get('chars', 0):,} chars)"
+            line = _fit_status(
+                f"  {frame} 💭 thinking… {elapsed}s ({spin.get('chars', 0):,} chars)"
             )
         else:
-            sys.stdout.write(f"\r  {frame} waiting for model… {elapsed}s")
+            line = _fit_status(f"  {frame} waiting for model… {elapsed}s")
+        sys.stdout.write(f"{_SPINNER_CLEAR}{line}")
         sys.stdout.flush()
         i += 1
     sys.stdout.write(_SPINNER_CLEAR)
@@ -486,7 +506,8 @@ def _tool_spinning(stop_event: _threading.Event, icon: str, label: str) -> None:
         frame = _SPINNER_FRAMES[i % len(_SPINNER_FRAMES)]
         elapsed = int(_time.monotonic() - start)
         tail = f"  {label}" if label else ""
-        sys.stdout.write(f"{_SPINNER_CLEAR}    {frame} {icon} running… {elapsed}s{tail}")
+        line = _fit_status(f"    {frame} {icon} running… {elapsed}s{tail}")
+        sys.stdout.write(f"{_SPINNER_CLEAR}{line}")
         sys.stdout.flush()
         i += 1
     sys.stdout.write(_SPINNER_CLEAR)

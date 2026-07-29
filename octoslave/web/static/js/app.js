@@ -1217,6 +1217,7 @@ function _provFormValues() {
     api_key:       document.getElementById('prov-api-key')?.value || '',
     default_model: document.getElementById('prov-default-model')?.value || '',
     models:        document.getElementById('prov-models')?.value || '',
+    context_window: parseInt(document.getElementById('prov-context-window')?.value, 10) || 0,
   };
 }
 
@@ -1231,7 +1232,7 @@ function _setProvFormStatus(text, kind) {
 
 function _resetProvForm() {
   ['prov-id', 'prov-name', 'prov-base-url', 'prov-api-key',
-   'prov-default-model', 'prov-models'].forEach(id => {
+   'prov-default-model', 'prov-models', 'prov-context-window'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.value = '';
   });

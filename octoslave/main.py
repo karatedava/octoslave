@@ -1888,6 +1888,11 @@ def _handle_provider_command(arg: str, state: dict, messages: list) -> str:
             models_raw = click.prompt(
                 "Known models (comma-separated, optional)", default=""
             ).strip()
+            context_window = click.prompt(
+                "Context window in tokens (optional — blank/0 = auto-detect from "
+                "the provider, or fall back to a per-family default)",
+                default=0, type=int, show_default=False,
+            )
         except click.Abort:
             display.console.print("[dim]Cancelled.[/dim]")
             return "ok"
@@ -1900,6 +1905,7 @@ def _handle_provider_command(arg: str, state: dict, messages: list) -> str:
                 "api_key": api_key,
                 "default_model": default_model,
                 "models": models_raw,
+                "context_window": context_window,
             })
         except ValueError as exc:
             display.print_error(str(exc))

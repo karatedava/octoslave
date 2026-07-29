@@ -54,6 +54,11 @@ def assemble_team(session: LabSession, client: OpenAI,
                   files_summary: str = "") -> tuple[list[AgentSpec], str]:
     """Design the initial team for the task. Returns (team, agenda)."""
     catalog = tool_catalog()
+    # If a specialist-model pool is configured, the Director assigns each agent a
+    # model from it; otherwise every agent inherits the session model.
+    pool = [m for m in (session.specialist_models or []) if m]
+    model_field = (',\n      "model": "<one of the specialist models listed below>"'
+                   if pool else "")
     user = f"""\
 The human has given the lab this task:
 
@@ -83,9 +88,28 @@ Respond as JSON:
       "expertise": "<what they're expert in>",
       "goal": "<what they will accomplish on this team>",
       "tools": ["tool_name", ...],
-      "icon": "<one emoji>"}}
+      "icon": "<one emoji>"{model_field}}}
   ]
 }}"""
+
+    if pool:
+        user = user + (
+            "\n\nSpecialist model pool — set each team member's \"model\" to one of "
+            "these (match model strength to the role; you, the Director, run on "
+            f"{session.model}):\n" + "\n".join(f"- {m}" for m in pool))
+
+    # Make the Director aware of a configured compute node so it plans heavy steps
+    # as offloaded jobs (and knows results come back locally for the report).
+    try:
+        from ..config import remote_awareness_note
+        from ..science.tools import active_compute_node
+        _node = active_compute_node()
+        if _node is not None:
+            _note = remote_awareness_note(active=_node, job_submission=True)
+            if _note:
+                user = user + "\n\n" + _note
+    except Exception:
+        pass
 
     data = complete_json(client, session.model, _DIRECTOR_SYSTEM, user, max_tokens=3000)
     team: list[AgentSpec] = []
@@ -95,6 +119,9 @@ Respond as JSON:
         for item in (data.get("team") or [])[:MAX_TEAM]:
             if not isinstance(item, dict):
                 continue
+            # Model from the pool if the Director picked a valid one; else default.
+            chosen = str(item.get("model", "")).strip()
+            spec_model = chosen if (pool and chosen in pool) else session.model
             team.append(AgentSpec(
                 name=str(item.get("name", "Specialist"))[:60],
                 role=str(item.get("role", ""))[:120],
@@ -102,7 +129,7 @@ Respond as JSON:
                 goal=str(item.get("goal", ""))[:400],
                 tools=[str(t) for t in (item.get("tools") or []) if isinstance(t, str)],
                 icon=str(item.get("icon", "🧪"))[:4] or "🧪",
-                model=session.model,
+                model=spec_model,
             ))
     return team, agenda
 

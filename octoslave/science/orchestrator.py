@@ -26,6 +26,7 @@ def run_science_turn(
     emit=None,
     remote: dict | None = None,
     refresh_artifact_id: str | None = None,
+    specialist_models: list | None = None,
 ) -> str:
     """Run one orchestrator turn against ``user_message`` and return its reply.
 
@@ -35,24 +36,43 @@ def run_science_turn(
     file in place without calling present_output again.
     """
     emit = emit or (lambda ev: None)
+    pool = [m for m in (specialist_models or []) if m]
     ctx = RunContext(session=session, client=client, model=model, emit=emit,
-                     permission_mode=permission_mode)
+                     permission_mode=permission_mode, specialist_models=pool)
     set_context(ctx)
     _science_tools.register()
     display.set_event_callback(emit)
+    # Tell the orchestrator which models it may assign to specialists. Injected on
+    # turn 1's system prompt; it persists in the message history for later turns.
+    pool_note = ""
+    if pool:
+        pool_note = (
+            "## Specialist model pool\n"
+            "When you spawn_specialist, you may set `model` to one of these "
+            "configured models — pick per task (e.g. a strong reasoner for hard "
+            "analysis, a fast/cheap model for routine work):\n"
+            + "\n".join(f"- {m}" for m in pool)
+            + f"\nOmit `model` to use the default ({pool[0]}). You run on {model}."
+        )
     try:
         wd = session.working_dir
+        # The orchestrator itself runs LOCALLY (fast; artifacts render in the tab).
+        # A selected remote is the HEAVY-COMPUTE cluster, reached only through the
+        # cluster-job tools (submit_cluster_job uses session.remote_id) — big files
+        # stay on the node, lightweight results are fetched back. So we do NOT route
+        # the orchestrator's own tools to the remote (remote=None below); the
+        # remote choice is carried on session.remote_id (set by the caller).
         if not session.messages:
             messages = run_agent(
                 user_message, model, wd, client,
                 prompt_profile="science", permission_mode=permission_mode,
                 enable_plan=False, enable_verify=False, enable_memory=True,
-                remote=remote,
+                remote=None, extra_system=pool_note,
             )
         else:
             messages = continue_agent(
                 session.messages, user_message, model, wd, client,
-                permission_mode=permission_mode, remote=remote,
+                permission_mode=permission_mode, remote=None,
             )
         session.messages = messages
         # Outputs reach the chat only when the orchestrator explicitly calls

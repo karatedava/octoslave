@@ -9,7 +9,7 @@ duration of a run. The web layer runs Science turns one at a time (guarded by
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from .session import ScienceSession
@@ -22,6 +22,9 @@ class RunContext:
     model: str
     emit: Callable[[dict], None]
     permission_mode: str = "autonomous"
+    # Pool of models the orchestrator may assign to spawned specialists. Empty →
+    # specialists use the orchestrator ``model``.
+    specialist_models: list = field(default_factory=list)
 
 
 _CTX: Optional[RunContext] = None

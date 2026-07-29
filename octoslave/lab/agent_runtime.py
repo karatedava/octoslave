@@ -54,6 +54,16 @@ def tools_for_agent(spec: AgentSpec) -> list[dict]:
     # synchronous bash call with an inflated timeout (the Director often omits these).
     if "bash" in allowed:
         allowed.update({"run_background", "check_process", "stop_process"})
+    # When a compute node is configured for this lab run, give code-capable agents
+    # the cluster-job tools so they can offload HEAVY steps to the node and fetch
+    # lightweight results back (the lab itself stays local). Mirrors the bash →
+    # run_background auto-grant. The tools are registered only while a node is active.
+    try:
+        from ..science.tools import active_compute_node, CLUSTER_TOOL_NAMES
+        if active_compute_node() is not None and (allowed & {"bash", "write_file", "edit_file", "apply_patch"}):
+            allowed.update(CLUSTER_TOOL_NAMES)
+    except Exception:
+        pass
     defs = [t for t in all_tool_definitions() if t["function"]["name"] in allowed]
     return defs
 
@@ -327,7 +337,7 @@ Today's date: {date}.
 
 def build_agent_system_prompt(spec: AgentSpec, working_dir: str) -> str:
     from datetime import datetime
-    return _AGENT_HEADER.format(
+    prompt = _AGENT_HEADER.format(
         name=spec.name,
         role=spec.role,
         expertise=spec.expertise,
@@ -336,3 +346,19 @@ def build_agent_system_prompt(spec: AgentSpec, working_dir: str) -> str:
         tool_list=", ".join(spec.tools) or "none — you are a discussion-only advisor",
         date=datetime.now().strftime("%Y-%m-%d"),
     )
+    # Compute-node awareness (hybrid model). The lab runs locally; when a node is
+    # configured for the run, code-capable agents get the cluster-job tools —
+    # tell them to offload HEAVY steps to it and fetch lightweight results back.
+    # Only injected when a node is actually active, so local-only runs stay clean.
+    if spec.tools:
+        try:
+            from ..config import remote_awareness_note
+            from ..science.tools import active_compute_node
+            node = active_compute_node()
+            if node is not None:
+                note = remote_awareness_note(active=node, job_submission=True)
+                if note:
+                    prompt = prompt + "\n\n" + note
+        except Exception:
+            pass
+    return prompt

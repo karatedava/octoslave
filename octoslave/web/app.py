@@ -408,6 +408,31 @@ async def list_remotes():
     return {"remotes": get_remotes()}
 
 
+# Substrings marking non-chat models (embeddings/rerankers/audio) to hide from the
+# model pickers. Covers the common embedding families whose ids don't contain
+# "embed" (e5, bge, gte, jina, …) so they don't leak into the specialist pool.
+_NON_CHAT_MODEL_HINTS = (
+    "embed", "rerank", "whisper", "reranker",
+    "-e5-", "e5-large", "e5-mistral", "multilingual-e5", "bge-", "gte-",
+    "jina-embed", "nomic",
+)
+
+
+@app.get("/api/models")
+async def api_models():
+    """Chat models available on the active backend — for the orchestrator/pool
+    selectors in Science and Lab. Falls back to the known list on any error."""
+    try:
+        from ..config import list_models as _list_models
+        cfg = load_config()
+        models = _list_models(cfg)
+    except Exception:
+        models = []
+    chat = [m for m in models
+            if not any(h in (m or "").lower() for h in _NON_CHAT_MODEL_HINTS)]
+    return {"models": chat, "default": load_config().get("default_model", "")}
+
+
 @app.post("/api/remotes")
 async def create_remote(payload: dict):
     """Add a new remote SSH target."""
@@ -1358,6 +1383,9 @@ async def ws_endpoint(websocket: WebSocket):
                 autonomous = bool(msg.get("autonomous", True))
                 max_rounds = max(1, min(12, int(msg.get("rounds", 4))))
                 model_all = msg.get("model_all") or None
+                # Pool of models the Director may assign to specialists.
+                specialist_models = [m for m in (msg.get("specialist_models") or [])
+                                     if isinstance(m, str) and m.strip()]
                 resume = bool(msg.get("resume", False))
                 state["running"] = True
 
@@ -1367,6 +1395,13 @@ async def ws_endpoint(websocket: WebSocket):
                 client = make_client(_resolved["api_key"], _resolved["base_url"])
                 model = model_all or cfg.get("default_model")
 
+                # Remote compute target for the whole lab (bash/file/background
+                # tools run on this host). Explicit per-message id wins, else the
+                # session's current selection; None → local.
+                remote_id = msg.get("remote_id") if "remote_id" in msg else state.get("remote_id")
+                state["remote_id"] = remote_id
+                remote = get_remote(None, remote_id) if remote_id else None
+
                 from ..lab.state import LabSession
                 from ..lab.runner import run_lab
                 lab_session = LabSession.load(working_dir) if resume else None
@@ -1374,15 +1409,17 @@ async def ws_endpoint(websocket: WebSocket):
                     lab_session = LabSession(task=task, working_dir=working_dir,
                                              model=model or "")
                 lab_session.autonomous = autonomous
+                if specialist_models:
+                    lab_session.specialist_models = specialist_models
                 state["lab_session"] = lab_session
 
                 def lab_fn(t=task, wd=working_dir, au=autonomous, mr=max_rounds,
-                           md=model, res=resume, sess=lab_session):
+                           md=model, res=resume, sess=lab_session, rmt=remote):
                     display.set_event_callback(make_emit())
                     try:
                         run_lab(task=t, working_dir=wd, client=client, model=md,
                                 autonomous=au, max_rounds=mr, resume=res,
-                                emit=make_emit(), session=sess)
+                                emit=make_emit(), session=sess, remote=rmt)
                     except Exception as exc:
                         loop.call_soon_threadsafe(
                             event_q.put_nowait, {"type": "error", "text": str(exc)}
@@ -1414,6 +1451,10 @@ async def ws_endpoint(websocket: WebSocket):
                 client = make_client(_resolved["api_key"], _resolved["base_url"])
                 model = cfg.get("default_model")
 
+                remote_id = msg.get("remote_id") if "remote_id" in msg else state.get("remote_id")
+                state["remote_id"] = remote_id
+                remote = get_remote(None, remote_id) if remote_id else None
+
                 from ..lab.state import LabSession
                 from ..lab.runner import continue_lab
                 lab_session = LabSession.load(working_dir)
@@ -1423,11 +1464,11 @@ async def ws_endpoint(websocket: WebSocket):
                 state["running"] = True
                 state["lab_session"] = lab_session
 
-                def followup_fn(fb=feedback, wd=working_dir, md=model, sess=lab_session):
+                def followup_fn(fb=feedback, wd=working_dir, md=model, sess=lab_session, rmt=remote):
                     display.set_event_callback(make_emit())
                     try:
                         continue_lab(working_dir=wd, client=client, feedback=fb,
-                                     model=md, emit=make_emit(), session=sess)
+                                     model=md, emit=make_emit(), session=sess, remote=rmt)
                     except Exception as exc:
                         loop.call_soon_threadsafe(
                             event_q.put_nowait, {"type": "error", "text": str(exc)})
@@ -1471,6 +1512,13 @@ async def ws_endpoint(websocket: WebSocket):
                 _resolved = resolve_backend(cfg)
                 client = make_client(_resolved["api_key"], _resolved["base_url"])
                 model = msg.get("model") or state.get("model") or cfg.get("default_model")
+                # Pool of models the orchestrator may assign to spawned specialists.
+                specialist_models = [m for m in (msg.get("specialist_models") or [])
+                                     if isinstance(m, str) and m.strip()]
+                if specialist_models:
+                    state["specialist_models"] = specialist_models
+                else:
+                    specialist_models = state.get("specialist_models") or []
 
                 remote_id = msg.get("remote_id") if "remote_id" in msg else state.get("remote_id")
                 state["remote_id"] = remote_id
@@ -1537,7 +1585,8 @@ async def ws_endpoint(websocket: WebSocket):
                             "artifact_id": msg.get("artifact_id")})
 
                 def science_fn(um=user_message, sc=sess, cl=client, md=model,
-                               rmt=remote, wd_key=want, rid=refine_id):
+                               rmt=remote, wd_key=want, rid=refine_id,
+                               pool=specialist_models):
                     display.set_event_callback(make_emit())
                     interrupt.register()
                     state["agent_ident"] = threading.get_ident()
@@ -1545,7 +1594,8 @@ async def ws_endpoint(websocket: WebSocket):
                         run_science_turn(sc, um, cl, md,
                                          permission_mode="autonomous",
                                          emit=make_emit(), remote=rmt,
-                                         refresh_artifact_id=rid)
+                                         refresh_artifact_id=rid,
+                                         specialist_models=pool)
                     except interrupt.StopRequested:
                         loop.call_soon_threadsafe(
                             event_q.put_nowait,

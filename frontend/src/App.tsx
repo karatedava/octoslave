@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { LabSocket } from "./ws";
 import { Nav } from "./Nav";
+import { ModelPicker } from "./ModelPicker";
 import type { Agent, ActivityItem, Decision } from "./types";
 
 const PHASES = [
@@ -64,6 +65,11 @@ export default function App() {
   const [task, setTask] = useState("");
   const [workingDir, setWorkingDir] = useState("");
   const [rounds, setRounds] = useState(3);
+  const [remotes, setRemotes] = useState<{ id: string; name?: string; host?: string }[]>([]);
+  const [remoteId, setRemoteId] = useState("");
+  const [models, setModels] = useState<string[]>([]);
+  const [dirModel, setDirModel] = useState("");
+  const [pool, setPool] = useState<string[]>([]);
 
   const [team, setTeam] = useState<Agent[]>([]);
   const [agenda, setAgenda] = useState("");
@@ -131,6 +137,21 @@ export default function App() {
   function setAgentStatus(id: string, st: string) {
     setTeam((t) => t.map((a) => (a.id === id ? { ...a, status: st } : a)));
   }
+
+  useEffect(() => {
+    fetch("/api/remotes")
+      .then((r) => r.json())
+      .then((d) => setRemotes(Array.isArray(d.remotes) ? d.remotes : []))
+      .catch(() => {});
+    fetch("/api/models")
+      .then((r) => r.json())
+      .then((d) => {
+        const ms: string[] = Array.isArray(d.models) ? d.models : [];
+        setModels(ms);
+        setDirModel(d.default && ms.includes(d.default) ? d.default : ms[0] || "");
+      })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     sock.onOpen(() => setConnected(true));
@@ -254,7 +275,7 @@ export default function App() {
     setObjective("");
     setDecisions([]);
     setAgentLast({});
-    sock.send({ type: "start_lab", task, working_dir: workingDir, rounds, autonomous });
+    sock.send({ type: "start_lab", task, working_dir: workingDir, rounds, autonomous, remote_id: remoteId || null, model_all: dirModel || undefined, specialist_models: pool });
   }
 
   async function browseDir() {
@@ -298,7 +319,7 @@ export default function App() {
       sock.send({ type: "inject", text });
       push("injection", `You: ${inject}${tag}`, "warn");
     } else {
-      sock.send({ type: "lab_followup", text, working_dir: workingDir });
+      sock.send({ type: "lab_followup", text, working_dir: workingDir, remote_id: remoteId || null });
       push("injection", `Follow-up: ${inject}${tag}`, "warn");
       setStatus("running");
     }
@@ -368,6 +389,9 @@ export default function App() {
           workingDir={workingDir} setWorkingDir={setWorkingDir}
           rounds={rounds} setRounds={setRounds}
           autonomous={autonomous} setAutonomous={setAutonomous}
+          remotes={remotes} remoteId={remoteId} setRemoteId={setRemoteId}
+          models={models} dirModel={dirModel} setDirModel={setDirModel}
+          pool={pool} setPool={setPool}
           onStart={start}
           onBrowse={browseDir}
           connected={connected}
@@ -684,6 +708,10 @@ function StartForm(props: {
   workingDir: string; setWorkingDir: (s: string) => void;
   rounds: number; setRounds: (n: number) => void;
   autonomous: boolean; setAutonomous: (b: boolean) => void;
+  remotes: { id: string; name?: string; host?: string }[];
+  remoteId: string; setRemoteId: (s: string) => void;
+  models: string[]; dirModel: string; setDirModel: (s: string) => void;
+  pool: string[]; setPool: (f: (p: string[]) => string[]) => void;
   onStart: () => void; onBrowse: () => void; connected: boolean;
 }) {
   return (
@@ -730,6 +758,35 @@ function StartForm(props: {
             Autonomous (don't pause at gates)
           </label>
         </div>
+        <ModelPicker
+          models={props.models} orchLabel="Director model"
+          orchModel={props.dirModel} setOrchModel={props.setDirModel}
+          pool={props.pool} setPool={props.setPool}
+        />
+        {props.remotes.length > 0 && (
+          <div className="start-row">
+            <div style={{ flex: 1 }}>
+              <label>Compute node (optional)</label>
+              <select
+                value={props.remoteId}
+                onChange={(e) => props.setRemoteId(e.target.value)}
+                style={{ width: "100%" }}
+              >
+                <option value="">Local only</option>
+                {props.remotes.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {(r.name || r.id) + (r.host ? ` (${r.host})` : "")}
+                  </option>
+                ))}
+              </select>
+              <div className="muted" style={{ fontSize: "0.8em", marginTop: 4 }}>
+                The lab runs locally by default. Pick a node and agents offload only
+                HEAVY steps (embeddings, large sims) to it — big files stay there,
+                lightweight results are fetched back and kept local.
+              </div>
+            </div>
+          </div>
+        )}
         <button
           className="btn primary big"
           onClick={props.onStart}

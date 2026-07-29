@@ -8,13 +8,62 @@ Signature contract (same as the Lab foundry): ``run(args, working_dir) ->
 from __future__ import annotations
 
 import json
+import posixpath
 import subprocess
+import threading
 import time
 from pathlib import Path
 
 from .. import tools as _tools
 from . import context as _ctx
 from .session import Artifact, Job, Specialist
+
+# ---------------------------------------------------------------------------
+# Compute context for the cluster-job tools (submit / check / fetch)
+#
+# These three tools are reused by BOTH the Science orchestrator and the
+# autonomous Lab. Science stashes its RunContext module-side (see context.py);
+# the Lab sets a THREAD-LOCAL context here with a LabSession-compatible adapter.
+# The thread-local wins when set, else we fall back to the science context — so
+# science behaviour is unchanged, and a Lab run on another thread is isolated.
+# The context object just needs ``.session`` (with working_dir, remote_id,
+# add_job/get_job/jobs, science_dir, save) and a callable ``.emit``.
+# ---------------------------------------------------------------------------
+_COMPUTE = threading.local()
+
+
+def set_compute_context(session, emit) -> None:
+    """Point this thread's cluster-job tools at ``session`` (working_dir /
+    remote_id / job store) with ``emit`` for progress events."""
+    _COMPUTE.ctx = type("_ComputeCtx", (), {"session": session, "emit": emit})()
+
+
+def clear_compute_context() -> None:
+    _COMPUTE.ctx = None
+
+
+def _compute_ctx():
+    """Active cluster-job context: the thread-local one if set (Lab), else the
+    science module context (Science)."""
+    c = getattr(_COMPUTE, "ctx", None)
+    return c if c is not None else _ctx.current()
+
+
+def _emit_compute(event: dict) -> None:
+    ctx = _compute_ctx()
+    if ctx and getattr(ctx, "emit", None):
+        try:
+            ctx.emit(event)
+        except Exception:
+            pass
+
+
+def active_compute_node() -> dict | None:
+    """The remote (SSH) compute node configured for the active cluster-job
+    context, or None. Used to make Lab/Science agents aware of the node."""
+    ctx = _compute_ctx()
+    rid = getattr(getattr(ctx, "session", None), "remote_id", "") or ""
+    return _remote_for(rid) if rid else None
 
 # ---------------------------------------------------------------------------
 # Artifact kind inference
@@ -73,23 +122,36 @@ def _run_spawn_specialist(args: dict, working_dir: str) -> tuple[str, bool]:
         granted = ["read_file", "write_file", "edit_file", "bash",
                    "glob", "grep", "list_dir"]
 
+    # Model for this specialist: the orchestrator may choose from the configured
+    # pool. An unknown/blank choice falls back to a pool member (or, if no pool is
+    # set, the orchestrator's own model). This lets a strong orchestrator delegate
+    # to cheaper/faster/specialised models per task.
+    pool = list(getattr(ctx, "specialist_models", []) or [])
+    requested = str(args.get("model", "")).strip()
+    if requested and (not pool or requested in pool):
+        spec_model = requested
+    elif pool:
+        spec_model = pool[0]
+    else:
+        spec_model = ctx.model
+
     from ..lab.state import AgentSpec
     from ..lab.agent_runtime import run_agent_task
 
     spec = AgentSpec(name=name, role=role, expertise=role, goal=goal or task,
-                     tools=granted, model=ctx.model, icon=icon)
+                     tools=granted, model=spec_model, icon=icon)
 
     rec = Specialist(name=name, role=role, goal=goal or task, tools=granted,
                      icon=icon, status="working")
     ctx.session.add_specialist(rec)
     _ctx.emit({"type": "science_specialist", "event": "start", "id": rec.id,
                "name": name, "role": role, "goal": goal or task,
-               "tools": granted, "icon": icon})
+               "tools": granted, "icon": icon, "model": spec_model})
 
     try:
         _transcript, summary = run_agent_task(
             spec, task or goal, working_dir, ctx.client,
-            model=ctx.model, permission_mode=ctx.permission_mode,
+            model=spec_model, permission_mode=ctx.permission_mode,
             context=f"You are a specialist reporting to a research orchestrator. "
                     f"Stay strictly within your goal. When you produce a figure, "
                     f"table, or report the user should see, note its exact path.",
@@ -118,10 +180,36 @@ def _remote_for(remote_id: str):
     return get_remote(None, remote_id) if remote_id else None
 
 
+def _remote_workspace(remote: dict, session) -> str:
+    """Persistent per-session workspace on the compute node where heavy jobs run
+    and big files / metadata live (they stay here — only lightweight results are
+    fetched back for local rendering). ``<remote_dir or $HOME>/octoslave/<name>``,
+    created on first use."""
+    from ..remote import RemoteSession
+    sess = RemoteSession.get(remote)
+    base = (remote.get("remote_dir") or "").strip() or sess.home()
+    name = posixpath.basename((session.working_dir or "session").rstrip("/")) or "session"
+    ws = posixpath.normpath(posixpath.join(base, "octoslave", name))
+    sess.mkdirs(ws)
+    return ws
+
+
+def _remote_job_cwd(remote: dict, session, explicit: str) -> str:
+    """Resolve a job's working directory ON THE REMOTE. An absolute path is used
+    as-is; a relative path is taken under the session workspace; empty defaults to
+    the workspace itself. Never a local path (which would not exist on the node)."""
+    ws = _remote_workspace(remote, session)
+    if not explicit:
+        return ws
+    if posixpath.isabs(explicit):
+        return explicit
+    return posixpath.normpath(posixpath.join(ws, explicit))
+
+
 def _run_submit_job(args: dict, working_dir: str) -> tuple[str, bool]:
-    ctx = _ctx.current()
+    ctx = _compute_ctx()
     if ctx is None:
-        return "Science context unavailable.", False
+        return "Compute context unavailable.", False
 
     name = str(args.get("name", "")).strip() or "job"
     command = str(args.get("command", "")).strip()
@@ -131,9 +219,13 @@ def _run_submit_job(args: dict, working_dir: str) -> tuple[str, bool]:
     if scheduler not in ("shell", "slurm", "pbs"):
         scheduler = "shell"
     remote_id = str(args.get("remote_id", "")).strip() or ctx.session.remote_id or ""
-    cwd = str(args.get("cwd", "")).strip() or working_dir
-
     remote = _remote_for(remote_id)
+    # On a remote node the job runs in the persistent session workspace (big files
+    # stay there); locally it uses the given cwd or the session dir.
+    if remote:
+        cwd = _remote_job_cwd(remote, ctx.session, str(args.get("cwd", "")).strip())
+    else:
+        cwd = str(args.get("cwd", "")).strip() or working_dir
     label = remote.get("name", remote_id) if remote else "local"
 
     job = Job(name=name, command=command, remote_id=remote_id or None,
@@ -207,9 +299,9 @@ def _parse_slurm_id(text: str) -> str:
 
 
 def _run_check_job(args: dict, working_dir: str) -> tuple[str, bool]:
-    ctx = _ctx.current()
+    ctx = _compute_ctx()
     if ctx is None:
-        return "Science context unavailable.", False
+        return "Compute context unavailable.", False
     jid = str(args.get("job_id", "")).strip()
     job = ctx.session.get_job(jid)
     if job is None:
@@ -251,10 +343,15 @@ def _poll_job(job: Job, remote, ctx) -> tuple[str, str]:
         if "fail" in s or "cancel" in s or "timeout" in s:
             return "failed", out
         return "unknown", out
-    # shell: is the pid alive? tail the log.
+    # shell: is the pid alive? tail the log. A finished-but-unreaped LOCAL child
+    # lingers as a zombie (state 'Z'), which `kill -0` still reports as alive — so
+    # the job would appear to run forever. Check the process STATE instead and
+    # treat an empty state (gone) or a zombie as done. Works for remote too (a
+    # done nohup'd job is reaped by init → empty state).
     log = (f"science_{job.id}.log" if remote else
            str(ctx.session.science_dir / "jobs" / f"{job.id}.log"))
-    alive_cmd = f"kill -0 {job.handle} 2>/dev/null && echo ALIVE || echo GONE"
+    alive_cmd = (f"S=$(ps -o stat= -p {job.handle} 2>/dev/null | tr -d ' '); "
+                 f"case \"$S\" in ''|Z*) echo GONE;; *) echo ALIVE;; esac")
     alive = _run_anywhere(alive_cmd, job.cwd, remote).strip()
     tail = _run_anywhere(f"tail -n 40 {log} 2>/dev/null", job.cwd, remote)
     status = "running" if "ALIVE" in alive else "done"
@@ -272,10 +369,45 @@ def _run_anywhere(cmd: str, cwd: str, remote) -> str:
 
 
 def _emit_job(job: Job) -> None:
-    _ctx.emit({"type": "science_job", "id": job.id, "name": job.name,
-               "status": job.status, "remote": job.remote_label,
-               "scheduler": job.scheduler, "handle": job.handle,
-               "output": job.output[-1500:]})
+    _emit_compute({"type": "science_job", "id": job.id, "name": job.name,
+                   "status": job.status, "remote": job.remote_label,
+                   "scheduler": job.scheduler, "handle": job.handle,
+                   "output": job.output[-1500:]})
+
+
+def _run_fetch_cluster_file(args: dict, working_dir: str) -> tuple[str, bool]:
+    """Copy a (lightweight) result file from the compute node back to the LOCAL
+    session directory so it can be rendered/presented. Big data stays on the node;
+    this is for the plots, projections, and small tables the user should see."""
+    ctx = _compute_ctx()
+    if ctx is None:
+        return "Compute context unavailable.", False
+    raw = str(args.get("path", "") or args.get("remote_path", "")).strip()
+    if not raw:
+        return "fetch_cluster_file needs a `path` to a file on the cluster.", False
+    remote_id = str(args.get("remote_id", "")).strip() or ctx.session.remote_id or ""
+    remote = _remote_for(remote_id)
+    if not remote:
+        return ("fetch_cluster_file needs a remote compute node, but none is "
+                "selected for this session.", False)
+    from ..remote import RemoteSession
+    sess = RemoteSession.get(remote)
+    # Relative paths resolve against the session workspace on the node.
+    remote_path = raw if posixpath.isabs(raw) else \
+        posixpath.join(_remote_workspace(remote, ctx.session), raw)
+    if not sess.is_file(remote_path):
+        return (f"fetch_cluster_file: no such file on "
+                f"{remote.get('name', remote_id)}: {remote_path}", False)
+    dest_name = str(args.get("dest", "")).strip() or posixpath.basename(remote_path)
+    local_dest = Path(ctx.session.working_dir) / dest_name
+    try:
+        local_dest.parent.mkdir(parents=True, exist_ok=True)
+        sess.pull(remote_path, dest=str(local_dest))
+    except Exception as exc:  # noqa: BLE001
+        return f"fetch_cluster_file: failed to copy {remote_path}: {exc}", False
+    return (f"Fetched '{remote_path}' from {remote.get('name', remote_id)} to local "
+            f"'{dest_name}'. Render it for the user with "
+            f"present_output(path='{dest_name}').", True)
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +580,9 @@ SCIENCE_TOOL_DEFINITIONS = [
             "tools": {"type": "array", "items": {"type": "string"},
                       "description": "Allowlist of tool names to grant (from the tool registry)."},
             "icon": {"type": "string", "description": "An emoji for the UI (optional)."},
+            "model": {"type": "string", "description": "Which model this specialist "
+                      "should run on — choose from the configured specialist pool "
+                      "(listed in your system prompt). Omit to use the default."},
         }, "required": ["name", "goal"]}}},
     {"type": "function", "function": {
         "name": "submit_cluster_job",
@@ -468,6 +603,21 @@ SCIENCE_TOOL_DEFINITIONS = [
         "parameters": {"type": "object", "properties": {
             "job_id": {"type": "string"},
         }, "required": ["job_id"]}}},
+    {"type": "function", "function": {
+        "name": "fetch_cluster_file",
+        "description": "Copy a LIGHTWEIGHT result file (a plot, a UMAP/embedding "
+                       "projection, a small summary table) from the remote compute "
+                       "node back to the local session directory so you can render it "
+                       "with present_output. Big data and intermediates stay on the "
+                       "node — only fetch what the user should actually see.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "File path on the cluster. "
+                     "Relative paths resolve against the job's session workspace."},
+            "dest": {"type": "string", "description": "Local filename to save as "
+                     "(optional; defaults to the remote basename)."},
+            "remote_id": {"type": "string", "description": "Configured remote id "
+                          "(optional; defaults to the session's compute node)."},
+        }, "required": ["path"]}}},
     {"type": "function", "function": {
         "name": "present_output",
         "description": "Surface a file (plot, table, report, dataset) into the chat as "
@@ -521,6 +671,7 @@ _RUNNERS = {
     "spawn_specialist": _run_spawn_specialist,
     "submit_cluster_job": _run_submit_job,
     "check_cluster_job": _run_check_job,
+    "fetch_cluster_file": _run_fetch_cluster_file,
     "present_output": _run_present_output,
     "record_provenance": _run_record_provenance,
     "curate_dataset": _run_curate_dataset,
@@ -537,4 +688,22 @@ def register() -> None:
 
 def unregister() -> None:
     for name in SCIENCE_TOOL_NAMES:
+        _tools.unregister_dynamic_tool(name)
+
+
+# The cluster-job subset — reused by the Lab (which does not want the rest of the
+# science toolset). Backed by the thread-local compute context (set_compute_context).
+CLUSTER_TOOL_NAMES = ("submit_cluster_job", "check_cluster_job", "fetch_cluster_file")
+
+
+def register_cluster_tools() -> None:
+    """Register ONLY the cluster-job tools into the live registry (Lab use)."""
+    for d in SCIENCE_TOOL_DEFINITIONS:
+        name = d["function"]["name"]
+        if name in CLUSTER_TOOL_NAMES:
+            _tools.register_dynamic_tool(d, _RUNNERS[name])
+
+
+def unregister_cluster_tools() -> None:
+    for name in CLUSTER_TOOL_NAMES:
         _tools.unregister_dynamic_tool(name)

@@ -30,7 +30,12 @@ from .config import (
     load_config,
     OLLAMA_BASE_URL,
     DEFAULT_SOFT_CONTEXT_TOKENS,
+    configured_model_window,
+    list_models,
     parse_model_windows,
+    pick_fallback_model,
+    provider_window_override,
+    remote_awareness_note,
     resolve_context_window,
 )
 
@@ -220,21 +225,41 @@ def _is_retryable_error(exc: Exception) -> bool:
 
     Covers connection drops mid-stream (``APIConnectionError`` →
     "peer closed connection without sending complete message body",
-    "incomplete chunked read", "connection reset"), request timeouts, and
-    gateway 502/503/504s. e-INFRA / NIM endpoints throw these on long-TTFT
+    "incomplete chunked read", "connection reset"), request timeouts, gateway
+    502/503/504s, and — critically — the litellm/vLLM 500 that e-INFRA returns
+    when an upstream model worker drops the connection ("litellm.InternalServer
+    Error: … Hosted_vllmException - Server disconnected"). Those 500s are
+    transient (a busy worker died mid-request), so they must be retried, not
+    treated as a fatal error. e-INFRA / NIM endpoints throw these on long-TTFT
     calls when a model "thinks" for tens of seconds before the first token."""
     if isinstance(exc, (APIConnectionError, APITimeoutError)):
         return True
-    if isinstance(exc, APIStatusError):
-        return exc.status_code in (502, 503, 504)
     s = str(exc).lower()
-    return (
+    # Body markers that mean a transient upstream hiccup (worker dropped, gateway
+    # overloaded) rather than a deterministic client error. Used for exceptions
+    # that carry no status code, and to qualify an otherwise-ambiguous 500.
+    transient = (
         "peer closed connection" in s
         or "incomplete chunked read" in s
         or "connection reset" in s
         or "connection error" in s
         or "server disconnected" in s
+        or "hosted_vllm" in s            # litellm wraps a vLLM worker drop as this
+        or "service unavailable" in s
+        or "temporarily unavailable" in s
+        or "overloaded" in s
+        or "try again" in s
     )
+    if isinstance(exc, APIStatusError):
+        if exc.status_code in (502, 503, 504):
+            return True
+        # A litellm/vLLM 500 is usually a transient upstream disconnect — retry
+        # only when the body says so, never a deterministic 500 with no such
+        # marker. Other 4xx/5xx have their own branches in _robust_stream.
+        if exc.status_code == 500:
+            return transient
+        return False
+    return transient
 
 
 # Hard cap on characters in a single tool result that goes into the message history.
@@ -446,9 +471,27 @@ def _remote_window_catalog(client) -> dict[str, int]:
 
 
 def _remote_model_window(client, model: str) -> int:
-    """Resolved context window (tokens) for a non-local model: the live
-    /v1/models value if the catalog advertises one, else the static family map
-    (config.resolve_context_window)."""
+    """Resolved context window (tokens) for a non-local model, on ANY provider.
+
+    Priority: a manual per-provider override configured for this endpoint (wins
+    outright — the user's escape hatch for a custom provider that misreports or
+    doesn't advertise), then the live /v1/models value if the catalog advertises
+    one, then the static pattern/family map (config.resolve_context_window)."""
+    # A per-model manual window (config.model_context_windows) wins outright — the
+    # escape hatch for a model no catalog advertises and no family map knows yet.
+    try:
+        mw = configured_model_window(model)
+    except Exception:
+        mw = None
+    if mw:
+        return mw
+    base = str(getattr(client, "base_url", "")).rstrip("/")
+    try:
+        override = provider_window_override(base)
+    except Exception:
+        override = None
+    if override:
+        return override
     return resolve_context_window(model, _remote_window_catalog(client))
 
 
@@ -1726,6 +1769,37 @@ def _stream_completion(client: OpenAI, model: str, messages: list, force_tool: b
     }
 
 
+def _switch_to_fallback_model(failed_model: str, client: OpenAI, prompt_profile: str) -> str | None:
+    """After retries are exhausted on an unresponsive model (persistent
+    connection drops / timeouts), pick a reachable substitute from the active
+    provider — preferring the kimi, glm and deepseek families — and re-size the
+    runtime budget for it so the run can finish the unfinished work on the new
+    model. Returns the substitute's id, or None when no alternative is available
+    (single-model provider, catalog unreachable, …), in which case the caller
+    proceeds unchanged."""
+    try:
+        available = list_models(load_config())
+    except Exception:
+        available = []
+    alt = pick_fallback_model(failed_model, available)
+    if not alt or alt == failed_model:
+        return None
+    display.print_info(
+        f"[bold]{failed_model}[/bold] stopped responding after repeated retries — "
+        f"switching to [bold]{alt}[/bold] to finish the unfinished work."
+    )
+    logger.log_info(
+        "Switched model after connection loss",
+        failed=failed_model,
+        fallback=alt,
+    )
+    try:
+        configure_runtime(client, alt, prompt_profile)
+    except Exception as e:
+        logger.log_error("Failed to re-size runtime for fallback model", exc=e)
+    return alt
+
+
 def run_agent(
     task: str,
     model: str,
@@ -1739,6 +1813,7 @@ def run_agent(
     plan_out: list | None = None,
     verify_out: list | None = None,
     remote: dict | None = None,
+    extra_system: str = "",
 ) -> list[dict]:
     if permission_mode is None:
         cfg = load_config()
@@ -1768,6 +1843,21 @@ def run_agent(
         )
 
     system_prompt = load_system_prompt(prompt_profile, working_dir)
+
+    # Remote-compute awareness. Science uses the hybrid compute-node model (runs
+    # local, submits only heavy jobs to a node, fetches results back); other
+    # profiles that are routed to a remote get the whole-session framing. Tell the
+    # model which nodes exist so it can offload heavy work — on request or its own
+    # judgement. Harmless no-op when nothing is configured.
+    if remote or prompt_profile == "science":
+        note = remote_awareness_note(active=remote,
+                                     job_submission=(prompt_profile == "science"))
+        if note:
+            system_prompt = system_prompt + "\n\n" + note
+
+    # Caller-supplied extra system context (e.g. the Science specialist-model pool).
+    if extra_system and extra_system.strip():
+        system_prompt = system_prompt + "\n\n" + extra_system.strip()
 
     # Inject session memory into system prompt when available, ranked by
     # relevance to the current task.
@@ -1806,18 +1896,33 @@ def run_agent(
         display.print_info("Local model: skipping separate planning step (plans inline).")
 
     try:
+        active_model = model  # may be swapped for a fallback on connection loss
+
         # Main agent loop
-        messages = _agent_loop(messages, model, working_dir, client, permission_mode)
+        messages, end_reason = _agent_loop(messages, active_model, working_dir, client, permission_mode)
+
+        # Model became unreachable (retries exhausted on a dropping / unresponsive
+        # connection). Swap to a reachable substitute — preferring the kimi, glm
+        # and deepseek families — and let it pick up the unfinished work, so a
+        # mid-task upstream outage doesn't sink the run.
+        if end_reason == "connection_lost":
+            alt = _switch_to_fallback_model(active_model, client, prompt_profile)
+            if alt:
+                active_model = alt
+                messages, end_reason = _agent_loop(
+                    messages, active_model, working_dir, client, permission_mode
+                )
 
         # Post-loop self-verification, WITH self-correction: a grade of PARTIAL
         # or FAILED sends the model back into the main loop to fix exactly what
         # it flagged, then re-grades — instead of just reporting the gap and
         # stopping (which used to leave "verify" purely cosmetic). Bounded by
-        # _MAX_VERIFY_CORRECTIONS so a stubborn gap can't loop forever.
+        # _MAX_VERIFY_CORRECTIONS so a stubborn gap can't loop forever. Runs on
+        # active_model, so a fallback swapped in above also drives verification.
         if enable_verify:
             for _round in range(_MAX_VERIFY_CORRECTIONS + 1):
                 display.print_info("Verifying…")
-                verdict = _verify_completion(messages, task, client, model)
+                verdict = _verify_completion(messages, task, client, active_model)
                 if not verdict:
                     break
                 logger.log_verify(verdict)
@@ -1838,7 +1943,13 @@ def run_agent(
                         "redo work that is already correct."
                     ),
                 })
-                messages = _agent_loop(messages, model, working_dir, client, permission_mode)
+                messages, end_reason = _agent_loop(messages, active_model, working_dir, client, permission_mode)
+                # A correction turn can also lose the connection — switch again so
+                # the next verify round (if any) runs on a reachable model.
+                if end_reason == "connection_lost":
+                    alt = _switch_to_fallback_model(active_model, client, prompt_profile)
+                    if alt:
+                        active_model = alt
     finally:
         configure_execution(None)
 
@@ -1869,7 +1980,16 @@ def continue_agent(
 
     messages.append({"role": "user", "content": follow_up})
     try:
-        return _agent_loop(messages, model, working_dir, client, permission_mode)
+        messages, end_reason = _agent_loop(messages, model, working_dir, client, permission_mode)
+        # Same connection-loss fallback as run_agent: if the model stopped
+        # responding, finish the follow-up on a reachable substitute.
+        if end_reason == "connection_lost":
+            alt = _switch_to_fallback_model(model, client, prompt_profile)
+            if alt:
+                messages, end_reason = _agent_loop(
+                    messages, alt, working_dir, client, permission_mode
+                )
+        return messages
     finally:
         configure_execution(None)
 
@@ -1974,7 +2094,7 @@ def _robust_stream(
             display.print_info(f"Request timeout — retrying in {wait}s ({state['timeout']}/3).")
             if state["timeout"] > 3:
                 display.print_error("Request keeps timing out after 3 retries.")
-                return None, "fatal", messages
+                return None, "fatal_conn", messages
             _time.sleep(wait)
             return None, "retry", messages
         elif _is_retryable_error(e):
@@ -1988,7 +2108,7 @@ def _robust_stream(
             )
             if state["conn"] > 4:
                 display.print_error("Connection keeps dropping after 4 retries.")
-                return None, "fatal", messages
+                return None, "fatal_conn", messages
             _time.sleep(wait)
             return None, "retry", messages
         elif "410" in err_str and ("end of life" in err_str.lower() or "Gone" in err_str):
@@ -2045,7 +2165,7 @@ def _agent_loop(
         if interrupt.should_stop():
             display.print_interrupted(iteration - 1)
             logger.log_session_end(iteration, reason="interrupted")
-            return messages
+            return messages, "interrupted"
         # Force a tool call only on the very first turn — kick-starts models that
         # would otherwise reply with chit-chat. After that, leave tool_choice="auto"
         # so a model that has finished can naturally return a text-only "done"
@@ -2061,7 +2181,13 @@ def _agent_loop(
             display.stream_end(False)
             display.print_interrupted(iteration)
             logger.log_session_end(iteration, reason="interrupted")
-            return messages
+            return messages, "interrupted"
+        if _signal == "fatal_conn":
+            # Retries exhausted on a dropping / unresponsive connection. The model
+            # is likely unreachable, so the caller may finish the work on a
+            # different model (see run_agent's fallback switch).
+            _end_reason = "connection_lost"
+            break
         if _signal == "fatal":
             _end_reason = "error"
             break
@@ -2283,7 +2409,7 @@ def _agent_loop(
         display.print_info(f"Reached max iterations ({MAX_ITERATIONS}).")
         display.print_done(iteration)  # unblock web UI — done event must always fire
         logger.log_session_end(iteration, reason="max_iterations")
-        return messages
+        return messages, "max_iterations"
 
     logger.log_session_end(iteration, reason=_end_reason)
-    return messages
+    return messages, _end_reason

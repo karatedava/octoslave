@@ -41,6 +41,7 @@ KNOWN_MODELS = [
     "qwen3-coder-30b",
     "qwen3-coder-next",
     "gpt-oss-120b",
+    "kimi-k3",
     "kimi-k2.7",
     "kimi-k2.6",
     "mistral-medium-3.5",
@@ -50,6 +51,7 @@ KNOWN_MODELS = [
     "glm-5",
     "glm-5.1",
     "glm-5.2",
+    "laguna-s2.1",
     "thinker",
     "coder",
     "agentic",
@@ -211,10 +213,57 @@ def resolve_debate_panel(available: list[str] | None, worker: str = "") -> list[
 def _model_family(model: str) -> str:
     """Coarse model-family key (vendor/series) for diversity checks."""
     m = (model or "").lower()
-    for fam in ("kimi", "glm", "deepseek", "qwen", "llama", "mistral", "gemma", "gpt"):
+    for fam in ("kimi", "glm", "deepseek", "qwen", "llama", "mistral", "gemma", "gpt", "laguna"):
         if fam in m:
             return fam
     return m.split("-")[0] if m else ""
+
+
+# Preferred families, in order, when swapping to a substitute model to finish
+# work the active model could no longer reach (persistent connection drops /
+# timeouts). A model from another family usually routes to a different backend
+# node — so it may be reachable when the first is not — and these three are the
+# strongest general-purpose coders on the default (e-INFRA) provider.
+FALLBACK_MODEL_FAMILIES: tuple[str, ...] = ("kimi", "glm", "deepseek")
+
+
+def pick_fallback_model(failed_model: str, available: list[str] | None) -> str | None:
+    """Choose a substitute model to continue work the active model could not
+    finish (e.g. after retries were exhausted on a dropping connection).
+
+    Preference order, drawn only from ``available`` (the active provider's live
+    models) and never returning ``failed_model``:
+      1. a DIFFERENT family, taken from kimi → glm → deepseek;
+      2. same preferred family as the failed model but a different build/id;
+      3. any other available model from a different family;
+      4. last resort: any available model that isn't the failed one.
+    Returns None when nothing usable is available.
+    """
+    avail = [m for m in (available or []) if m]
+    failed = (failed_model or "").strip()
+    avail = [m for m in avail if m != failed]
+    if not avail:
+        return None
+    failed_fam = _model_family(failed)
+
+    # 1. Preferred families, a different family first.
+    for fam in FALLBACK_MODEL_FAMILIES:
+        if fam == failed_fam:
+            continue
+        for m in avail:
+            if _model_family(m) == fam:
+                return m
+    # 2. Same preferred family as the failed model, different build.
+    if failed_fam in FALLBACK_MODEL_FAMILIES:
+        for m in avail:
+            if _model_family(m) == failed_fam:
+                return m
+    # 3. Any other family.
+    for m in avail:
+        if _model_family(m) != failed_fam:
+            return m
+    # 4. Anything that isn't the failed model.
+    return avail[0]
 
 
 # ---------------------------------------------------------------------------
@@ -230,11 +279,13 @@ def _model_family(model: str) -> str:
 
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "glm-4.7": 200_000,
+    "kimi-k3": 1_000_000,   # k3 ships a ~1M window (k2.x is 256K, the family default)
 }
 
 FAMILY_CONTEXT_WINDOWS: dict[str, int] = {
     "kimi":     256_000,
     "glm":      1_000_000,
+    "laguna":   1_000_000,   # laguna-s2.x ships a ~1M window (like GLM 5.x)
     "deepseek": 128_000,
     "qwen":     256_000,
     "llama":    128_000,
@@ -245,41 +296,101 @@ FAMILY_CONTEXT_WINDOWS: dict[str, int] = {
 
 DEFAULT_CONTEXT_WINDOW = 128_000
 
-# Fields an OpenAI-compatible /v1/models entry may use to advertise its window.
+# Field names an OpenAI-compatible /v1/models entry may use to advertise its
+# window. Providers vary: OpenAI/e-INFRA omit it, OpenRouter/together use
+# context_length, vLLM uses max_model_len, TGI/HF surface max_sequence_length /
+# max_position_embeddings / n_ctx. We accept them all so any advertising gateway
+# is auto-detected on switch — no per-provider code.
 _WINDOW_FIELDS = (
     "context_length", "max_model_len", "max_context_length",
-    "max_input_tokens", "context_window",
+    "max_input_tokens", "context_window", "max_context_window_tokens",
+    "max_sequence_length", "context_size", "n_ctx", "max_position_embeddings",
+)
+
+# Substring patterns for models whose window differs from their family default,
+# matched (lowercased) AFTER an exact-id override and BEFORE the family map. This
+# is what makes provider-PREFIXED ids resolve correctly — e.g. NIM's
+# 'meta/llama-4-maverick-17b-128e-instruct' never matches an exact key or the
+# base 'llama' family window (128K), but does contain 'llama-4'. First match
+# wins, so order most-specific first.
+PATTERN_CONTEXT_WINDOWS: tuple[tuple[str, int], ...] = (
+    ("llama-4", 1_000_000),   # Llama 4 Scout/Maverick — ~1M+ (llama-3.x is 128K)
+    ("llama4",  1_000_000),
 )
 
 
 def parse_model_windows(models_payload: dict) -> dict[str, int]:
     """Extract ``{model_id: context_window}`` from a /v1/models JSON payload.
 
-    Tolerant of gateways that omit the window (the entry is simply absent) and
-    of the several field names providers use for it (see _WINDOW_FIELDS)."""
+    Provider-agnostic: tolerant of gateways that omit the window (entry absent),
+    of the several field names providers use (see _WINDOW_FIELDS), of a numeric
+    string or float value, and of the field being nested one level under a
+    ``meta``/``config``/``model_info`` object (TGI/vLLM/HF style)."""
+    def _pluck(d: dict) -> int | None:
+        for f in _WINDOW_FIELDS:
+            v = d.get(f)
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)) and v > 0:
+                return int(v)
+            if isinstance(v, str) and v.strip().isdigit() and int(v) > 0:
+                return int(v)
+        return None
+
     out: dict[str, int] = {}
     for m in (models_payload or {}).get("data", []):
+        if not isinstance(m, dict):
+            continue
         mid = m.get("id")
         if not mid:
             continue
-        for f in _WINDOW_FIELDS:
-            v = m.get(f)
-            if isinstance(v, int) and v > 0:
-                out[mid] = v
-                break
+        win = _pluck(m)
+        if win is None:
+            for nested in ("meta", "config", "model_info"):
+                sub = m.get(nested)
+                if isinstance(sub, dict):
+                    win = _pluck(sub)
+                    if win:
+                        break
+        if win:
+            out[mid] = win
     return out
 
 
-def resolve_context_window(model: str, live: dict[str, int] | None = None) -> int:
-    """Best-known context window (tokens) for a non-local model.
+def configured_model_window(model: str, cfg: dict | None = None) -> int | None:
+    """Manual per-model context window (tokens) from config
+    ``model_context_windows`` (``{model_id: tokens}``), or None. Lets a user pin
+    the real window for a model the gateway doesn't advertise and the family map
+    doesn't know yet (e.g. a brand-new kimi/glm build) — no code change needed."""
+    if cfg is None:
+        cfg = load_config()
+    m = cfg.get("model_context_windows") or {}
+    if not isinstance(m, dict):
+        return None
+    val = m.get(model) or m.get((model or "").lower())
+    try:
+        return int(val) if val and int(val) > 0 else None
+    except (TypeError, ValueError):
+        return None
 
-    Priority: the live catalog value (from parse_model_windows), then an exact
-    model-id override, then the family default, then DEFAULT_CONTEXT_WINDOW."""
+
+def resolve_context_window(model: str, live: dict[str, int] | None = None) -> int:
+    """Best-known context window (tokens) for a non-local model, on ANY provider.
+
+    Priority: live catalog value (parse_model_windows) → exact model-id override
+    → substring pattern (PATTERN_CONTEXT_WINDOWS; handles provider-prefixed ids)
+    → family default → DEFAULT_CONTEXT_WINDOW. A per-provider manual override, if
+    configured, is applied by the caller (agent._remote_model_window) ABOVE all of
+    these, for exotic providers that neither advertise a window nor match a
+    family."""
     if live and live.get(model):
         return live[model]
     m = (model or "").lower()
     if m in MODEL_CONTEXT_WINDOWS:
         return MODEL_CONTEXT_WINDOWS[m]
+    for pat, win in PATTERN_CONTEXT_WINDOWS:
+        if pat in m:
+            return win
     fam = _model_family(model)
     if fam in FAMILY_CONTEXT_WINDOWS:
         return FAMILY_CONTEXT_WINDOWS[fam]
@@ -659,6 +770,11 @@ def load_config() -> dict:
         # value caps the auto-sized budget — handy to bound latency/cost on a huge
         # window. Local Ollama backends ignore this (they auto-size natively).
         "soft_context_tokens": 0,
+        # Optional per-model context windows (tokens), {model_id: tokens}. Overrides
+        # the live catalog + family map for a model the gateway doesn't advertise
+        # and the built-in map doesn't know (e.g. a new kimi/glm build). Empty = use
+        # auto-detection. Highest priority in agent._remote_model_window.
+        "model_context_windows": {},
         "nim_api_key": "",
         "nim_url": NIM_BASE_URL,
         "role_models_einfra": {},
@@ -843,7 +959,16 @@ def _normalize_provider(p: dict) -> dict:
     models = p.get("models") or []
     if isinstance(models, str):
         models = [m.strip() for m in models.split(",") if m.strip()]
-    return {
+    # Optional manual context window (tokens). For providers that don't advertise
+    # a window in /v1/models and whose model ids don't match a known family, this
+    # lets the user pin the real window so the budget auto-sizes correctly. 0 /
+    # absent / invalid → omitted (auto-detect/family fallback applies).
+    cw_raw = p.get("context_window")
+    try:
+        context_window = int(cw_raw) if cw_raw not in (None, "", 0, "0") else 0
+    except (TypeError, ValueError):
+        context_window = 0
+    out = {
         "id": pid,
         "name": name,
         "base_url": base_url,
@@ -851,6 +976,29 @@ def _normalize_provider(p: dict) -> dict:
         "default_model": default_model,
         "models": list(models),
     }
+    if context_window > 0:
+        out["context_window"] = context_window
+    return out
+
+
+def provider_window_override(base_url: str, cfg: dict | None = None) -> int | None:
+    """Manual context-window override (tokens) configured for the provider that
+    serves ``base_url``, or None. Lets a custom provider that doesn't advertise a
+    window (and doesn't match a known family) still size its budget correctly.
+    Matched by normalized base_url so it works regardless of the active-backend id."""
+    if not base_url:
+        return None
+    if cfg is None:
+        cfg = load_config()
+    target = base_url.rstrip("/")
+    for p in (cfg.get("custom_providers") or []):
+        if (p.get("base_url") or "").rstrip("/") == target:
+            cw = p.get("context_window")
+            try:
+                return int(cw) if cw and int(cw) > 0 else None
+            except (TypeError, ValueError):
+                return None
+    return None
 
 
 def get_custom_providers(cfg: dict | None = None) -> list[dict]:
@@ -974,6 +1122,83 @@ def get_remote(cfg: dict | None, remote_id: str) -> dict | None:
         if r.get("id") == remote_id:
             return r
     return None
+
+
+def remote_awareness_note(active: dict | None = None, cfg: dict | None = None,
+                          job_submission: bool = False) -> str:
+    """A short prompt block making an agent aware of configured SSH remote compute
+    targets. Empty when nothing is configured and none is active, so callers can
+    append it unconditionally.
+
+    Two framings:
+      - ``job_submission=True`` (hybrid compute-node model, e.g. Science): the
+        agent runs LOCALLY by default and offloads only HEAVY jobs to a node via
+        submit_cluster_job, then fetches lightweight results back to render — big
+        data stays on the node. This is the default recommended model.
+      - ``job_submission=False`` (whole-session-remote): the agent's own tools are
+        already routed to ``active`` over SSH; it just runs heavy work there.
+
+    Either way the agent can only choose a node it knows exists — hence the list."""
+    if cfg is None:
+        cfg = load_config()
+    remotes = get_remotes(cfg)
+    if not remotes and not active:
+        return ""
+
+    def _label(r: dict) -> str:
+        host = r.get("host", "?")
+        user = r.get("user") or ""
+        return f"{r.get('id')} — {r.get('name') or r.get('id')} ({user + '@' if user else ''}{host})"
+
+    active_id = (active or {}).get("id")
+    lines = ["## Remote compute"]
+
+    if job_submission:
+        lines.append(
+            "You run LOCALLY by default — no compute node is required. Do lightweight "
+            "work (data wrangling, plotting, small analyses) locally so results render "
+            "immediately. Only when a step is genuinely HEAVY (large embeddings, model "
+            "training, big simulations, anything that would block for minutes or needs "
+            "a cluster) offload it to a configured compute node."
+        )
+        if remotes:
+            lines.append("Configured compute nodes:")
+            for r in remotes:
+                mark = "  ← this session's default node" if r.get("id") == active_id else ""
+                lines.append(f"- {_label(r)}{mark}")
+            lines.append(
+                "Workflow: submit_cluster_job(remote_id=…, command=…) to run the heavy "
+                "step on the node → check_cluster_job to poll it → when it finishes, "
+                "fetch_cluster_file the LIGHTWEIGHT result (a plot, a UMAP/embedding "
+                "projection, a small summary table) back to the local session, then "
+                "present_output it so the user sees it. Big files, models, and "
+                "intermediates STAY on the node — fetch only what the user should see. "
+                "With no node configured, just do it locally."
+            )
+        return "\n".join(lines)
+
+    if active:
+        lines.append(
+            f"Your shell (`bash`), background-process, and file tools are currently "
+            f"executing on the remote host '{active.get('name') or active.get('id')}' "
+            f"({active.get('host', '?')}) over SSH — not on the local machine."
+        )
+    if remotes:
+        lines.append(
+            "Configured remote compute targets available to this session"
+            + (" (the active one is marked)" if active else "") + ":"
+        )
+        for r in remotes:
+            mark = "  ← active" if r.get("id") == active_id else ""
+            lines.append(f"- {_label(r)}{mark}")
+        lines.append(
+            "Use a remote for HEAVY or long-running computation — on the user's "
+            "request or your own judgement. Launch such work in the background "
+            "(`run_background`, or `sbatch`/`qsub`/`nohup … &` via `bash`) so it runs "
+            "on the remote node and the conversation keeps moving; poll it rather than "
+            "blocking. Keep light, interactive work local."
+        )
+    return "\n".join(lines)
 
 
 def add_remote(remote: dict) -> dict:

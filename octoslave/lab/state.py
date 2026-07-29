@@ -92,7 +92,9 @@ class AgentSpec:
 class LabSession:
     task: str
     working_dir: str
-    model: str = ""                          # default model for all roles (kimi-k2.7)
+    model: str = ""                          # Director model + default for agents
+    specialist_models: list = field(default_factory=list)  # pool the Director may
+    #                                          assign to specialists (empty = model)
     autonomous: bool = True                  # True = run without pausing at gates
     phase: str = LabPhase.INIT
     status: str = "idle"                     # idle | running | paused | complete | stopped
@@ -190,6 +192,7 @@ class LabSession:
             "task": self.task,
             "working_dir": self.working_dir,
             "model": self.model,
+            "specialist_models": self.specialist_models,
             "autonomous": self.autonomous,
             "phase": self.phase,
             "status": self.status,
@@ -260,6 +263,7 @@ class LabSession:
             return None
         sess = cls(task=d.get("task", ""), working_dir=working_dir)
         sess.model = d.get("model", "")
+        sess.specialist_models = d.get("specialist_models", []) or []
         sess.autonomous = d.get("autonomous", True)
         sess.phase = d.get("phase", LabPhase.INIT)
         sess.status = d.get("status", "idle")

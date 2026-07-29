@@ -38,6 +38,56 @@ def _emit(emit, event: dict):
             pass
 
 
+class _LabComputeSession:
+    """Adapter exposing a LabSession to the reused cluster-job tools (which expect
+    a session with working_dir / remote_id / a job store / a local log dir). Lets
+    the Lab offload HEAVY jobs to a compute node exactly like Science, while the
+    lab itself stays local. Jobs are tracked in-memory for the run."""
+
+    def __init__(self, lab_session: LabSession, remote_id: str):
+        self.working_dir = lab_session.working_dir
+        self.remote_id = remote_id or ""
+        self.jobs: list = []
+        self.science_dir = Path(lab_session.working_dir) / "lab"
+
+    def add_job(self, job):
+        self.jobs.append(job)
+        return job
+
+    def get_job(self, jid):
+        return next((j for j in self.jobs if j.id == jid), None)
+
+    def save(self):
+        pass
+
+
+def _enable_compute_node(session: LabSession, remote: dict | None, emit):
+    """If a compute node is selected, register the cluster-job tools and point the
+    thread-local compute context at this lab run. Returns True when enabled."""
+    if not remote:
+        return False
+    from ..science import tools as _sci
+    _sci.set_compute_context(_LabComputeSession(session, remote.get("id", "")), emit)
+    _sci.register_cluster_tools()
+    display.print_info(
+        f"  🖥 compute node: {remote.get('name') or remote.get('id')} "
+        f"({remote.get('host', '?')}) — heavy jobs offload here; lightweight "
+        f"results are fetched back and kept local"
+    )
+    return True
+
+
+def _disable_compute_node(enabled: bool):
+    if not enabled:
+        return
+    try:
+        from ..science import tools as _sci
+        _sci.unregister_cluster_tools()
+        _sci.clear_compute_context()
+    except Exception:
+        pass
+
+
 # --- step-mode approval gate -------------------------------------------------
 # The web layer resolves these via resolve_lab_approval(session, action).
 
@@ -429,11 +479,16 @@ def run_lab(
     session: LabSession | None = None,
     enable_foundry: bool = True,
     orient_first: bool = True,
+    remote: dict | None = None,
 ) -> LabSession:
     """Run the full autonomous lab loop. Returns the final LabSession.
 
     A pre-built ``session`` may be passed in (the web layer does this so live
-    injections / approvals reach the same object the loop uses)."""
+    injections / approvals reach the same object the loop uses). When ``remote``
+    is set, the whole lab — Director orientation and every specialist's shell /
+    file / background tools — runs on that SSH host (heavy computation offloads to
+    the remote node); the loop is single-threaded so the thread-local routing is
+    inherited by all agents."""
     cfg = load_config()
     model = model or cfg.get("default_model") or DEFAULT_MODEL
     emit = emit or display.get_event_callback()
@@ -476,8 +531,17 @@ def run_lab(
         session.touch()
         _emit(emit, {"type": "lab_phase", "phase": p, "round": session.round})
 
+    # Hybrid compute-node model: the lab runs LOCALLY by default. When a node is
+    # selected, agents get the cluster-job tools to offload HEAVY steps to it
+    # (big files stay on the node; lightweight results are fetched back) — the
+    # lab's own file/report work stays local so outputs render here. Registered
+    # BEFORE assemble_team so the Director can grant the tools; torn down in the
+    # finally. Single-threaded loop → the thread-local compute context is inherited.
+    _compute_on = _enable_compute_node(session, remote, emit)
+
     _emit(emit, {"type": "lab_start", "task": task, "working_dir": working_dir,
-                 "model": model, "autonomous": autonomous})
+                 "model": model, "autonomous": autonomous,
+                 "remote": (remote.get("name") or remote.get("id")) if remote else None})
     display.print_info(f"\n🧬 Lab starting — {task}\n")
 
     try:
@@ -562,6 +626,8 @@ def run_lab(
         display.print_error(f"Lab error: {exc}")
         _emit(emit, {"type": "error", "text": f"Lab error: {exc}"})
         return _finish(session, emit, stopped=True)
+    finally:
+        _disable_compute_node(_compute_on)
 
 
 def continue_lab(
@@ -573,12 +639,14 @@ def continue_lab(
     emit=None,
     max_followup_rounds: int = 2,
     session: LabSession | None = None,
+    remote: dict | None = None,
 ) -> LabSession:
     """Resume a COMPLETED lab to act on human follow-up feedback.
 
     The Director classifies the feedback: a small report change re-runs only the
     reporter; substantive feedback runs a bounded set of implementation/review
-    rounds and then regenerates the report. Reuses the same engine as run_lab."""
+    rounds and then regenerates the report. Reuses the same engine as run_lab.
+    ``remote`` routes all tool calls to an SSH host (as in run_lab)."""
     cfg = load_config()
     model = model or cfg.get("default_model") or DEFAULT_MODEL
     emit = emit or display.get_event_callback()
@@ -597,6 +665,8 @@ def continue_lab(
         _foundry.enable(session, client, model, emit=emit)
     except Exception:
         pass
+
+    _compute_on = _enable_compute_node(session, remote, emit)
 
     _emit(emit, {"type": "lab_start", "task": session.task, "working_dir": working_dir,
                  "model": model, "autonomous": session.autonomous, "followup": True})
@@ -638,6 +708,8 @@ def continue_lab(
         display.print_error(f"Lab follow-up error: {exc}")
         _emit(emit, {"type": "error", "text": f"Lab follow-up error: {exc}"})
         return _finish(session, emit, stopped=True)
+    finally:
+        _disable_compute_node(_compute_on)
 
 
 def _finish(session: LabSession, emit, stopped: bool) -> LabSession:

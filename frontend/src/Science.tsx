@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { LabSocket } from "./ws";
 import { Nav } from "./Nav";
+import { ModelPicker } from "./ModelPicker";
 
 type Role = "user" | "assistant" | "note";
 type Artifact = {
@@ -51,6 +52,11 @@ export default function Science() {
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [showSessions, setShowSessions] = useState(false);
   const [remoteRunning, setRemoteRunning] = useState(false);
+  const [remotes, setRemotes] = useState<{ id: string; name?: string; host?: string }[]>([]);
+  const [remoteId, setRemoteId] = useState("");
+  const [models, setModels] = useState<string[]>([]);
+  const [orchModel, setOrchModel] = useState("");
+  const [pool, setPool] = useState<string[]>([]);
   const [todos, setTodos] = useState<{ content: string; status: string }[]>([]);
   const [showPlan, setShowPlan] = useState(true);
 
@@ -92,6 +98,21 @@ export default function Science() {
   useEffect(() => {
     scrollRef.current?.scrollTo(0, scrollRef.current.scrollHeight);
   }, [feed, live]);
+
+  useEffect(() => {
+    fetch("/api/remotes")
+      .then((r) => r.json())
+      .then((d) => setRemotes(Array.isArray(d.remotes) ? d.remotes : []))
+      .catch(() => {});
+    fetch("/api/models")
+      .then((r) => r.json())
+      .then((d) => {
+        const ms: string[] = Array.isArray(d.models) ? d.models : [];
+        setModels(ms);
+        setOrchModel(d.default && ms.includes(d.default) ? d.default : ms[0] || "");
+      })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     sock.onOpen(() => setConnected(true));
@@ -299,7 +320,7 @@ export default function Science() {
   function sendMessage(text: string) {
     if (!text.trim() || running) return;
     setRunning(true);
-    sock.send({ type: "science_message", message: text, working_dir: workingDir });
+    sock.send({ type: "science_message", message: text, working_dir: workingDir, remote_id: remoteId || null, model: orchModel || undefined, specialist_models: pool });
   }
   function onSend() {
     const t = input.trim();
@@ -313,7 +334,7 @@ export default function Science() {
   function comment(artId: string, text: string) {
     if (!text.trim() || running) return;
     setRunning(true);
-    sock.send({ type: "science_comment", artifact_id: artId, text, working_dir: workingDir });
+    sock.send({ type: "science_comment", artifact_id: artId, text, working_dir: workingDir, remote_id: remoteId || null });
   }
   function focusArtifact(id: string) {
     const el = document.getElementById("sciart-" + id);
@@ -378,6 +399,29 @@ export default function Science() {
               value={goal}
               onChange={(e) => setGoal(e.target.value)}
             />
+            <ModelPicker
+              models={models} orchLabel="Orchestrator model"
+              orchModel={orchModel} setOrchModel={setOrchModel}
+              pool={pool} setPool={setPool}
+            />
+            {remotes.length > 0 && (
+              <>
+                <label>Compute node (optional)</label>
+                <select value={remoteId} onChange={(e) => setRemoteId(e.target.value)}>
+                  <option value="">Local only</option>
+                  {remotes.map((r) => (
+                    <option key={r.id} value={r.id}>
+                      {(r.name || r.id) + (r.host ? ` (${r.host})` : "")}
+                    </option>
+                  ))}
+                </select>
+                <div className="muted" style={{ fontSize: "0.8em", marginTop: 4 }}>
+                  Everything runs locally by default. Pick a node and the agent offloads
+                  only HEAVY steps (embeddings, large sims) to it — big files stay there,
+                  lightweight results (plots, projections) are fetched back and rendered here.
+                </div>
+              </>
+            )}
             <button className="btn primary big" onClick={() => openSession(workingDir, goal)}
               disabled={!connected || !workingDir.trim()}>
               {connected ? "Open session" : "Connecting…"}

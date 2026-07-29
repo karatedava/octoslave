@@ -416,6 +416,10 @@
             <label>Known models <span class="provider-hint">(comma-separated, optional — used if /v1/models is unavailable)</span></label>
             <input type="text" id="prov-models" placeholder="gpt-4o, gpt-4o-mini" autocomplete="off">
           </div>
+          <div class="settings-field">
+            <label>Context window <span class="provider-hint">(tokens, optional — only if the provider doesn't advertise one; blank = auto-detect)</span></label>
+            <input type="number" id="prov-context-window" placeholder="e.g. 131072" min="0" step="1024" autocomplete="off">
+          </div>
           <div class="provider-form-actions">
             <button class="btn-secondary btn-sm" id="prov-test-btn" type="button">Test connection</button>
             <button class="btn-primary btn-sm" id="prov-save-btn" type="button">Save provider</button>

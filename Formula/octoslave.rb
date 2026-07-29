@@ -59,6 +59,8 @@ class Octoslave < Formula
 
   test do
     assert_match "OctoSlave", shell_output("#{bin}/ots --help")
-    assert_match "0.2.0",     shell_output("#{bin}/ots --version 2>/dev/null || true")
+    # Version-agnostic: assert a semver is printed, not a pinned number (which
+    # would rot on every release). The concrete version comes from `url` above.
+    assert_match(/\d+\.\d+\.\d+/, shell_output("#{bin}/ots --version 2>/dev/null || true"))
   end
 end
