@@ -28,6 +28,7 @@ from . import interrupt
 from .tools import TOOL_DEFINITIONS, execute_tool, all_tool_definitions, valid_tool_names, set_tool_profile
 from .config import (
     load_config,
+    constitution_enabled,
     OLLAMA_BASE_URL,
     DEFAULT_SOFT_CONTEXT_TOKENS,
     configured_model_window,
@@ -361,6 +362,24 @@ _COMPACT_SUMMARY_SYSTEM = (
 
 # Path to prompt profiles directory
 PROMPT_PROFILES_DIR = Path(__file__).parent / "prompt_profiles"
+
+# Optional compressed "constitution" (character/values) block, prepended to ANY
+# profile when enabled (config.json `constitution` / OCTOSLAVE_CONSTITUTION). It
+# lives OUTSIDE prompt_profiles/ on purpose so it never shows up as a selectable
+# profile — it's a layer, not a profile. Read lazily and cached.
+CONSTITUTION_FILE = Path(__file__).parent / "constitution.md"
+_CONSTITUTION_CACHE: str | None = None
+
+
+def _constitution_text() -> str:
+    """The constitution block text (cached), or '' if the file is missing."""
+    global _CONSTITUTION_CACHE
+    if _CONSTITUTION_CACHE is None:
+        try:
+            _CONSTITUTION_CACHE = CONSTITUTION_FILE.read_text().strip()
+        except OSError:
+            _CONSTITUTION_CACHE = ""
+    return _CONSTITUTION_CACHE
 
 # Per-thread runtime knobs, set once per run by configure_runtime() based on the
 # backend. Lets the context/tool helpers adapt to small local models WITHOUT
@@ -947,17 +966,21 @@ def delete_memory_insight(working_dir: str, query: str, max_remove: int = 3,
     return removed
 
 
-def load_system_prompt(profile: str = "base", working_dir: str = None) -> str:
+def load_system_prompt(profile: str = "base", working_dir: str = None,
+                       constitution: bool | None = None) -> str:
     """
     Load a system prompt from a profile file in the prompt_profiles directory.
-    
+
     Args:
         profile: Profile name without extension (e.g., "base" or "simple")
         working_dir: Current working directory to substitute in the prompt
-    
+        constitution: Whether to prepend the compressed constitution (character/
+            values) block. None (default) resolves the toggle from config.json /
+            OCTOSLAVE_CONSTITUTION; pass True/False to force it (e.g. for an A/B).
+
     Returns:
         The system prompt string with working_dir and date substituted
-    
+
     Raises:
         FileNotFoundError: If the profile file doesn't exist
     """
@@ -995,7 +1018,23 @@ def load_system_prompt(profile: str = "base", working_dir: str = None) -> str:
 
     # Substitute placeholders
     wd = working_dir or Path.cwd().resolve()
-    return content.format(working_dir=wd, date=date.today().isoformat())
+    prompt = content.format(working_dir=wd, date=date.today().isoformat())
+
+    # Optionally splice in the constitution (character/values) layer. Done AFTER
+    # formatting so the block never needs brace-escaping. Placed just before the
+    # first "## " section so the identity opener + working-dir/date context stay
+    # at the very top, then "who you are", then the procedural "how to work"
+    # sections. Falls back to appending if the profile has no such heading.
+    if constitution is None:
+        constitution = constitution_enabled()
+    block = _constitution_text() if constitution else ""
+    if block:
+        marker = prompt.find("\n## ")
+        if marker != -1:
+            prompt = prompt[:marker + 1] + block + "\n\n" + prompt[marker + 1:]
+        else:
+            prompt = prompt.rstrip() + "\n\n" + block + "\n"
+    return prompt
 
 
 # Substrings that, when present in a provider error string, mean "you sent too
@@ -1590,6 +1629,56 @@ def _orientation_phase(
     return messages
 
 
+def _assess_task_approach(task: str, system_prompt: str, client: OpenAI, model: str) -> str:
+    """Let the AGENT ITSELF judge, up front, how much preparation the task needs,
+    and return one of:
+
+      "act"  — do it directly now; no orientation, no plan (small, well-specified:
+               kill/restart a process, run a given command, show/inspect something,
+               a one-line or single-file edit, a git op, answer a question).
+      "look" — glance at a few files to get grounded first, but no written plan.
+      "plan" — explore the workspace AND write a plan (multi-step / unknowns:
+               implement, refactor, debug, analyze, build a deliverable).
+
+    The assessment is made in the agent's OWN voice — its real system prompt is
+    the system message, so the same persona that will do the work decides its
+    approach (rather than a separate mechanical classifier). Biased toward "plan"
+    when unsure or on a dropped response, so complex work never loses its
+    preparation. Long tasks skip the assessment call and plan outright.
+    Overridable: OCTOSLAVE_ALWAYS_PLAN=1 forces full planning (old behaviour),
+    OCTOSLAVE_NEVER_PLAN=1 always acts directly."""
+    if (os.environ.get("OCTOSLAVE_ALWAYS_PLAN") or "").lower() in ("1", "true", "yes"):
+        return "plan"
+    if (os.environ.get("OCTOSLAVE_NEVER_PLAN") or "").lower() in ("1", "true", "yes"):
+        return "act"
+    # Obviously substantial — don't spend an assessment call, just plan.
+    if len(task) > 600 or task.count("\n") >= 4:
+        return "plan"
+    assess = (
+        "Before you start, assess how much preparation THIS task needs. You already "
+        "have full tool access (shell, file read/write/edit, search, web) and can "
+        "look at anything you need WHILE working. Reply with exactly one word:\n"
+        "  ACT  — you can just do it now; it's small and well-specified (kill/restart "
+        "a process, run a given command, show/inspect something, a one-line or "
+        "single-file edit, a git command, answer a question). No exploration or plan.\n"
+        "  LOOK — glance at a few files to orient yourself first, but it does not need "
+        "a written multi-step plan.\n"
+        "  PLAN — it is multi-step or has unknowns and benefits from exploring the "
+        "workspace and writing a plan first (implement, refactor, debug an unknown "
+        "failure, analyze data, build a multi-part deliverable).\n"
+        "When unsure, choose PLAN. Answer with one word: ACT, LOOK, or PLAN."
+    )
+    raw = _simple_completion(client, model, [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"Task:\n{task}\n\n{assess}"},
+    ], max_tokens=8).strip().upper()
+    if raw.startswith("ACT"):
+        return "act"
+    if raw.startswith("LOOK"):
+        return "look"
+    return "plan"  # PLAN, empty, or anything unrecognized → the safe, thorough path
+
+
 def _planning_step(
     task: str,
     system_prompt: str,
@@ -1888,10 +1977,22 @@ def run_agent(
     # ~900 tokens of an already-tiny context window on a plan small models follow
     # poorly. They plan inline in the main loop instead.
     if enable_plan and not is_local:
-        messages, plan_text = _planning_step(task, system_prompt, client, model, messages, working_dir, permission_mode)
-        if plan_text and plan_out is not None:
-            plan_out.append(plan_text)
-            logger.log_plan(plan_text)
+        # The agent judges its own approach up front, then only pays for the
+        # preparation the task actually needs: ACT (do it now), LOOK (a quick
+        # look, no written plan), or PLAN (full orient + plan). A direct action
+        # ("kill the app on port 6969") no longer eats a pile of irrelevant file
+        # reads and a plan it doesn't need, while complex work is fully planned.
+        approach = _assess_task_approach(task, system_prompt, client, model)
+        if approach == "act":
+            display.print_info("Direct task — acting now (no orientation or planning).")
+        elif approach == "look":
+            display.print_info("Focused task — a quick look first, no written plan.")
+            messages = _orientation_phase(client, model, messages, working_dir, permission_mode)
+        else:  # "plan"
+            messages, plan_text = _planning_step(task, system_prompt, client, model, messages, working_dir, permission_mode)
+            if plan_text and plan_out is not None:
+                plan_out.append(plan_text)
+                logger.log_plan(plan_text)
     elif enable_plan and is_local:
         display.print_info("Local model: skipping separate planning step (plans inline).")
 

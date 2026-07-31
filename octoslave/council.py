@@ -234,10 +234,18 @@ def _verifier_gate_completion(
         "Reply with EXACTLY one of:\n"
         "  DONE\n"
         "  REVISE: <the single most important thing still missing or wrong>\n"
-        "Only say DONE if the task's deliverable was actually produced and verified "
-        "THIS session. Pre-existing files, or the worker's assertion that something "
-        "'already works', are NOT evidence — if the task asks to build, run, test, "
-        "fix, or produce something and none of that happened, answer REVISE.\n"
+        "Grade the END STATE against the task, not which session produced it. Say DONE "
+        "if the task's deliverable now EXISTS and demonstrably satisfies the task — "
+        "INCLUDING when it was produced in an earlier session — as long as the "
+        "transcript actually confirms that state (the worker READ the files and their "
+        "contents meet the requirements, or ran/tested them and they pass). Do NOT "
+        "force the worker to redo edits that are already present and correct: re-doing "
+        "already-correct work is waste, not completion.\n"
+        "But an UNVERIFIED claim is NOT completion: a bare assertion that something "
+        "'already works' or 'was done before', with nothing in the transcript showing "
+        "the deliverable actually meets the task, is not enough — answer REVISE and "
+        "tell the worker to CONFIRM the real state (read / run / test it), not to "
+        "blindly redo it.\n"
         "Grade the WHOLE task, not part of it. If the task (or the plan above) has "
         "several parts or steps and only SOME are done, answer REVISE and name the "
         "first unfinished part — partial progress is NOT completion.\n"
@@ -708,26 +716,31 @@ def _council_loop(
                 continue
 
             # A completion claim with zero state-changing work is usually premature:
-            # the worker only inspected existing files (read/grep/list) and assumed
-            # the task was already satisfied. Push back ONCE to make it actually
-            # perform & verify the task this session before we trust "done". Bounded
-            # (one nudge) so a genuine read-only / answer-only task can still finish —
-            # the verifier gate below, now told nothing was produced, makes the call.
+            # the worker only inspected existing files (read/grep/list) and ASSUMED
+            # the task was already satisfied. Push back ONCE — but ask it to CONFIRM
+            # the end state, not to blindly redo work. If the deliverable already
+            # exists and demonstrably meets the task (e.g. a resumed session), citing
+            # that evidence is completion; only genuinely-missing work must be done.
+            # Bounded (one nudge) so a genuine read-only / answer-only task, or an
+            # already-satisfied deliverable, can still finish — the verifier gate
+            # below makes the final call.
             if work_actions == 0 and not nudged_no_work:
                 nudged_no_work = True
                 display.print_info(
-                    f"{_TAG['worker']} claims completion without doing any work — "
-                    f"directing it to actually execute and verify."
+                    f"{_TAG['worker']} claims completion without changing anything — "
+                    f"directing it to confirm the deliverable actually meets the task."
                 )
                 messages.append({"role": "user", "content": (
                     "You are claiming the task is done, but this session you have only INSPECTED "
-                    "files (reads/greps/lists) — you have not run, built, written, edited, produced, "
-                    "or verified anything. Pre-existing files do NOT prove the task is satisfied. "
-                    "Carry out the task now and verify it end-to-end: run the app/tests, produce or "
-                    "regenerate the required deliverable, and confirm it actually works (e.g. the "
-                    "report opens). Only report completion once you have concrete evidence from THIS "
-                    "session. If the task was genuinely only to read or answer, state that explicitly "
-                    "and give the answer."
+                    "files (reads/greps/lists) — you have not run, built, edited, or tested anything. "
+                    "A pre-existing file only counts if you CONFIRM it actually satisfies the task. "
+                    "Verify the END STATE now: check that the required deliverable exists and meets "
+                    "EVERY part of the task — read it and point to the specific content that satisfies "
+                    "each requirement, and run the app/tests if the task involves running or producing "
+                    "something. If it ALREADY fully meets the task, say so and cite that evidence — do "
+                    "NOT redo, rewrite, or regenerate work that is already correct (that is wasted "
+                    "effort, not completion). Only carry out the parts that are genuinely missing or "
+                    "wrong. If the task was truly only to read or answer, state that and give the answer."
                 )})
                 continue
 
@@ -774,9 +787,12 @@ def _council_loop(
             )
             if work_actions == 0:
                 evidence += (
-                    " It produced, changed, and ran NOTHING — it only inspected existing files. "
-                    "If the task requires building, running, testing, fixing, or producing anything, "
-                    "it is NOT complete."
+                    " It changed and ran NOTHING this session — it only inspected existing files. "
+                    "That is acceptable ONLY if those files already fully satisfy the task AND the "
+                    "inspection above confirms it (a resumed session whose deliverable already "
+                    "exists is complete — do not demand redundant re-writes). Otherwise, if the "
+                    "task requires building, running, testing, fixing, or producing something and "
+                    "the current files do not meet it, it is NOT complete."
                 )
             if bg_running:
                 evidence += (

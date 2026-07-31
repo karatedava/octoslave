@@ -285,7 +285,12 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
 FAMILY_CONTEXT_WINDOWS: dict[str, int] = {
     "kimi":     256_000,
     "glm":      1_000_000,
-    "laguna":   1_000_000,   # laguna-s2.x ships a ~1M window (like GLM 5.x)
+    # laguna-s2.x is spec'd at ~1M, but e-INFRA serves it with a much smaller
+    # max-model-len (empirically ~128K: a request overflowed at ~128K estimated
+    # tokens). Use the SERVED window so we don't over-commit the budget and eat a
+    # reactive-overflow round-trip every session. If a deployment serves more,
+    # the live /v1/models value or a config `model_context_windows` override wins.
+    "laguna":   128_000,
     "deepseek": 128_000,
     "qwen":     256_000,
     "llama":    128_000,
@@ -756,6 +761,25 @@ def list_models(cfg: dict | None = None) -> list[str]:
     return live if live else list(KNOWN_MODELS)
 
 
+def _truthy(val) -> bool:
+    """Coerce a config/env value to bool. Accepts real bools, and the usual
+    string spellings ('1', 'true', 'yes', 'on') case-insensitively."""
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
+def constitution_enabled(cfg: dict | None = None) -> bool:
+    """Whether the compressed constitution (character/values) block should be
+    prepended to the system prompt. Resolved from OCTOSLAVE_CONSTITUTION (wins) or
+    the config.json ``constitution`` key. On unless explicitly disabled."""
+    if os.environ.get("OCTOSLAVE_CONSTITUTION"):
+        return _truthy(os.environ["OCTOSLAVE_CONSTITUTION"])
+    if cfg is None:
+        cfg = load_config()
+    return _truthy(cfg.get("constitution", True))
+
+
 def load_config() -> dict:
     config = {
         "api_key": "",
@@ -770,6 +794,12 @@ def load_config() -> dict:
         # value caps the auto-sized budget — handy to bound latency/cost on a huge
         # window. Local Ollama backends ignore this (they auto-size natively).
         "soft_context_tokens": 0,
+        # Prepend the compressed "constitution" (character/values) block to the
+        # system prompt of ANY prompt profile. ON by default. A dispositional
+        # layer on top of the procedural profile — makes the agent read intent,
+        # stay honest/calibrated, and be pleasant to work with. Disable in
+        # config.json ("constitution": false) or OCTOSLAVE_CONSTITUTION=0.
+        "constitution": True,
         # Optional per-model context windows (tokens), {model_id: tokens}. Overrides
         # the live catalog + family map for a model the gateway doesn't advertise
         # and the built-in map doesn't know (e.g. a new kimi/glm build). Empty = use
@@ -806,6 +836,8 @@ def load_config() -> dict:
             config["soft_context_tokens"] = int(os.environ["OCTOSLAVE_SOFT_CONTEXT_TOKENS"])
         except ValueError:
             pass
+    if os.environ.get("OCTOSLAVE_CONSTITUTION"):
+        config["constitution"] = _truthy(os.environ["OCTOSLAVE_CONSTITUTION"])
 
     if CONFIG_FILE.exists():
         try:
@@ -830,6 +862,9 @@ def load_config() -> dict:
                     config["soft_context_tokens"] = int(saved["soft_context_tokens"])
                 except (ValueError, TypeError):
                     pass
+            # Constitution toggle — bool, env var wins over the file value.
+            if not os.environ.get("OCTOSLAVE_CONSTITUTION") and "constitution" in saved:
+                config["constitution"] = _truthy(saved["constitution"])
             # Custom providers list — only loaded from file
             providers = saved.get("custom_providers")
             if isinstance(providers, list):

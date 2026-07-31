@@ -17,6 +17,7 @@ block_cipher = None
 
 datas = [
     (str(OCTOSLAVE_PKG / "prompt_profiles"), "octoslave/prompt_profiles"),
+    (str(OCTOSLAVE_PKG / "constitution.md"), "octoslave"),
     (str(OCTOSLAVE_PKG / "web" / "static"),  "octoslave/web/static"),
     (str(OCTOSLAVE_PKG / "web" / "lab_static"), "octoslave/web/lab_static"),
 ]

@@ -19,7 +19,7 @@
 
 OctoSlave is an autonomous agent for scientists and engineers. Give it a task or a research
 topic — it explores the web, writes and runs code, debugs, evaluates, and iterates until the
-job is done. It runs on cloud models (e-INFRA CZ / NVIDIA NIM) or fully offline via Ollama.
+job is done. It runs on cloud models (e-INFRA CZ / NVIDIA NIM / Any custom provider) or fully offline via Ollama.
 
 **Modes**
 
@@ -27,8 +27,20 @@ job is done. It runs on cloud models (e-INFRA CZ / NVIDIA NIM) or fully offline 
 - **One-shot** (`ots run "..."`) — run a task and exit, or stay interactive with `-i`
 - **Parallel agents** (`--parallel N`) — N agents on one task; a Judge / vote / Merger picks the result
 - **Autonomous Lab** (`/long-research`, or the web UI at `/lab`) — a Director assembles a custom team of specialists for your problem, a Critic vets the plan, and they research/build over multiple rounds with live human steering → self-contained HTML report
-- **Vault improve** (`ots vault-improve`) — note-by-note improvement of an Obsidian / markdown vault
-- **Batch** (`ots batch tasks.txt`) — run a list of tasks with resume support
+
+---
+
+## Quick Overview
+
+A visual walk-through of everything OctoSlave can do — capabilities, usage, model selection, and modes — rendered as a self-contained HTML report:
+
+<div align="center">
+<a href="docs/OctoSlave_Capabilities_Report.html">
+  <img src="assets/webui_main.png" alt="OctoSlave Capabilities Report" width="600">
+</a>
+</div>
+
+[📖 View the full Capabilities Report](docs/OctoSlave_Capabilities_Report.html)
 
 ---
 
@@ -37,6 +49,7 @@ job is done. It runs on cloud models (e-INFRA CZ / NVIDIA NIM) or fully offline 
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Highlights](#highlights)
+- [Quick Overview](#quick-overview)
 - [Commands](#commands)
 - [Backends and models](#backends-and-models)
 - [Modes in depth](#modes-in-depth)
@@ -515,10 +528,16 @@ Precedence: **environment variable** → `~/.octoslave/config.json` → built-in
 | `OCTOSLAVE_OLLAMA_URL` | Ollama base URL (default `http://localhost:11434/v1`) |
 | `OCTOSLAVE_MODEL` / `OCTOSLAVE_BACKEND` | Default model / backend (`einfra` / `ollama` / `nim`) |
 | `OCTOSLAVE_PERMISSION_MODE` | `autonomous` / `controlled` / `supervised` |
+| `OCTOSLAVE_CONSTITUTION` | Constitution layer: `1`/`0` (default on; config key `constitution`) |
 
 **Permission modes:** `autonomous` (default, no prompts), `controlled` (ask before any
 modifying action), `supervised` (ask before file edits only). See
 [docs/PERMISSION_MODE.md](docs/PERMISSION_MODE.md).
+
+**Constitution:** a compact character/values layer prepended to the system prompt of
+every profile — the agent stays honest and calibrated, reads intent over literal
+wording, and is warmer to work with. On by default; disable with
+`OCTOSLAVE_CONSTITUTION=0` or `"constitution": false` in `~/.octoslave/config.json`.
 
 **Prompt profiles:** `base` (default), `coder`, `analyst`, and `cryouncle` (a
 CryoSPARC-connected cryo-EM companion for structural biologists). Switch with
@@ -530,6 +549,7 @@ CryoSPARC-connected cryo-EM companion for structural biologists). Switch with
 
 | Doc | Contents |
 |-----|----------|
+| [docs/OctoSlave_Capabilities_Report.html](docs/OctoSlave_Capabilities_Report.html) | Visual advertisement report — capabilities, usage, model selection, modes |
 | [docs/IMPROVED_MODE.md](docs/IMPROVED_MODE.md) | Improved (council) mode — roles, coordinator, config |
 | [docs/USAGE.md](docs/USAGE.md) | Extended usage examples and install reference |
 | [docs/RESEARCH.md](docs/RESEARCH.md) | Long-research pipeline contract and per-role models |

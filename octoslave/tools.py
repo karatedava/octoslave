@@ -2,6 +2,7 @@ import atexit
 import json
 import os
 import posixpath
+import re
 import shutil
 import signal
 import subprocess
@@ -319,7 +320,9 @@ TOOL_DEFINITIONS = [
                 "Much cheaper than several edit_file calls when changing several regions "
                 "of the same file. Each old_string must be unique in the file when its "
                 "edit runs, unless that edit sets replace_all=true. Preserve indentation "
-                "and surrounding context exactly."
+                "and surrounding context exactly. Pass `edits` as a JSON ARRAY of objects "
+                '(e.g. [{"old_string": "...", "new_string": "..."}]) — not a string and '
+                "not a single object."
             ),
             "parameters": {
                 "type": "object",
@@ -848,8 +851,13 @@ def _remote_apply_patch(sess, path, edits, working_dir) -> tuple[str, bool]:
     rp = _remote_resolve(path, working_dir)
     if not sess.is_file(rp):
         return f"File not found: {path}", False
-    if not isinstance(edits, list) or not edits:
-        return "apply_patch requires a non-empty `edits` list of {old_string, new_string}.", False
+    edits = _coerce_edits(edits)  # idempotent when already a clean list
+    if not edits:
+        return (
+            "apply_patch got no usable edits. Pass `edits` as a JSON array of "
+            '{old_string, new_string} objects — e.g. edits=[{"old_string": "foo", '
+            '"new_string": "bar"}]. (file left UNCHANGED)'
+        ), False
     try:
         content = sess.read_text(rp)
     except Exception as e:
@@ -1033,6 +1041,7 @@ def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str =
     # working_dir into a real remote directory so every tool (bash, file ops,
     # cluster-job submission) resolves paths and `cd`s somewhere that exists.
     # No-op for local execution.
+    orig_working_dir = working_dir  # pre-remap, for a safe retry (see except below)
     if _remote() is not None:
         working_dir = _remote_cwd(working_dir)
 
@@ -1116,6 +1125,16 @@ def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str =
         else:
             return f"Unknown tool: {name}", False
     except TypeError as e:
+        # Some models hallucinate extra keyword args they've seen in OTHER agent
+        # frameworks (e.g. bash with description=/mode=, borrowed from Claude
+        # Code). Rather than hard-failing the call, strip the single offending
+        # kwarg and retry — the action still runs. Bounded: each retry removes one
+        # key that is actually present in args, so it converges. Re-enters with the
+        # ORIGINAL (pre-remap) working_dir so the remote path isn't remapped twice.
+        m = re.search(r"unexpected keyword argument '([^']+)'", str(e))
+        if m and m.group(1) in args:
+            cleaned = {k: v for k, v in args.items() if k != m.group(1)}
+            return execute_tool(name, cleaned, orig_working_dir, permission_mode)
         return f"Invalid arguments for {name}: {e}", False
     except Exception as e:
         return f"Tool error: {e}", False
@@ -1491,12 +1510,101 @@ def _edit_file(
     return f"Edited {path}", True
 
 
-def _apply_patch(path: str, edits: list, working_dir: str) -> tuple[str, bool]:
+# Field-name aliases models emit for an edit's two halves. apply_patch accepts
+# any of them so a slightly-off tool call still applies instead of hard-failing.
+_EDIT_OLD_KEYS = ("old_string", "oldString", "old", "oldText", "old_text",
+                  "search", "find", "before", "from")
+_EDIT_NEW_KEYS = ("new_string", "newString", "new", "newText", "new_text",
+                  "replace", "replacement", "after", "to")
+
+
+def _first_key(d: dict, keys):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return None
+
+
+def _coerce_one_edit(e):
+    """Normalize one edit-ish object to {old_string, new_string[, replace_all]},
+    or None if it carries no old/new text. Tolerates a JSON-encoded string and
+    alternate field names."""
+    if isinstance(e, str):
+        s = e.strip()
+        if not s:
+            return None
+        try:
+            e = json.loads(s)
+        except Exception:
+            return None
+    if not isinstance(e, dict):
+        return None
+    old = _first_key(e, _EDIT_OLD_KEYS)
+    new = _first_key(e, _EDIT_NEW_KEYS)
+    if old is None and new is None:
+        return None
+    norm = {"old_string": "" if old is None else str(old),
+            "new_string": "" if new is None else str(new)}
+    ra = e.get("replace_all", e.get("replaceAll"))
+    if ra is not None:
+        norm["replace_all"] = bool(ra)
+    return norm
+
+
+def _coerce_edits(edits, extra=None):
+    """Coerce the model's ``edits`` argument into a clean list[dict] of
+    {old_string, new_string[, replace_all]}.
+
+    Different models serialize the nested array in slightly different ways; this
+    accepts the common ones instead of rejecting the call with "requires a
+    non-empty edits list":
+      - a JSON-encoded STRING of the array (``"[{...}]"``),
+      - a single edit OBJECT (not wrapped in a list),
+      - an index-keyed dict (``{"0": {...}, "1": {...}}``),
+      - per-edit JSON strings, and alternate field names (old/new, search/
+        replace, before/after, …),
+      - a single top-level edit passed WITHOUT an ``edits`` wrapper (the model
+        called apply_patch like edit_file), recovered from ``extra``.
+    Returns [] when nothing usable is present.
+    """
+    if isinstance(edits, str):
+        s = edits.strip()
+        try:
+            edits = json.loads(s) if s else None
+        except Exception:
+            edits = None
+    if isinstance(edits, dict):
+        # index-keyed dict → ordered list; otherwise a single edit object
+        if edits and all(str(k).lstrip("-").isdigit() for k in edits):
+            edits = [edits[k] for k in sorted(edits, key=lambda x: int(x))]
+        else:
+            edits = [edits]
+    out: list[dict] = []
+    if isinstance(edits, list):
+        for e in edits:
+            ne = _coerce_one_edit(e)
+            if ne is not None:
+                out.append(ne)
+    # Fallbacks from top-level args when `edits` yielded nothing.
+    if not out and isinstance(extra, dict) and extra:
+        for k in ("patch", "changes", "edit", "hunks", "diffs"):
+            if k in extra:
+                return _coerce_edits(extra[k])
+        ne = _coerce_one_edit(extra)
+        if ne is not None:
+            out.append(ne)
+    return out
+
+
+def _apply_patch(path: str, edits=None, working_dir: str = "", **extra) -> tuple[str, bool]:
     """Apply several old→new string replacements to one file, atomically.
 
     The file is written only after every edit has matched, so a failure
-    mid-list leaves the file untouched.
+    mid-list leaves the file untouched. ``edits`` is normalized via
+    :func:`_coerce_edits` first, so a slightly-malformed tool call (stringified
+    array, single object, alt field names) still applies.
     """
+    edits = _coerce_edits(edits, extra)
     _sess = _remote()
     if _sess is not None:
         return _remote_apply_patch(_sess, path, edits, working_dir)
@@ -1505,8 +1613,12 @@ def _apply_patch(path: str, edits: list, working_dir: str) -> tuple[str, bool]:
         return f"File not found: {path}", False
     if not resolved.is_file():
         return f"Not a file: {path}", False
-    if not isinstance(edits, list) or not edits:
-        return "apply_patch requires a non-empty `edits` list of {old_string, new_string}.", False
+    if not edits:
+        return (
+            "apply_patch got no usable edits. Pass `edits` as a JSON array of "
+            '{old_string, new_string} objects — e.g. edits=[{"old_string": "foo", '
+            '"new_string": "bar"}] — not a string or a single object. (file left UNCHANGED)'
+        ), False
     if _is_binary(resolved):
         return f"Cannot edit binary file: {resolved.name}", False
 
@@ -1553,26 +1665,96 @@ def _apply_patch(path: str, edits: list, working_dir: str) -> tuple[str, bool]:
 _TODO_STORE: dict[str, list[dict]] = {}
 _VALID_TODO_STATUS = {"pending", "in_progress", "completed"}
 
+# Alt field names / status spellings models use for a checklist item, so a
+# slightly-off todo_write still populates the list instead of "no valid tasks".
+_TODO_CONTENT_KEYS = ("content", "task", "text", "title", "step", "name",
+                      "description", "todo", "item", "activity", "label")
+_TODO_STATUS_KEYS = ("status", "state")
+_TODO_STATUS_ALIASES = {
+    "done": "completed", "complete": "completed", "completed": "completed",
+    "finished": "completed", "closed": "completed", "resolved": "completed",
+    "in_progress": "in_progress", "inprogress": "in_progress",
+    "active": "in_progress", "doing": "in_progress", "working": "in_progress",
+    "started": "in_progress", "current": "in_progress", "wip": "in_progress",
+    "pending": "pending", "todo": "pending", "to_do": "pending",
+    "open": "pending", "not_started": "pending", "queued": "pending",
+    "planned": "pending", "new": "pending", "": "pending",
+}
+
+
+def _normalize_todo_status(s) -> str:
+    key = str(s or "").strip().lower().replace(" ", "_").replace("-", "_")
+    if key in _TODO_STATUS_ALIASES:
+        return _TODO_STATUS_ALIASES[key]
+    return key if key in _VALID_TODO_STATUS else "pending"
+
+
+def _coerce_todos(todos):
+    """Coerce the model's ``todos`` argument into a clean list[dict] of
+    {content, status}. Same tolerance as :func:`_coerce_edits`: accepts a
+    JSON-encoded string, a single object, an index-keyed dict, plain-string items
+    (``["step 1", "step 2"]`` → each becomes content with status 'pending'),
+    per-item JSON strings, alternate content keys (task/text/title/step/…) and
+    status spellings (done→completed, doing→in_progress, todo→pending, …).
+    Returns [] when nothing usable is present."""
+    if isinstance(todos, str):
+        s = todos.strip()
+        try:
+            todos = json.loads(s) if s else None
+        except Exception:
+            todos = None
+    if isinstance(todos, dict):
+        if todos and all(str(k).lstrip("-").isdigit() for k in todos):
+            todos = [todos[k] for k in sorted(todos, key=lambda x: int(x))]
+        else:
+            todos = [todos]
+    out: list[dict] = []
+    if isinstance(todos, list):
+        for t in todos:
+            if isinstance(t, str):
+                st = t.strip()
+                if not st:
+                    continue
+                # A string item may itself be a JSON object; else it's content.
+                if st[:1] in "{[":
+                    try:
+                        t = json.loads(st)
+                    except Exception:
+                        out.append({"content": st, "status": "pending"})
+                        continue
+                else:
+                    out.append({"content": st, "status": "pending"})
+                    continue
+            if not isinstance(t, dict):
+                continue
+            content = _first_key(t, _TODO_CONTENT_KEYS)
+            if content is None:
+                continue
+            content = str(content).strip()
+            if not content:
+                continue
+            status = _normalize_todo_status(_first_key(t, _TODO_STATUS_KEYS))
+            out.append({"content": content, "status": status})
+    return out
+
 
 def get_todos(working_dir: str) -> list[dict]:
     """Return the current task list for a working dir (used by the web UI)."""
     return list(_TODO_STORE.get(working_dir, []))
 
 
-def _todo_write(todos: list, working_dir: str) -> tuple[str, bool]:
-    if not isinstance(todos, list):
-        return "todo_write requires `todos` to be a list of {content, status} objects.", False
-    norm: list[dict] = []
-    for t in todos:
-        if not isinstance(t, dict):
-            continue
-        content = str(t.get("content", "")).strip()
-        if not content:
-            continue
-        status = t.get("status", "pending")
-        if status not in _VALID_TODO_STATUS:
-            status = "pending"
-        norm.append({"content": content, "status": status})
+def _todo_write(todos=None, working_dir: str = "", **extra) -> tuple[str, bool]:
+    norm = _coerce_todos(todos)
+    # Fallbacks when `todos` yielded nothing: an alt container key, or a single
+    # top-level {content, status} passed without a `todos` wrapper.
+    if not norm and extra:
+        for k in ("items", "tasks", "list", "todo", "checklist", "steps"):
+            if k in extra:
+                norm = _coerce_todos(extra[k])
+                if norm:
+                    break
+        if not norm:
+            norm = _coerce_todos(extra)
 
     if not norm:
         return "todo_write received no valid tasks (each needs `content` and `status`).", False

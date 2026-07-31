@@ -596,7 +596,19 @@ def _tool_summary(name: str, args: dict) -> str:
         return (url[:80] + "…") if len(url) > 80 else url
     if name == "apply_patch":
         edits = args.get("edits") or []
-        n = len(edits) if isinstance(edits, list) else 0
+        # Models sometimes send edits as a JSON-string or a single object; count
+        # those correctly too (the tool itself coerces them before applying).
+        if isinstance(edits, str):
+            try:
+                edits = json.loads(edits)
+            except Exception:
+                edits = []
+        if isinstance(edits, dict):
+            n = 1
+        elif isinstance(edits, list):
+            n = len(edits)
+        else:
+            n = 0
         return f"{args.get('path', '')}  ({n} edit{'s' if n != 1 else ''})"
     if name == "todo_write":
         todos = args.get("todos") or []
