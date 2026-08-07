@@ -409,13 +409,51 @@ async def list_remotes():
 
 
 # Substrings marking non-chat models (embeddings/rerankers/audio) to hide from the
-# model pickers. Covers the common embedding families whose ids don't contain
-# "embed" (e5, bge, gte, jina, …) so they don't leak into the specialist pool.
-_NON_CHAT_MODEL_HINTS = (
-    "embed", "rerank", "whisper", "reranker",
-    "-e5-", "e5-large", "e5-mistral", "multilingual-e5", "bge-", "gte-",
-    "jina-embed", "nomic",
-)
+# model pickers. Shared with the agent's fallback picker, so a failover can never
+# land on an embedding model either.
+from ..config import NON_CHAT_MODEL_HINTS as _NON_CHAT_MODEL_HINTS
+
+
+def _mark_stopped(messages: list[dict]) -> list[dict]:
+    """Append the user-stop notice to a message history.
+
+    A stop leaves the transcript ending mid-action (a tool call with no result, a
+    half-finished edit). Without a note, the next turn reads that as its own
+    failure and often redoes work that already succeeded — so state plainly what
+    happened. Any dangling tool call is repaired first, or the history won't be
+    accepted back by the API.
+    """
+    from ..agent import repair_messages
+    from ..interrupt import STOP_NOTICE
+    msgs, _ = repair_messages(list(messages or []))
+    while msgs and msgs[-1].get("role") == "assistant" and msgs[-1].get("tool_calls"):
+        msgs.pop()
+    if msgs and msgs[-1].get("role") == "user" and STOP_NOTICE in str(msgs[-1].get("content", "")):
+        return msgs
+    msgs.append({"role": "user", "content": STOP_NOTICE})
+    return msgs
+
+
+def _healthy_model(model: str, cfg: dict) -> tuple[str, str]:
+    """Check ``model`` against the backend's live catalog before a run starts.
+
+    A model id that the backend no longer serves fails deep inside the run with
+    an opaque 400 ("no healthy deployments for this model") — most often a stale
+    ``default_model`` in config.json. Returns ``(model_to_use, replaced_id)``,
+    where ``replaced_id`` is empty when nothing was swapped. Unreachable catalog
+    ⇒ no opinion: the caller's model is used unchanged.
+    """
+    try:
+        from ..config import list_models as _list_models, pick_fallback_model
+        available = [m for m in (_list_models(cfg) or []) if m]
+    except Exception:
+        return model, ""
+    if not available or not model or model in available:
+        return model, ""
+    chat = [m for m in available
+            if not any(h in (m or "").lower() for h in _NON_CHAT_MODEL_HINTS)]
+    alt = pick_fallback_model(model, chat or available)
+    return (alt, model) if alt else (model, "")
 
 
 @app.get("/api/models")
@@ -626,7 +664,11 @@ async def ws_endpoint(websocket: WebSocket):
                     elif mt in ("stop", "stop_chat"):
                         ident = state.get("agent_ident")
                         if ident and interrupt.request_stop(ident):
-                            event_q.put_nowait({"type": "info", "text": "⏹ Stopping…"})
+                            event_q.put_nowait({
+                                "type": "info",
+                                "text": "⏹ Stopping — killing the running command "
+                                        "and ending the turn.",
+                            })
                     # ---- live lab controls (handled while a lab is running) ----
                     elif mt == "inject":
                         sess = state.get("lab_session")
@@ -1186,9 +1228,10 @@ async def ws_endpoint(websocket: WebSocket):
                             pass
                     except interrupt.StopRequested:
                         # Stop requested during a phase that calls the model
-                        # directly (orientation / planning). The main loop handles
-                        # its own stop and never reaches here. Emit a stopped-done
-                        # so the UI resets; prior history (if any) is preserved.
+                        # directly (orientation / planning), or mid-tool. Keep the
+                        # history and note WHY it ends here, so the next turn
+                        # continues instead of re-deriving the interrupted work.
+                        state["messages"] = _mark_stopped(state.get("messages") or [])
                         loop.call_soon_threadsafe(
                             event_q.put_nowait,
                             {"type": "done", "iterations": 0, "stopped": True},
@@ -1499,8 +1542,13 @@ async def ws_endpoint(websocket: WebSocket):
                                 "snapshot": sess.snapshot()})
 
             elif mtype in ("science_message", "science_comment"):
+                # The UI marks itself busy the moment it sends a turn, and only a
+                # "science_done" clears that. So EVERY path out of this branch —
+                # including the rejections below, which never start a turn — has
+                # to send one, or the tab stays stuck in a running state.
                 if state["running"]:
                     await send({"type": "error", "text": "A task is already running."})
+                    await send({"type": "science_done"})
                     continue
 
                 working_dir = msg.get("working_dir") or state["working_dir"]
@@ -1511,19 +1559,6 @@ async def ws_endpoint(websocket: WebSocket):
                     cfg["backend"] = state["backend"]
                 _resolved = resolve_backend(cfg)
                 client = make_client(_resolved["api_key"], _resolved["base_url"])
-                model = msg.get("model") or state.get("model") or cfg.get("default_model")
-                # Pool of models the orchestrator may assign to spawned specialists.
-                specialist_models = [m for m in (msg.get("specialist_models") or [])
-                                     if isinstance(m, str) and m.strip()]
-                if specialist_models:
-                    state["specialist_models"] = specialist_models
-                else:
-                    specialist_models = state.get("specialist_models") or []
-
-                remote_id = msg.get("remote_id") if "remote_id" in msg else state.get("remote_id")
-                state["remote_id"] = remote_id
-                remote = get_remote(None, remote_id) if remote_id else None
-
                 from ..science.session import ScienceSession
                 from ..science.orchestrator import run_science_turn
 
@@ -1533,19 +1568,49 @@ async def ws_endpoint(websocket: WebSocket):
                     await send({"type": "info",
                                 "text": "This session is still working — wait for the "
                                         "current turn to finish before sending more."})
+                    await send({"type": "science_done"})
                     continue
                 if sess is None or sess.working_dir != want:
                     sess = ScienceSession.load(working_dir)
+
+                # Model resolution, most specific first: what this message asked
+                # for → what this SESSION was started with → the socket's model →
+                # config's default. The session tier matters: a refine comment and
+                # a reload both arrive without a model, and before this they fell
+                # through to default_model — silently moving the session onto a
+                # different (possibly dead) model than the one the user picked.
+                model = (msg.get("model") or getattr(sess, "model", "")
+                         or state.get("model") or cfg.get("default_model"))
+                # Pool of models the orchestrator may assign to spawned specialists.
+                specialist_models = [m for m in (msg.get("specialist_models") or [])
+                                     if isinstance(m, str) and m.strip()]
+                if not specialist_models:
+                    specialist_models = (list(getattr(sess, "specialist_models", []) or [])
+                                         or state.get("specialist_models") or [])
+                state["specialist_models"] = specialist_models
+
+                model, _swapped = _healthy_model(model, cfg)
+                if _swapped:
+                    await send({"type": "info", "text": (
+                        f"'{_swapped}' isn't available on this backend — running on "
+                        f"{model} instead.")})
+                state["model"] = model
+
+                remote_id = msg.get("remote_id") if "remote_id" in msg else state.get("remote_id")
+                state["remote_id"] = remote_id
+                remote = get_remote(None, remote_id) if remote_id else None
 
                 # Build the turn's user message (a comment refines a specific output).
                 refine_id = None
                 if mtype == "science_comment":
                     if sess is None:
                         await send({"type": "error", "text": "No science session for this directory."})
+                        await send({"type": "science_done"})
                         continue
                     comment = (msg.get("text") or "").strip()
                     art = sess.get_artifact(msg.get("artifact_id", ""))
                     if not comment:
+                        await send({"type": "science_done"})
                         continue
                     if art:
                         refine_id = art.id
@@ -1561,6 +1626,7 @@ async def ws_endpoint(websocket: WebSocket):
                 else:
                     user_message = (msg.get("message") or "").strip()
                     if not user_message:
+                        await send({"type": "science_done"})
                         continue
                     if sess is None:
                         sess = ScienceSession(task=user_message,
@@ -1571,6 +1637,10 @@ async def ws_endpoint(websocket: WebSocket):
                     echo = user_message
 
                 sess.remote_id = remote_id
+                # Remember the models this session runs on, so a refine comment, a
+                # reload, or reopening it later all stay on the user's choice.
+                sess.model = model or sess.model
+                sess.specialist_models = specialist_models
                 state["science_session"] = sess
                 state["running"] = True
                 _ACTIVE_SCIENCE.add(want)
@@ -1597,9 +1667,20 @@ async def ws_endpoint(websocket: WebSocket):
                                          refresh_artifact_id=rid,
                                          specialist_models=pool)
                     except interrupt.StopRequested:
+                        # Record the stop in the session's own history, so the next
+                        # turn (and any later session) knows the work was cut short
+                        # by the user rather than finished or failed.
+                        try:
+                            sc.messages = _mark_stopped(sc.messages)
+                            sc.save()
+                        except Exception:
+                            pass
                         loop.call_soon_threadsafe(
                             event_q.put_nowait,
-                            {"type": "science_reply", "text": "⏹ Stopped.", "stopped": True})
+                            {"type": "science_reply",
+                             "text": "⏹ Stopped by you. Any running command was killed; "
+                                     "the work so far is saved. Send a message to carry on.",
+                             "stopped": True})
                     except Exception as exc:
                         loop.call_soon_threadsafe(
                             event_q.put_nowait, {"type": "error", "text": str(exc)})
@@ -1612,6 +1693,11 @@ async def ws_endpoint(websocket: WebSocket):
 
                 threading.Thread(target=science_fn, daemon=True).start()
                 await stream_events()
+                # Authoritative end-of-turn: the turn thread has finished (the
+                # sentinel drained). Recoverable mid-run errors (a model that
+                # stopped responding and got swapped for a fallback, a failed
+                # tool) must NOT be what puts the tab back to idle.
+                await send({"type": "science_done"})
 
     except WebSocketDisconnect:
         pass

@@ -48,6 +48,7 @@ from . import logger
 from . import interrupt
 from .agent import (
     MAX_ITERATIONS,
+    note_stopped,
     _robust_stream,
     _simple_completion,
     _orientation_phase,
@@ -94,6 +95,10 @@ _TAG = {
 _MAX_VERIFIER_REVISIONS = 2
 # Bound how many full completion-gate rounds the Verifier can demand.
 _MAX_COMPLETION_ROUNDS = 3
+# Completion gates that returned no verdict at all (grading models down). Bounded
+# separately from real REVISE rounds: an outage shouldn't consume the worker's
+# revision budget, and shouldn't loop forever either.
+_MAX_UNVERIFIED_ROUNDS = 2
 # Re-running the SAME action (same tool + args) with no edit in between is the
 # classic stuck loop (e.g. running `tsc`/tests repeatedly without changing code).
 # Soft = re-strategize + switch family; hard = stop the loop. Re-runs that follow
@@ -149,23 +154,76 @@ def council_available(cfg: dict | None = None) -> bool:
 # Verifier / Thinker consults (thin wrappers over _simple_completion)
 # ---------------------------------------------------------------------------
 
+# How much of a proposed action the Verifier gets to see. This has to be generous:
+# a reviewer that cannot see the file it is reviewing rejects for lack of evidence,
+# the worker re-issues the same thing, and the loop escalates — all because of a
+# display budget, not a defect. Config files and edits routinely exceed a few KB.
+_ACTION_CONTENT_BUDGET = 6000
+_ACTION_TOTAL_BUDGET = 14000
+# Args whose value IS the substance of the action — shown as a readable block
+# rather than JSON-escaped on one line (a YAML file rendered with literal "\n"
+# is nearly unreviewable, which degrades the verdict even when it does fit).
+_BODY_ARGS = ("content", "new_string", "old_string", "command", "edits", "patch")
+
+
+def _clip(text: str, budget: int) -> str:
+    """Clip to ``budget`` keeping the HEAD and TAIL — the start says what this is,
+    the end is where truncation usually hides the problem. States what was cut."""
+    if len(text) <= budget:
+        return text
+    head, tail = budget * 2 // 3, budget // 3
+    hidden = len(text) - head - tail
+    return (f"{text[:head]}\n"
+            f"…[{hidden} characters elided from the MIDDLE of this value]…\n"
+            f"{text[-tail:]}")
+
+
 def _format_action(tool_calls: list[dict]) -> str:
     """Render the Worker's proposed tool calls for the Verifier to review."""
-    lines = []
+    blocks: list[str] = []
+    budget = _ACTION_TOTAL_BUDGET
     for tc in tool_calls:
         name = tc["function"]["name"]
         raw = tc["function"].get("arguments") or "{}"
         try:
             args = json.loads(raw)
         except Exception:
-            args = {"_raw": raw[:800]}
-        # Keep diffs/commands readable but bounded.
-        rendered = {}
-        for k, v in args.items():
-            sv = v if isinstance(v, str) else json.dumps(v)
-            rendered[k] = sv if len(sv) <= 1200 else sv[:1200] + " …[truncated]"
-        lines.append(f"- {name}({json.dumps(rendered, ensure_ascii=False)[:1500]})")
-    return "\n".join(lines)
+            args = {"_raw": raw[:2000]}
+        head_args = {k: v for k, v in args.items() if k not in _BODY_ARGS}
+        parts = [f"- {name}({json.dumps(head_args, ensure_ascii=False)[:600]})"]
+        for k in _BODY_ARGS:
+            if k not in args:
+                continue
+            v = args[k]
+            sv = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, indent=2)
+            share = max(800, min(_ACTION_CONTENT_BUDGET, budget))
+            body = _clip(sv, share)
+            budget -= len(body)
+            parts.append(f"  {k}:\n```\n{body}\n```")
+        blocks.append("\n".join(parts))
+    return "\n".join(blocks)
+
+
+def _is_blind_rejection(note: str) -> bool:
+    """True when the reviewer is objecting that it CANNOT SEE the content rather
+    than naming a defect in it.
+
+    'I can't verify because the content is truncated' is a statement about the
+    review, not about the work. Treating it as a defect makes the worker re-issue
+    identical actions and eventually get its model swapped — pure thrash.
+    """
+    s = (note or "").lower()
+    blind = ("truncat" in s or "not visible" in s or "cannot see" in s
+             or "can't see" in s or "is elided" in s or "was elided" in s
+             or "not shown" in s or "unable to view" in s or "no content" in s
+             or "content is missing" in s)
+    if not blind:
+        return False
+    # …unless it ALSO names something concrete about the action itself.
+    concrete = any(w in s for w in (
+        "wrong", "missing field", "typo", "destructive", "delete", "rm -rf",
+        "wrong file", "wrong path", "syntax", "should be", "instead of"))
+    return not concrete
 
 
 def _verifier_review_action(
@@ -185,14 +243,21 @@ def _verifier_review_action(
         f"run the action(s) below. Decide if they are correct and safe for the task.\n\n"
         f"TASK:\n{task}\n\n"
         f"PLAN:\n{plan or '(none)'}\n\n"
-        f"RECENT CONTEXT (last worker reasoning / tool results):\n{recent[:2500]}\n\n"
+        f"RECENT CONTEXT (last worker reasoning / tool results):\n{_clip(recent, 8000)}\n\n"
         f"PROPOSED ACTION:\n{_format_action(tool_calls)}\n\n"
         "Reply with EXACTLY one of:\n"
         "  APPROVE\n"
         "  REVISE: <one specific, actionable defect to fix>\n"
         "Approve unless there is a concrete correctness, safety, or task-mismatch "
         "problem (wrong file, destructive command, code bug, ignores the task). "
-        "Do NOT nitpick style. Be terse."
+        "Do NOT nitpick style.\n"
+        "Long values may be shown with a marked section elided in the middle. That "
+        "is a display limit, NOT a defect: judge what you CAN see, and never answer "
+        "REVISE merely because you cannot see all of it or 'cannot verify' it — "
+        "asking for content you were not shown does not help the worker, which will "
+        "just re-issue the same action. Only flag a problem you can actually point "
+        "to in the visible text.\n"
+        "Be terse."
     )
     raw = _simple_completion(client, verifier_model, [
         {"role": "system", "content": "You are a strict but pragmatic reviewer. One verdict, no preamble."},
@@ -203,8 +268,51 @@ def _verifier_review_action(
     head = raw.splitlines()[0].strip()
     if head.upper().startswith("REVISE"):
         reason = head.split(":", 1)[1].strip() if ":" in head else raw[len("REVISE"):].strip()
+        if _is_blind_rejection(reason):
+            # The reviewer is objecting to what it wasn't shown, not to the work.
+            # Let the action through: the result is inspectable afterwards, and
+            # blocking here only produces identical re-issues.
+            display.print_info(
+                f"{_TAG['verifier']} couldn't see the full content — approving "
+                f"(the result is checked after it runs)."
+            )
+            return True, ""
         return False, reason or "unspecified concern"
     return True, ""
+
+
+# Marker note meaning "the grader could not be reached", as distinct from a real
+# REVISE verdict. The work has NOT been judged — callers must not treat it as
+# rejected (no re-strategising, no "your work is wrong" message to the worker).
+UNVERIFIED = "__verification_unavailable__"
+
+
+def _gate_reason(note: str) -> str:
+    """Human-readable form of a completion-gate note. The UNVERIFIED marker is a
+    control value, never something to show a user or paste into a prompt."""
+    return ("the verifier could not be reached, so completion is unconfirmed"
+            if note == UNVERIFIED else note)
+
+
+def _other_grader_model(failed: str, client) -> str | None:
+    """A different model to grade with when ``failed`` won't answer.
+
+    A silent grader is usually a sick deployment, not a sick prompt — so before
+    concluding anything about the work, ask someone else."""
+    try:
+        from .agent import probe_model
+        from .config import is_chat_model, list_models, load_config, pick_fallback_model
+        catalog = [m for m in (list_models(load_config()) or [])
+                   if is_chat_model(m) and m != failed]
+    except Exception:  # noqa: BLE001 — catalog unreachable
+        return None
+    alt = pick_fallback_model(failed, catalog)
+    if not alt:
+        return None
+    try:
+        return alt if probe_model(client, alt) else None
+    except Exception:  # noqa: BLE001
+        return alt
 
 
 def _verifier_gate_completion(
@@ -228,9 +336,9 @@ def _verifier_gate_completion(
         f"You are the VERIFIER. The WORKER says it is finished. Independently grade "
         f"completion against the task.\n\n"
         f"TASK:\n{task}\n\n"
-        + (f"THE PLAN THE WORKER COMMITTED TO (every step must be done):\n{plan[:1500]}\n\n" if plan else "")
+        + (f"THE PLAN THE WORKER COMMITTED TO (every step must be done):\n{_clip(plan, 4000)}\n\n" if plan else "")
         + (f"SESSION ACTIVITY (ground truth, not the worker's claim):\n{evidence}\n\n" if evidence else "")
-        + f"WHAT THE WORKER DID (recent transcript):\n{transcript[:4000]}\n\n"
+        + f"WHAT THE WORKER DID (recent transcript):\n{_clip(transcript, 12000)}\n\n"
         "Reply with EXACTLY one of:\n"
         "  DONE\n"
         "  REVISE: <the single most important thing still missing or wrong>\n"
@@ -265,16 +373,23 @@ def _verifier_gate_completion(
         {"role": "user", "content": prompt},
     ]
     # The completion decision is critical, so a transient drop shouldn't decide
-    # it — retry once before giving up.
+    # it — retry, then try a DIFFERENT model before concluding anything. An empty
+    # verdict is an infrastructure failure, not a grade: reporting it as "REVISE"
+    # sends a finished worker back to redo correct work.
     raw = _simple_completion(client, verifier_model, grader_msgs, max_tokens=200).strip()
     if not raw:
         raw = _simple_completion(client, verifier_model, grader_msgs, max_tokens=200).strip()
     if not raw:
-        # Fail SAFE, not open: an empty verdict means the grader call dropped
-        # (common on a flaky connection) — do NOT read that as approval, or the
-        # task ends unverified mid-work. Ask for another round; the completion-
-        # round cap still bounds this so a persistent outage can't loop forever.
-        return False, "completion could not be verified (grader did not respond) — continue the task"
+        alt = _other_grader_model(verifier_model, client)
+        if alt:
+            display.print_info(
+                f"{_TAG['verifier']} {verifier_model} didn't answer — grading on {alt}."
+            )
+            raw = _simple_completion(client, alt, grader_msgs, max_tokens=200).strip()
+    if not raw:
+        # Still nothing. Say so honestly with a distinguishable marker: this is
+        # NOT a judgement about the work, and callers must not treat it as one.
+        return False, UNVERIFIED
     head = raw.splitlines()[0].strip()
     if head.upper().startswith("REVISE"):
         reason = head.split(":", 1)[1].strip() if ":" in head else raw[len("REVISE"):].strip()
@@ -302,10 +417,16 @@ def _debate_completion(
     for m in panel:
         done, note = _verifier_gate_completion(client, m, task, messages, evidence=evidence, plan=plan)
         verdicts.append((m, done, note))
+    # A critic that never answered has no opinion — drop it rather than counting
+    # its silence as a concern. Only if the WHOLE panel was unreachable is the
+    # completion genuinely ungraded.
+    graded = [(m, d, n) for m, d, n in verdicts if n != UNVERIFIED]
+    if not graded:
+        return False, UNVERIFIED
     # Unanimous DONE → finish without spending an aggregator call.
-    if all(d for _, d, _ in verdicts):
+    if all(d for _, d, _ in graded):
         return True, ""
-    concerns = [f"- {m}: {note}" for m, d, note in verdicts if not d and note]
+    concerns = [f"- {m}: {note}" for m, d, note in graded if not d and note]
     if not concerns:  # a REVISE with no stated reason — treat as a minor, pass it
         return True, ""
     transcript = _recent_text(messages, n=10)
@@ -314,9 +435,9 @@ def _debate_completion(
         f"graded the WORKER's finished work; some raised concerns. Decide the FINAL "
         f"verdict: is the deliverable actually complete and correct for the task?\n\n"
         f"TASK:\n{task}\n\n"
-        + (f"THE PLAN THE WORKER COMMITTED TO (every step must be done):\n{plan[:1500]}\n\n" if plan else "")
+        + (f"THE PLAN THE WORKER COMMITTED TO (every step must be done):\n{_clip(plan, 4000)}\n\n" if plan else "")
         + (f"SESSION ACTIVITY (ground truth):\n{evidence}\n\n" if evidence else "")
-        + f"WHAT THE WORKER DID (recent transcript):\n{transcript[:3500]}\n\n"
+        + f"WHAT THE WORKER DID (recent transcript):\n{_clip(transcript, 10000)}\n\n"
         f"CRITIC CONCERNS:\n" + "\n".join(concerns) + "\n\n"
         "Dismiss concerns that are nitpicks or already satisfied. Reply with EXACTLY one of:\n"
         "  DONE\n"
@@ -395,7 +516,7 @@ def _thinker_consult(
         f"uncertain. Give a brief, concrete course correction (2-4 sentences): the "
         f"most likely cause and the next single best move. Name specific files/steps.\n\n"
         f"TASK:\n{task}\n\nPLAN:\n{plan or '(none)'}\n\n"
-        f"RECENT CONTEXT:\n{transcript[:3000]}"
+        f"RECENT CONTEXT:\n{_clip(transcript, 9000)}"
     )
     return _simple_completion(client, thinker_model, [
         {"role": "system", "content": "You are a sharp planning strategist. Be concrete and brief."},
@@ -534,20 +655,45 @@ def _thinker_plan(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _recent_text(messages: list[dict], n: int = 8) -> str:
-    """Compact textual digest of the last ``n`` non-system messages."""
-    parts = []
-    for m in messages[-n:]:
+# Model-facing context budgets. These are NOT the UI's preview limits: what the
+# user sees can be a one-line summary, but a Verifier or grader that only gets a
+# fragment of a file or a command's output cannot do its job, and says so — which
+# the loop then mistakes for a defect in the work. Be generous here; the display
+# layer clips separately (see display._tool_summary / args_preview).
+_CONTEXT_PER_MSG = 3000       # per message in a digest
+_CONTEXT_BUDGET = 12000       # whole digest
+
+
+def _recent_text(messages: list[dict], n: int = 8,
+                 per_msg: int = _CONTEXT_PER_MSG,
+                 budget: int = _CONTEXT_BUDGET) -> str:
+    """Textual digest of the last ``n`` non-system messages, newest-first priority.
+
+    Fills the budget from the MOST RECENT message backwards and drops older ones
+    when it runs out, rather than truncating every message to a small fixed size —
+    a reviewer needs the last few steps in full far more than it needs a sliver of
+    each of the last ten.
+    """
+    picked: list[str] = []
+    used = 0
+    for m in reversed(messages[-n:]):
         role = m.get("role", "")
         if role == "system":
             continue
         content = m.get("content") or ""
+        if not isinstance(content, str):
+            content = json.dumps(content, ensure_ascii=False)
         if role == "assistant" and m.get("tool_calls"):
             names = ", ".join(tc["function"]["name"] for tc in m["tool_calls"])
             content = (content + f"  [calls: {names}]").strip()
-        if content:
-            parts.append(f"{role}: {content[:600]}")
-    return "\n".join(parts)
+        if not content:
+            continue
+        text = _clip(content, per_msg)
+        if picked and used + len(text) > budget:
+            break
+        picked.append(f"{role}: {text}")
+        used += len(text)
+    return "\n".join(reversed(picked))
 
 
 def _classify_turn(tool_calls: list[dict]) -> str:
@@ -596,6 +742,7 @@ def _council_loop(
     retry_state = {"rate": 0, "timeout": 0, "conn": 0}
     iteration = 0
     completion_rounds = 0
+    unverified_rounds = 0
     stall = 0  # consecutive non-productive worker turns (text-only / botched)
     seen_calls: dict[tuple, int] = {}
     redundant = 0
@@ -637,7 +784,7 @@ def _council_loop(
         if interrupt.should_stop():
             display.print_interrupted(iteration - 1)
             logger.log_session_end(iteration, reason="interrupted")
-            return messages
+            return note_stopped(messages)
         # Force a tool call until the worker has actually DONE something. The
         # orient+plan preamble ends with the worker promising to execute, and
         # some models then narrate ("I will now…") or falsely claim completion
@@ -655,9 +802,12 @@ def _council_loop(
             display.stream_end(False)
             display.print_interrupted(iteration)
             logger.log_session_end(iteration, reason="interrupted")
-            return messages
-        if signal == "fatal":
-            end_reason = "error"
+            return note_stopped(messages)
+        if signal in ("fatal", "fatal_conn"):
+            # fatal_conn = retries exhausted / endpoint rejecting this model.
+            # Either way `response` is None, so stop cleanly instead of
+            # dereferencing it below.
+            end_reason = "connection_lost" if signal == "fatal_conn" else "error"
             break
 
         content = response["content"]
@@ -807,6 +957,37 @@ def _council_loop(
                 display.print_info(f"{_TAG['verifier']} [bold #7fd88f]approved[/bold #7fd88f] — task complete.")
                 display.print_done(iteration)
                 break
+            if note == UNVERIFIED:
+                # The grader never answered — the work has NOT been judged. Don't
+                # re-strategise finished work on the back of an outage. Ask the
+                # worker for a cheap self-check instead (useful either way), and
+                # if the graders stay down, finish with an honest caveat rather
+                # than grinding the deliverable.
+                unverified_rounds += 1
+                completion_rounds -= 1   # an outage must not burn a real round
+                if unverified_rounds > _MAX_UNVERIFIED_ROUNDS:
+                    display.print_error(
+                        "Completion could not be verified — the grading models are "
+                        "unreachable. Stopping with the work as it stands (UNVERIFIED); "
+                        "re-run when the backend is healthy to have it checked."
+                    )
+                    _final_summary(client, active_worker, task, messages)
+                    end_reason = "unverified"
+                    display.print_done(iteration)
+                    break
+                display.print_info(
+                    f"{_TAG['verifier']} unreachable — asking the worker to "
+                    f"self-check while the graders recover."
+                )
+                messages.append({"role": "user", "content": (
+                    "The independent verifier is unreachable right now, so your completion "
+                    "has NOT been reviewed — this is an infrastructure problem, not a "
+                    "judgement on your work. Do NOT redo or re-plan anything. Instead, "
+                    "CONFIRM the end state cheaply: check that each deliverable the task "
+                    "asks for exists and works (read the file, run it, run the test), and "
+                    "report exactly what you verified. If it all checks out, say so and stop."
+                )})
+                continue
             display.print_info(f"{_TAG['verifier']} requests revision: [dim]{note[:160]}[/dim]")
             # Rejected completion means the work itself is wrong/incomplete (not a
             # transient error) — the highest-value place for the Thinker. Turn the
@@ -901,6 +1082,11 @@ def _council_loop(
             display.tool_activity_start(name, args, permission_mode)
             try:
                 result, success = execute_tool(name, args, working_dir, permission_mode)
+            except interrupt.StopRequested:
+                display.tool_activity_end()
+                display.print_interrupted(iteration)
+                logger.log_session_end(iteration, reason="interrupted")
+                return note_stopped(messages)
             finally:
                 display.tool_activity_end()
             # Track substantive vs read-only activity so the completion gate knows
@@ -939,7 +1125,7 @@ def _council_loop(
         if interrupt.should_stop():
             display.print_interrupted(iteration)
             logger.log_session_end(iteration, reason="interrupted")
-            return messages
+            return note_stopped(messages)
 
         # ---- Hard/stalled escalation to the Thinker ---------------------------
         if turn_had_error:
@@ -978,8 +1164,10 @@ def _council_loop(
                 end_reason = "completed"
             else:
                 display.print_error(
-                    "Stopping: the worker is stuck in a loop and the task is not complete. "
-                    "Send another message to continue from here."
+                    "Stopping: the worker is stuck in a loop and "
+                    + ("completion could not be verified (the verifier is unreachable)."
+                       if _note == UNVERIFIED else "the task is not complete.")
+                    + " Send another message to continue from here."
                 )
                 _final_summary(client, active_worker, task, messages)
                 end_reason = "looping"
@@ -1044,14 +1232,15 @@ def _council_loop(
                 display.print_done(iteration)
                 end_reason = "no_progress"
                 break
-            display.print_info(f"{_TAG['verifier']} says work remains: [dim]{note[:160]}[/dim]")
+            display.print_info(
+                f"{_TAG['verifier']} says work remains: [dim]{_gate_reason(note)[:160]}[/dim]")
             # Nudge the current worker first; only switch family if a nudge already
             # failed to break the spin (2nd recovery onward).
             if stuck_recoveries >= 2:
                 _escalate_worker("still stuck re-reading after being redirected")
             messages.append({"role": "user", "content": (
                 "You keep re-reading files you already have without changing anything — that will "
-                "not advance the task, and the verifier confirms it is NOT done: " + note + "\n"
+                "not advance the task, and completion is not confirmed: " + _gate_reason(note) + "\n"
                 "Stop re-reading. Make the next CONCRETE change now (write/edit a file, run the "
                 "code, produce or fix the deliverable). Do not inspect what you have already seen."
             )})

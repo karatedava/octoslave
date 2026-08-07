@@ -70,7 +70,11 @@ class ScienceSession:
     def __init__(self, task: str, working_dir: str, model: str = ""):
         self.task = task
         self.working_dir = str(Path(working_dir).expanduser().resolve())
+        # The models CHOSEN for this session in the UI. Persisted so reopening a
+        # session (or a refresh, which skips the start form) keeps running on what
+        # the user picked instead of silently reverting to config's default_model.
         self.model = model
+        self.specialist_models: list[str] = []
         self.created_at = _now()
         self.updated_at = self.created_at
         # OpenAI-style message history for the orchestrator (system+user+assistant+tool).
@@ -115,6 +119,40 @@ class ScienceSession:
                     break
             self.touch()
             self._save_locked()
+
+    def get_specialist(self, ref: str) -> Optional[Specialist]:
+        """Look a specialist up by id, or (case-insensitively) by name."""
+        ref = (ref or "").strip()
+        if not ref:
+            return None
+        for s in self.specialists:
+            if s.id == ref:
+                return s
+        for s in self.specialists:
+            if s.name.lower() == ref.lower():
+                return s
+        return None
+
+    # -- specialist transcripts -------------------------------------------
+    # Kept out of state.json (they are large) in their own files, so a specialist
+    # can be RESUMED with everything it already learned instead of being cloned.
+    @property
+    def transcripts_dir(self) -> Path:
+        return self.science_dir / "specialists"
+
+    def save_transcript(self, sid: str, messages: list[dict]) -> None:
+        try:
+            self.transcripts_dir.mkdir(parents=True, exist_ok=True)
+            (self.transcripts_dir / f"{sid}.json").write_text(json.dumps(messages))
+        except Exception:
+            pass
+
+    def load_transcript(self, sid: str) -> list[dict]:
+        try:
+            p = self.transcripts_dir / f"{sid}.json"
+            return json.loads(p.read_text()) if p.exists() else []
+        except Exception:
+            return []
 
     def add_job(self, job: Job) -> Job:
         with self._lock:
@@ -176,6 +214,7 @@ class ScienceSession:
             "task": self.task,
             "working_dir": self.working_dir,
             "model": self.model,
+            "specialist_models": self.specialist_models,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "messages": self.messages,
@@ -230,6 +269,8 @@ class ScienceSession:
             return None
         s = cls(task=data.get("task", ""), working_dir=working_dir,
                 model=data.get("model", ""))
+        s.specialist_models = [m for m in (data.get("specialist_models") or [])
+                               if isinstance(m, str) and m.strip()]
         s.created_at = data.get("created_at", s.created_at)
         s.updated_at = data.get("updated_at", s.updated_at)
         s.messages = data.get("messages", [])
@@ -247,6 +288,8 @@ class ScienceSession:
         return {
             "task": self.task,
             "working_dir": self.working_dir,
+            "model": self.model,
+            "specialist_models": self.specialist_models,
             "specialists": [asdict(s) for s in self.specialists],
             "jobs": [asdict(j) for j in self.jobs],
             "artifacts": [asdict(a) for a in self.artifacts],

@@ -313,8 +313,13 @@ def stream_reason(text: str):
         spin["chars"] = spin.get("chars", 0) + len(text)
 
 
-def stream_end(had_content: bool):
-    _emit({"type": "stream_end"})
+def stream_end(had_content: bool, aborted: bool = False):
+    """``aborted`` — the stream died mid-flight (connection drop, interrupt), so
+    whatever was streamed is being THROWN AWAY: it never enters the message
+    history and the model will regenerate from scratch. The UI needs to know, or
+    it renders the discarded draft as a completed turn and the run looks like it
+    made progress it did not."""
+    _emit({"type": "stream_end", "aborted": aborted})
     if _silent():
         _stream_state.started = False
         return
@@ -622,6 +627,31 @@ def _tool_summary(name: str, args: dict) -> str:
     if name == "remember":
         c = args.get("content", "")
         return (c[:90] + "…") if len(c) > 90 else c
+    # Science / lab orchestration tools — without these the fallback prints raw
+    # truncated JSON ('{"name": "Data Wrangler", "goal": "Acquire and cl…').
+    if name == "spawn_specialist":
+        who = args.get("name", "") or "specialist"
+        role = args.get("role", "")
+        return f"{who}{f' — {role}' if role else ''}"
+    if name == "continue_specialist":
+        task = args.get("task", "") or ""
+        return f"{args.get('id', '') or 'specialist'}: " + (
+            (task[:70] + "…") if len(task) > 70 else task)
+    if name == "present_output":
+        return args.get("caption", "") or args.get("path", "")
+    if name == "record_provenance":
+        return args.get("artifact", "") or args.get("path", "")
+    if name == "curate_dataset":
+        return args.get("name", "") or args.get("path", "")
+    if name == "literature_search":
+        q = args.get("query", "")
+        return (q[:90] + "…") if len(q) > 90 else q
+    if name == "submit_cluster_job":
+        cmd = args.get("command", "") or ""
+        return f"{args.get('name', '') or 'job'}: " + (
+            (cmd[:60] + "…") if len(cmd) > 60 else cmd)
+    if name in ("check_cluster_job", "fetch_cluster_file"):
+        return args.get("job_id", "") or args.get("path", "") or ""
     if name.startswith("mcp__"):
         return name
     return json.dumps(args)[:80]

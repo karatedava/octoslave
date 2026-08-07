@@ -5,6 +5,7 @@ export class LabSocket {
   private ws: WebSocket | null = null;
   private handlers: Handler[] = [];
   private onOpenCbs: (() => void)[] = [];
+  private onCloseCbs: (() => void)[] = [];
   private queue: any[] = [];
 
   connect() {
@@ -26,7 +27,10 @@ export class LabSocket {
       this.handlers.forEach((h) => h(msg));
     };
     this.ws.onclose = () => {
-      // auto-reconnect after a short delay
+      this.onCloseCbs.forEach((cb) => cb());
+      // auto-reconnect after a short delay. The new socket is a FRESH server-side
+      // connection: any run started on the old one keeps going but its events no
+      // longer reach us, so listeners must re-sync their state on the next open.
       setTimeout(() => this.connect(), 1500);
     };
   }
@@ -37,6 +41,10 @@ export class LabSocket {
 
   onOpen(cb: () => void) {
     this.onOpenCbs.push(cb);
+  }
+
+  onClose(cb: () => void) {
+    this.onCloseCbs.push(cb);
   }
 
   send(msg: any) {

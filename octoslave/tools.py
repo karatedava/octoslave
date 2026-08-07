@@ -1006,6 +1006,12 @@ def _run_staged_tool(name, args, sess, working_dir) -> tuple[str, bool]:
 
 def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str = "autonomous") -> tuple[str, bool]:
     """Execute a tool. Returns (result_text, success)."""
+    # A stop already requested must not start NEW work. Without this, a turn that
+    # proposed several tool calls would run all of them after the user hit Stop —
+    # the single biggest reason stopping felt slow.
+    from . import interrupt
+    if interrupt.should_stop():
+        raise interrupt.StopRequested
     # Check permission for modifying tools
     # - controlled: ask for all modifying tools (file ops + bash)
     # - supervised: ask only for file operations (allow bash without asking)
@@ -2090,6 +2096,53 @@ def _looks_blocking(command: str) -> bool:
     return any(re.search(p, command) for p in _BLOCKING_CMD_PATTERNS)
 
 
+class _Completed:
+    """Minimal stand-in for ``subprocess.CompletedProcess``."""
+    __slots__ = ("stdout", "stderr", "returncode")
+
+    def __init__(self, stdout: str, stderr: str, returncode: int):
+        self.stdout, self.stderr, self.returncode = stdout, stderr, returncode
+
+
+def _run_interruptible(command: str, working_dir: str, timeout: int,
+                       env: dict) -> "_Completed | None":
+    """Run ``command`` like ``subprocess.run``, but abortable.
+
+    ``subprocess.run`` blocks until the command exits or its timeout fires, which
+    is why pressing Stop during a long build used to do nothing for minutes. Here
+    the process gets its OWN process group and we poll while waiting, so a stop
+    can kill the whole tree (the shell AND its children) at once.
+
+    Returns None when the user stopped the session; raises ``TimeoutExpired`` on
+    the normal timeout so the caller's existing handling is unchanged.
+    """
+    from . import interrupt
+    proc = subprocess.Popen(
+        command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, cwd=working_dir, env=env, start_new_session=True,
+    )
+    deadline = _time.monotonic() + timeout
+    while True:
+        try:
+            stdout, stderr = proc.communicate(timeout=0.25)
+            return _Completed(stdout, stderr, proc.returncode)
+        except subprocess.TimeoutExpired:
+            if interrupt.should_stop():
+                _terminate_proc(proc)
+                try:            # drain whatever it managed to print
+                    proc.communicate(timeout=2)
+                except Exception:
+                    pass
+                return None
+            if _time.monotonic() >= deadline:
+                _terminate_proc(proc)
+                try:
+                    proc.communicate(timeout=2)
+                except Exception:
+                    pass
+                raise subprocess.TimeoutExpired(command, timeout)
+
+
 def _bash(command: str, working_dir: str, timeout: int = 300) -> tuple[str, bool]:
     # Redirect commands that never return on their own to run_background, so a
     # single blocking call can't freeze the agent until the timeout fires.
@@ -2112,15 +2165,15 @@ def _bash(command: str, working_dir: str, timeout: int = 300) -> tuple[str, bool
     # venv doesn't match the project's .venv.
     env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
     try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            cwd=working_dir,
-            timeout=timeout,
-            env=env,
-        )
+        result = _run_interruptible(command, working_dir, timeout, env)
+        if result is None:
+            # User pressed Stop while this command was running. The process (and
+            # everything it spawned) has been killed; report it as the tool result
+            # so the agent's history says what happened instead of showing a
+            # truncated command that appears to have failed on its own.
+            return ("Command was KILLED because the user stopped the session. "
+                    "It did not finish, so its effects may be partial — check the "
+                    "actual state before assuming anything about it.", False)
         stdout = result.stdout or ""
         stderr = result.stderr or ""
         # Label streams when both have content so the model can tell them apart.

@@ -1082,6 +1082,180 @@ def _is_context_window_error(err_str: str) -> bool:
     return False
 
 
+_MALFORMED_HISTORY_NEEDLES = (
+    "must have a string or a list of chunks",
+    "assistant message must have",
+    "content or a list of tool calls",
+    "'content' is a required property",
+    "content must not be empty",
+    "expected a string, but got null",
+)
+
+
+def _is_malformed_history_error(err_str: str) -> bool:
+    """True if a 400 is about the SHAPE of the message history rather than its
+    size — e.g. the vLLM/litellm rejection
+
+        "Assistant message must have a string or a list of chunks in content
+         or a list of tool calls."
+
+    which fires when a turn ended with an assistant message carrying neither
+    text nor tool calls (some models return an empty final turn, and strict
+    OpenAI-compatible servers refuse to accept it back as history)."""
+    if not err_str:
+        return False
+    s = err_str.lower()
+    return any(n in s for n in _MALFORMED_HISTORY_NEEDLES)
+
+
+# How long to wait before re-testing a model that was swapped out, escalating so a
+# long outage isn't probed every few minutes forever. Reset once it comes back.
+_MODEL_PROBE_BACKOFF_SECS = (240, 600, 1200, 1800)
+
+
+def probe_model(client: OpenAI, model: str, timeout: float = 12.0) -> bool:
+    """Is ``model`` serving requests again? One tiny non-streaming completion.
+
+    Cheap on purpose: re-testing by running a real turn costs the full retry
+    ladder (minutes) every time, which is why a demoted model would otherwise
+    never be worth retrying. Anything that isn't a connection failure or a "no
+    healthy deployment" answer counts as ALIVE — the deployment replied, which is
+    all we're asking.
+    """
+    if not model:
+        return False
+    try:
+        c = client.with_options(timeout=timeout) if hasattr(client, "with_options") else client
+        c.chat.completions.create(
+            model=model, messages=[{"role": "user", "content": "ping"}],
+            max_tokens=1, stream=False,
+        )
+        return True
+    except Exception as e:  # noqa: BLE001 — classify, don't propagate
+        if _is_retryable_error(e) or _is_model_unavailable_error(str(e)):
+            return False
+        return True
+
+
+class ModelRestorer:
+    """Brings a preferred model back once the backend recovers.
+
+    A failover moves work onto whatever is reachable — often a weaker model. That
+    is the right call during an outage and the wrong one for the next hour, so
+    this re-tests the preferred model on an escalating schedule and reports when
+    it's worth switching back. Probes are cheap (see ``probe_model``); the first
+    one is deliberately not immediate, to let a flapping backend settle.
+    """
+
+    def __init__(self, preferred: str):
+        self.preferred = preferred or ""
+        self._attempt = 0
+        self._next_at = _time_now() + _MODEL_PROBE_BACKOFF_SECS[0]
+
+    def due(self, active_model: str) -> bool:
+        return bool(self.preferred) and active_model != self.preferred \
+            and _time_now() >= self._next_at
+
+    def recovered(self, client: OpenAI) -> bool:
+        """True when the preferred model answers again (caller should switch back)."""
+        if probe_model(client, self.preferred):
+            self._attempt = 0
+            self._next_at = _time_now() + _MODEL_PROBE_BACKOFF_SECS[0]
+            return True
+        self._attempt += 1
+        idx = min(self._attempt, len(_MODEL_PROBE_BACKOFF_SECS) - 1)
+        self._next_at = _time_now() + _MODEL_PROBE_BACKOFF_SECS[idx]
+        return False
+
+
+def _time_now() -> float:
+    import time as _t
+    return _t.monotonic()
+
+
+_MODEL_UNAVAILABLE_NEEDLES = (
+    "no healthy deployments",
+    "no deployments available",
+    "model not found",
+    "model_not_found",
+    "does not exist or you do not have access",
+    "is currently not available",
+    "no such model",
+)
+
+
+def _is_model_unavailable_error(err_str: str) -> bool:
+    """True if the failure means THIS MODEL is not servable right now — e.g. the
+    litellm router's "You passed in model=X. There are no healthy deployments for
+    this model." Nothing about the conversation is wrong, so the work can be
+    finished on a different model rather than aborted."""
+    if not err_str:
+        return False
+    s = err_str.lower()
+    return any(n in s for n in _MODEL_UNAVAILABLE_NEEDLES)
+
+
+def repair_messages(messages: list[dict]) -> tuple[list[dict], int]:
+    """Make a message history acceptable to strict OpenAI-compatible servers.
+
+    Returns ``(repaired, n_changes)``. Fixes, in order of how often they bite:
+      * assistant turns with blank content AND no tool calls — dropped (they
+        carry nothing, and vLLM/litellm 400s on them);
+      * assistant turns with tool calls but ``content: None`` — content set to
+        the empty string, which every backend accepts alongside tool_calls;
+      * tool results with empty content — given a placeholder, since a tool_call
+        must be answered and an empty answer is rejected;
+      * orphaned tool results (no preceding tool_call with that id) — dropped.
+    Applied before every request, so a bad turn never reaches the wire twice.
+    """
+    out: list[dict] = []
+    changes = 0
+    open_ids: set[str] = set()
+    for m in messages:
+        role = m.get("role")
+        if role == "assistant":
+            tcs = m.get("tool_calls")
+            content = m.get("content")
+            if tcs:
+                if content is None:
+                    m = {**m, "content": ""}
+                    changes += 1
+                for tc in tcs:
+                    if tc.get("id"):
+                        open_ids.add(tc["id"])
+            elif not (isinstance(content, list) and content) and not str(content or "").strip():
+                changes += 1
+                continue          # empty assistant turn — drop it
+        elif role == "tool":
+            tid = m.get("tool_call_id")
+            if tid and tid not in open_ids:
+                changes += 1
+                continue          # answer to a turn that is no longer here
+            if not str(m.get("content") or "").strip():
+                m = {**m, "content": "(no output)"}
+                changes += 1
+        out.append(m)
+    return out, changes
+
+
+def note_stopped(messages: list[dict]) -> list[dict]:
+    """Close a history that ends because the USER stopped the run.
+
+    A stop lands mid-action, so the transcript trails off after a tool call or a
+    half-done edit. Left unexplained, the next turn reads that as its own failure
+    and commonly redoes work that already succeeded. Repair the dangling call and
+    say plainly what happened.
+    """
+    msgs, _ = repair_messages(list(messages or []))
+    while msgs and msgs[-1].get("role") == "assistant" and msgs[-1].get("tool_calls"):
+        msgs.pop()
+    if msgs and msgs[-1].get("role") == "user" \
+            and interrupt.STOP_NOTICE in str(msgs[-1].get("content", "")):
+        return msgs
+    msgs.append({"role": "user", "content": interrupt.STOP_NOTICE})
+    return msgs
+
+
 def _estimated_tokens(messages: list[dict]) -> int:
     """Fast char/4 token estimate over a message list. Good enough to decide
     whether to compact proactively — actual tokenisation is provider-specific
@@ -1858,19 +2032,28 @@ def _stream_completion(client: OpenAI, model: str, messages: list, force_tool: b
     }
 
 
-def _switch_to_fallback_model(failed_model: str, client: OpenAI, prompt_profile: str) -> str | None:
+def _switch_to_fallback_model(failed_model: str, client: OpenAI, prompt_profile: str,
+                              pool: list[str] | None = None) -> str | None:
     """After retries are exhausted on an unresponsive model (persistent
-    connection drops / timeouts), pick a reachable substitute from the active
-    provider — preferring the kimi, glm and deepseek families — and re-size the
-    runtime budget for it so the run can finish the unfinished work on the new
-    model. Returns the substitute's id, or None when no alternative is available
-    (single-model provider, catalog unreachable, …), in which case the caller
-    proceeds unchanged."""
-    try:
-        available = list_models(load_config())
-    except Exception:
-        available = []
-    alt = pick_fallback_model(failed_model, available)
+    connection drops / timeouts, or an endpoint that rejects what the model
+    produces), pick a reachable substitute and re-size the runtime budget for it
+    so the run can finish the unfinished work on the new model.
+
+    When a ``pool`` of models was chosen for this run, the substitute is drawn at
+    RANDOM from it (minus the failed model); otherwise it comes from the active
+    provider's catalog, preferring the kimi, glm and deepseek families. Returns
+    the substitute's id, or None when no alternative is available (single-model
+    provider, catalog unreachable, …), in which case the caller proceeds
+    unchanged."""
+    import random
+    choices = [m for m in (pool or []) if m and m != failed_model]
+    alt = random.choice(choices) if choices else None
+    if not alt:
+        try:
+            available = list_models(load_config())
+        except Exception:
+            available = []
+        alt = pick_fallback_model(failed_model, available)
     if not alt or alt == failed_model:
         return None
     display.print_info(
@@ -1903,6 +2086,7 @@ def run_agent(
     verify_out: list | None = None,
     remote: dict | None = None,
     extra_system: str = "",
+    model_pool: list[str] | None = None,
 ) -> list[dict]:
     if permission_mode is None:
         cfg = load_config()
@@ -2007,11 +2191,13 @@ def run_agent(
         # and deepseek families — and let it pick up the unfinished work, so a
         # mid-task upstream outage doesn't sink the run.
         if end_reason == "connection_lost":
-            alt = _switch_to_fallback_model(active_model, client, prompt_profile)
+            alt = _switch_to_fallback_model(active_model, client, prompt_profile, model_pool)
             if alt:
+                preferred = active_model      # what the user actually chose
                 active_model = alt
                 messages, end_reason = _agent_loop(
-                    messages, active_model, working_dir, client, permission_mode
+                    messages, active_model, working_dir, client, permission_mode,
+                    preferred_model=preferred,
                 )
 
         # Post-loop self-verification, WITH self-correction: a grade of PARTIAL
@@ -2048,7 +2234,7 @@ def run_agent(
                 # A correction turn can also lose the connection — switch again so
                 # the next verify round (if any) runs on a reachable model.
                 if end_reason == "connection_lost":
-                    alt = _switch_to_fallback_model(active_model, client, prompt_profile)
+                    alt = _switch_to_fallback_model(active_model, client, prompt_profile, model_pool)
                     if alt:
                         active_model = alt
     finally:
@@ -2065,6 +2251,7 @@ def continue_agent(
     client: OpenAI,
     permission_mode: str = None,
     remote: dict | None = None,
+    model_pool: list[str] | None = None,
 ) -> list[dict]:
     if permission_mode is None:
         cfg = load_config()
@@ -2085,10 +2272,11 @@ def continue_agent(
         # Same connection-loss fallback as run_agent: if the model stopped
         # responding, finish the follow-up on a reachable substitute.
         if end_reason == "connection_lost":
-            alt = _switch_to_fallback_model(model, client, prompt_profile)
+            alt = _switch_to_fallback_model(model, client, prompt_profile, model_pool)
             if alt:
                 messages, end_reason = _agent_loop(
-                    messages, alt, working_dir, client, permission_mode
+                    messages, alt, working_dir, client, permission_mode,
+                    preferred_model=model,
                 )
         return messages
     finally:
@@ -2120,6 +2308,7 @@ def _robust_stream(
     """
     import time as _time
     messages = _proactive_trim(messages, client=client, model=model)
+    messages, _fixed = repair_messages(messages)
     try:
         try:
             response = _stream_completion(client, model, messages, force_tool=force_tool)
@@ -2128,12 +2317,22 @@ def _robust_stream(
             # before its normal close, so stream_end never ran — the CLI spinner
             # would keep spinning and the web UI would stay stuck on "thinking…"
             # across the retry. Reset the visual stream, then let the handlers
-            # below classify the error and decide retry/fatal/interrupt.
-            display.stream_end(False)
+            # below classify the error and decide retry/fatal/interrupt. The
+            # partial response is discarded (messages are returned untouched), so
+            # flag it as aborted rather than letting the UI keep the draft.
+            display.stream_end(False, aborted=True)
             raise
         state["rate"] = 0
-        state["timeout"] = 0
-        state["conn"] = 0
+        state["bad"] = 0
+        # Connection health DECAYS on success instead of resetting. A flapping
+        # endpoint alternates drop/success, so a hard reset meant the counter
+        # never reached the failover threshold — the run burned turn after turn
+        # re-generating the same (long) response and dying at the same point,
+        # while the "switch to a reachable model" path never fired. Decay lets a
+        # genuinely recovered endpoint drain the counter, while an endpoint that
+        # fails about as often as it succeeds still ratchets up to failover.
+        state["timeout"] = max(0, state["timeout"] - 1)
+        state["conn"] = max(0, state["conn"] - 1)
         return response, "ok", messages
     except BadRequestError as e:
         err_str = str(e)
@@ -2155,6 +2354,40 @@ def _robust_stream(
                 "Use /compact to summarise history, or /clear to start fresh."
             )
             return None, "fatal", messages
+        elif _is_model_unavailable_error(err_str):
+            # The backend can't serve this model at all (dead deployment, stale
+            # id). Nothing to fix in the conversation — hand back "fatal_conn" so
+            # the caller finishes the work on a different model.
+            display.print_error(
+                f"[bold]{model}[/bold] is not available on this backend "
+                f"(no healthy deployment)."
+            )
+            return None, "fatal_conn", messages
+        elif _is_malformed_history_error(err_str):
+            # The server rejected the SHAPE of the history (e.g. an empty
+            # assistant turn). Repair and retry; if there is nothing left to
+            # repair, drop the last exchange and try once more, then give up on
+            # this model so the caller can fail over to another one.
+            repaired, fixed = repair_messages(messages)
+            state["bad"] = state.get("bad", 0) + 1
+            if fixed:
+                display.print_info(
+                    f"Model returned a message this endpoint rejects — repaired "
+                    f"{fixed} message(s) and retrying."
+                )
+                return None, "retry", repaired
+            if state["bad"] <= 2 and len(repaired) > 2:
+                while len(repaired) > 2 and repaired[-1].get("role") in ("tool", "assistant"):
+                    repaired.pop()
+                display.print_info(
+                    "Endpoint rejected the conversation shape — rolling back the "
+                    "last exchange and retrying."
+                )
+                return None, "retry", repaired
+            display.print_error(
+                "This endpoint keeps rejecting the conversation this model produces."
+            )
+            return None, "fatal_conn", repaired
         elif "Unterminated string" in err_str or "Extra data" in err_str:
             # The model's tool-call arguments were cut off mid-stream, leaving
             # invalid JSON in the message history.  Roll back the last assistant
@@ -2183,20 +2416,22 @@ def _robust_stream(
         if "429" in err_str or "rate" in err_str.lower() or "RateLimit" in type(e).__name__:
             state["rate"] += 1
             wait = min(60, 5 * (2 ** (state["rate"] - 1)))
-            display.print_info(f"Rate limit — waiting {wait}s ({state['rate']}/5).")
             if state["rate"] > 5:
                 display.print_error("Rate limit persists after 5 retries.")
                 return None, "fatal", messages
-            _time.sleep(wait)
+            display.print_info(f"Rate limit — waiting {wait}s ({state['rate']}/5).")
+            if interrupt.wait(wait):      # wakes at once on Stop
+                raise interrupt.StopRequested
             return None, "retry", messages
         elif "timeout" in err_str.lower() or "timed out" in err_str.lower() or "Timeout" in type(e).__name__:
             state["timeout"] += 1
             wait = min(30, 5 * (2 ** (state["timeout"] - 1)))
-            display.print_info(f"Request timeout — retrying in {wait}s ({state['timeout']}/3).")
             if state["timeout"] > 3:
                 display.print_error("Request keeps timing out after 3 retries.")
                 return None, "fatal_conn", messages
-            _time.sleep(wait)
+            display.print_info(f"Request timeout — retrying in {wait}s ({state['timeout']}/3).")
+            if interrupt.wait(wait):      # wakes at once on Stop
+                raise interrupt.StopRequested
             return None, "retry", messages
         elif _is_retryable_error(e):
             # Transient connection drop ("peer closed connection without sending
@@ -2204,13 +2439,16 @@ def _robust_stream(
             state["conn"] += 1
             wait = min(30, 5 * (2 ** (state["conn"] - 1)))
             logger.log_error(f"Connection error on turn {iteration}", exc=e)
-            display.print_info(
-                f"Connection dropped — retrying in {wait}s ({state['conn']}/4)."
-            )
+            # Report the budget check FIRST: printing "retrying (5/4)" and then
+            # "keeps dropping after 4 retries" reads like an off-by-one bug.
             if state["conn"] > 4:
                 display.print_error("Connection keeps dropping after 4 retries.")
                 return None, "fatal_conn", messages
-            _time.sleep(wait)
+            display.print_info(
+                f"Connection dropped — retrying in {wait}s ({state['conn']}/4)."
+            )
+            if interrupt.wait(wait):      # wakes at once on Stop
+                raise interrupt.StopRequested
             return None, "retry", messages
         elif "410" in err_str and ("end of life" in err_str.lower() or "Gone" in err_str):
             display.print_error(
@@ -2246,8 +2484,14 @@ def _agent_loop(
     working_dir: str,
     client: OpenAI,
     permission_mode: str = "autonomous",
+    preferred_model: str = "",
 ) -> list[dict]:
+    """``preferred_model`` — the model this run is *meant* to use, when ``model``
+    is only a substitute swapped in after a failure. The loop re-tests it
+    periodically and moves back as soon as it is serving again, so an outage
+    costs a few turns on a weaker model rather than the rest of the session."""
     from collections import Counter
+    restorer = ModelRestorer(preferred_model) if preferred_model and preferred_model != model else None
     iteration = 0
     _retry_state = {"rate": 0, "timeout": 0, "conn": 0}  # persisted across _robust_stream calls
     _end_reason = "completed"  # how the loop terminated (for accurate session_end log)
@@ -2261,12 +2505,29 @@ def _agent_loop(
 
     while iteration < MAX_ITERATIONS:
         iteration += 1
+        # Running on a substitute? Check whether the model we actually want is
+        # back, and return to it between turns (the history is model-agnostic).
+        if restorer is not None and restorer.due(model):
+            if restorer.recovered(client):
+                display.print_info(
+                    f"[bold]{restorer.preferred}[/bold] is responding again — "
+                    f"switching back from {model}."
+                )
+                logger.log_info("Restored preferred model",
+                                substitute=model, restored=restorer.preferred)
+                model = restorer.preferred
+                try:
+                    configure_runtime(client, model,
+                                      "local" if _is_ollama_client(client) else "base")
+                except Exception as e:  # noqa: BLE001
+                    logger.log_error("Failed to re-size runtime on restore", exc=e)
+                restorer = None
         # User-requested stop (web UI) — caught here between turns (e.g. while a
         # tool was running) in addition to the mid-stream check.
         if interrupt.should_stop():
             display.print_interrupted(iteration - 1)
             logger.log_session_end(iteration, reason="interrupted")
-            return messages, "interrupted"
+            return note_stopped(messages), "interrupted"
         # Force a tool call only on the very first turn — kick-starts models that
         # would otherwise reply with chit-chat. After that, leave tool_choice="auto"
         # so a model that has finished can naturally return a text-only "done"
@@ -2282,7 +2543,7 @@ def _agent_loop(
             display.stream_end(False)
             display.print_interrupted(iteration)
             logger.log_session_end(iteration, reason="interrupted")
-            return messages, "interrupted"
+            return note_stopped(messages), "interrupted"
         if _signal == "fatal_conn":
             # Retries exhausted on a dropping / unresponsive connection. The model
             # is likely unreachable, so the caller may finish the work on a
@@ -2409,6 +2670,14 @@ def _agent_loop(
             display.tool_activity_start(name, args, permission_mode)
             try:
                 result, success = execute_tool(name, args, working_dir, permission_mode)
+            except interrupt.StopRequested:
+                # Stop landed mid-tool (the running command was already killed).
+                # Return the history CLEANLY rather than propagating, so the turn's
+                # work is kept and the next message continues from here.
+                display.tool_activity_end()
+                display.print_interrupted(iteration)
+                logger.log_session_end(iteration, reason="interrupted")
+                return note_stopped(messages), "interrupted"
             finally:
                 display.tool_activity_end()
 

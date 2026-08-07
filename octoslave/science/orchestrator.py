@@ -44,7 +44,6 @@ def run_science_turn(
     display.set_event_callback(emit)
     # Tell the orchestrator which models it may assign to specialists. Injected on
     # turn 1's system prompt; it persists in the message history for later turns.
-    pool_note = ""
     if pool:
         pool_note = (
             "## Specialist model pool\n"
@@ -53,6 +52,17 @@ def run_science_turn(
             "analysis, a fast/cheap model for routine work):\n"
             + "\n".join(f"- {m}" for m in pool)
             + f"\nOmit `model` to use the default ({pool[0]}). You run on {model}."
+            + "\nThese are the ONLY valid values: a model id from anywhere else "
+              "(however familiar) does not exist on this backend and will be refused."
+        )
+    else:
+        # Without this, models tend to invent a plausible-sounding id ("gpt-4.1")
+        # for spawn_specialist's `model`, which fails on the specialist's first call.
+        pool_note = (
+            "## Specialist models\n"
+            f"No specialist pool is configured for this session: every specialist "
+            f"you spawn runs on {model}, the same model as you. Do NOT pass `model` "
+            f"to spawn_specialist — there is no other model to choose from."
         )
     try:
         wd = session.working_dir
@@ -62,17 +72,22 @@ def run_science_turn(
         # stay on the node, lightweight results are fetched back. So we do NOT route
         # the orchestrator's own tools to the remote (remote=None below); the
         # remote choice is carried on session.remote_id (set by the caller).
+        # If the orchestrator's own model stops responding (or its endpoint starts
+        # rejecting what it produces), finish the turn on another model from the
+        # configured pool rather than dropping the conversation.
+        fallbacks = [m for m in pool if m != model]
         if not session.messages:
             messages = run_agent(
                 user_message, model, wd, client,
                 prompt_profile="science", permission_mode=permission_mode,
                 enable_plan=False, enable_verify=False, enable_memory=True,
-                remote=None, extra_system=pool_note,
+                remote=None, extra_system=pool_note, model_pool=fallbacks,
             )
         else:
             messages = continue_agent(
                 session.messages, user_message, model, wd, client,
                 permission_mode=permission_mode, remote=None,
+                model_pool=fallbacks,
             )
         session.messages = messages
         # Outputs reach the chat only when the orchestrator explicitly calls
@@ -86,6 +101,17 @@ def run_science_turn(
                 emit({"type": "science_artifact", "id": art.id, "rel": art.rel,
                       "path": art.path, "caption": art.caption, "kind": art.kind,
                       "provenance": art.provenance, "refreshed": True})
+        # A mid-tool stop unwinds the loop cleanly (history preserved and already
+        # annotated), so the turn returns normally — check the flag rather than
+        # relying on an exception, or a stop would be reported as a normal reply.
+        from .. import interrupt as _interrupt
+        if _interrupt.should_stop():
+            session.messages = messages
+            session.save()
+            emit({"type": "science_reply", "stopped": True, "text": (
+                "⏹ Stopped by you. Any running command was killed and the work so "
+                "far is saved — send a message to carry on from here.")})
+            return ""
         reply = _last_assistant_text(messages)
         emit({"type": "science_reply", "text": reply})
         session.save()

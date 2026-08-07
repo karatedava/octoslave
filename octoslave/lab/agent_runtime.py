@@ -19,16 +19,21 @@ import time
 from openai import OpenAI, BadRequestError
 
 from .. import display
+from .. import interrupt
 from ..agent import (
     _RT,
     _cap_result,
     _compact_and_trim,
     _handle_context_overflow,
     _is_context_window_error,
+    _is_malformed_history_error,
+    _is_model_unavailable_error,
     _is_retryable_error,
     _proactive_trim,
     _stream_completion,
     independent_soft_budget,
+    repair_messages,
+    ModelRestorer,
 )
 from ..tools import all_tool_definitions, execute_tool
 from .llm import strip_tool_markup
@@ -38,6 +43,15 @@ from .state import AgentSpec, AGENT_DONE, AGENT_WORKING
 _MAX_TURN_RETRIES = 2
 _RETRY_BACKOFF_SECS = 30
 _DEFAULT_MAX_ITER = 40
+
+# Failover budget. Each switch costs _MAX_TURN_RETRIES × _RETRY_BACKOFF_SECS of
+# waiting, so an unbounded loop would churn for hours getting nowhere. A turn that
+# succeeds resets the budget — these limit consecutive failures, not the run.
+_MAX_FAILOVERS = 6
+# Waits after a full sweep of every reachable model has failed. Escalating, since
+# by then the problem is the backend, not the model choice. Exhausting this list
+# ends the agent (with its partial work preserved) instead of looping forever.
+_SWEEP_BACKOFF_SECS = (60, 180, 300)
 
 
 def tools_for_agent(spec: AgentSpec) -> list[dict]:
@@ -87,8 +101,55 @@ def _stream_turn(client: OpenAI, model: str, messages: list[dict],
                 f"  ↻ Upstream {type(e).__name__}; retry "
                 f"{attempt + 1}/{_MAX_TURN_RETRIES} in {_RETRY_BACKOFF_SECS}s…"
             )
-            time.sleep(_RETRY_BACKOFF_SECS)
+            if interrupt.wait(_RETRY_BACKOFF_SECS):
+                raise interrupt.StopRequested
     raise last_exc  # pragma: no cover
+
+
+def _pick_alternate_model(failed: str, pool: list[str] | None,
+                          tried: set[str], client: OpenAI) -> str | None:
+    """An UNTRIED model to carry on with after ``failed`` gave up, or None.
+
+    Order: a random untried member of the configured pool (random so a run
+    doesn't deterministically pile onto the same second choice), then — once the
+    pool is exhausted — any untried chat model in the provider catalog, by the
+    usual family preference. Never returns a model already in ``tried``: bouncing
+    between two models that are both down just burns retry timeouts. When this
+    returns None the caller should back off rather than reuse something.
+    """
+    import random
+    untried_pool = [m for m in (pool or []) if m and m != failed and m not in tried]
+    if untried_pool:
+        return random.choice(untried_pool)
+    try:
+        from ..config import is_chat_model, list_models, load_config, pick_fallback_model
+        catalog = [m for m in (list_models(load_config()) or [])
+                   if m and m != failed and m not in tried and is_chat_model(m)]
+    except Exception:  # noqa: BLE001 — catalog unreachable
+        return None
+    if not catalog:
+        return None
+    return pick_fallback_model(failed, catalog) or random.choice(catalog)
+
+
+def _resumable(history: list[dict]) -> list[dict]:
+    """Trim a stored transcript to a state the API will accept as a prefix.
+
+    A run that ended on an error can leave a trailing assistant turn whose
+    tool_calls have no tool results — resuming on that is a 400. Drop such turns
+    (a transcript ending in tool results is fine).
+    """
+    msgs = list(history)
+    while msgs:
+        last = msgs[-1]
+        if last.get("role") == "assistant" and last.get("tool_calls"):
+            answered = {m.get("tool_call_id") for m in msgs if m.get("role") == "tool"}
+            if all(tc.get("id") in answered for tc in last["tool_calls"]):
+                break
+            msgs.pop()
+            continue
+        break
+    return msgs
 
 
 def run_agent_task(
@@ -102,12 +163,24 @@ def run_agent_task(
     permission_mode: str = "autonomous",
     context: str = "",
     emit=None,
+    history: list[dict] | None = None,
+    model_pool: list[str] | None = None,
 ) -> tuple[list[dict], str]:
     """Run ``spec`` against ``task`` and return ``(transcript, final_text)``.
 
     ``context`` is extra shared-state material (prior findings, the agenda)
     appended to the user message. ``emit`` is an optional event callback used to
     surface per-agent activity to the web UI.
+
+    ``history`` RESUMES a previous run of this agent: the transcript returned by
+    an earlier call is carried in as the starting messages, so the agent keeps
+    everything it already learned (and the dead ends it already hit) and ``task``
+    becomes its next instruction. Without it the agent starts fresh.
+
+    ``model_pool`` is the set of models this run may fall back to. When the active
+    model stops being usable — retries exhausted on a dropping connection, or an
+    endpoint that keeps rejecting what it produces — the agent picks a random
+    OTHER pool member and carries on with the same transcript rather than failing.
     """
     model = model or spec.model
     spec.status = AGENT_WORKING
@@ -127,14 +200,19 @@ def run_agent_task(
             except Exception:
                 pass
 
-    system_prompt = build_agent_system_prompt(spec, working_dir)
     user_blocks = [task.strip()]
     if context.strip():
         user_blocks.append("\n\n## Shared context\n" + context.strip())
-    messages: list[dict] = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": "\n".join(user_blocks)},
-    ]
+    messages: list[dict]
+    if history:
+        # Resume: keep the prior transcript (system prompt included) and append the
+        # next instruction. A resumed agent must not redo what it already did.
+        messages = _resumable(history) + [{"role": "user", "content": "\n".join(user_blocks)}]
+    else:
+        messages = [
+            {"role": "system", "content": build_agent_system_prompt(spec, working_dir)},
+            {"role": "user", "content": "\n".join(user_blocks)},
+        ]
 
     display.print_agent_banner(spec.name, model, 0, 0)
     _ev("start", role=spec.role, tools=spec.tools)
@@ -161,6 +239,59 @@ def run_agent_task(
             except Exception:
                 pass
 
+    # Model failover: when the active model can no longer be used, continue the
+    # SAME transcript on another one instead of losing the agent's work. The
+    # substitute is a stopgap — `restorer` watches for the chosen model coming
+    # back and returns to it, so an outage doesn't demote the rest of the run.
+    preferred_model = model
+    restorer: ModelRestorer | None = None
+    tried_models: set[str] = {model}
+    bad_shape = 0        # consecutive "endpoint rejected the history" 400s
+    stopped_reason = ""  # set when the loop breaks on an infrastructure failure
+    switches = 0         # failovers since the last turn that actually succeeded
+    sweeps = 0           # times we've been through every reachable model
+
+    def _failover(reason: str) -> bool:
+        """Move to another model, or return False to stop trying.
+
+        Every reachable model is tried before any is retried. When a whole sweep
+        fails, that is an outage rather than a bad model, so we wait — an
+        escalating pause, not another immediate lap — before starting over.
+        """
+        nonlocal model, tried_models, switches, sweeps, restorer
+        if switches >= _MAX_FAILOVERS:
+            return False
+        alt = _pick_alternate_model(model, model_pool, tried_models, client)
+        if not alt:
+            if sweeps >= len(_SWEEP_BACKOFF_SECS):
+                return False
+            wait = _SWEEP_BACKOFF_SECS[sweeps]
+            sweeps += 1
+            display.print_info(
+                f"[{spec.name}] Every available model is failing — the backend "
+                f"looks down. Waiting {wait}s before trying again."
+            )
+            _ev("backend_down", wait=wait, sweep=sweeps)
+            if interrupt.wait(wait):
+                raise interrupt.StopRequested
+            tried_models = {model}      # fresh sweep; the current model failed
+            alt = _pick_alternate_model(model, model_pool, tried_models, client)
+            if not alt:
+                return False
+        display.print_info(
+            f"[{spec.name}] {reason} on {model} — switching to {alt} to finish the work."
+        )
+        _ev("model_switch", from_model=model, to_model=alt, reason=reason)
+        tried_models.add(alt)
+        switches += 1
+        model = alt
+        sb = independent_soft_budget(client, alt)
+        if sb:
+            _RT.soft_budget = sb
+        if alt != preferred_model and restorer is None:
+            restorer = ModelRestorer(preferred_model)
+        return True
+
     t0 = time.time()
     iteration = 0
     final_text = ""
@@ -168,6 +299,16 @@ def run_agent_task(
     summary_nudged = False
     while iteration < max_iter:
         iteration += 1
+        # A user Stop must end the specialist too, not just the orchestrator that
+        # spawned it — otherwise Stop appears to hang until the specialist is done.
+        if interrupt.should_stop():
+            display.print_info(f"[{spec.name}] stopped by the user.")
+            _restore_budget()
+            # Carry the partial transcript on the exception so the caller can save
+            # it — a stopped specialist should be resumable, not thrown away.
+            stop = interrupt.StopRequested()
+            stop.transcript = messages          # type: ignore[attr-defined]
+            raise stop
         # Heartbeat: a single model turn can take minutes on a slow backend, and
         # state.json otherwise only updates at meeting boundaries — so a long
         # meeting LOOKS stuck. Emit a per-turn liveness event and refresh
@@ -180,14 +321,78 @@ def run_agent_task(
                     _sess.touch()
             except Exception:
                 pass
+        # Working on a substitute after a failover? Go back to the model this
+        # agent was given as soon as it is serving again.
+        if restorer is not None and restorer.due(model):
+            if restorer.recovered(client):
+                display.print_info(
+                    f"[{spec.name}] {preferred_model} is responding again — "
+                    f"switching back from {model}.")
+                _ev("model_switch", from_model=model, to_model=preferred_model,
+                    reason="preferred model recovered")
+                model = preferred_model
+                tried_models = {model}
+                sb = independent_soft_budget(client, model)
+                if sb:
+                    _RT.soft_budget = sb
+                restorer = None
         # Re-resolve the offered tools each turn so a tool the agent just built
         # via request_tool (granted back to spec.tools) becomes callable now.
         tools = tools_for_agent(spec)
         messages = _proactive_trim(messages, label=spec.name, client=client, model=model)
+        # Strict OpenAI-compatible endpoints (vLLM behind litellm) 400 on shapes
+        # some models emit — most often an assistant turn with no text and no
+        # tool calls. Normalise before every request so it never reaches the wire.
+        messages, _ = repair_messages(messages)
         try:
             response = _stream_turn(client, model, messages, tools)
+            # Progress. Forgive the past: every model becomes a candidate again,
+            # and the failover budget resets — these bound consecutive failures,
+            # not the lifetime of the run.
+            bad_shape = 0
+            switches = 0
+            sweeps = 0
+            tried_models = {model}
         except BadRequestError as e:
             err = str(e)
+            if _is_model_unavailable_error(err):
+                # Dead deployment / stale model id — the conversation is fine.
+                if _failover("Model is not available on this backend"):
+                    iteration -= 1
+                    continue
+                display.print_error(f"[{spec.name}] {model} is not available and "
+                                    f"no alternative model was found.")
+                stopped_reason = "no reachable model"
+                break
+            if _is_malformed_history_error(err):
+                # Repair what we can; if there's nothing left to repair, drop the
+                # last exchange; if it STILL fails, this model and this endpoint
+                # don't agree — carry on somewhere else.
+                bad_shape += 1
+                repaired, fixed = repair_messages(messages)
+                if fixed:
+                    display.print_info(
+                        f"[{spec.name}] Endpoint rejected {fixed} message(s) — "
+                        f"repaired and retrying.")
+                    messages = repaired
+                    iteration -= 1
+                    continue
+                if bad_shape <= 2 and len(repaired) > 2:
+                    while len(repaired) > 2 and repaired[-1].get("role") in ("tool", "assistant"):
+                        repaired.pop()
+                    messages = repaired
+                    display.print_info(
+                        f"[{spec.name}] Rolling back the last exchange and retrying.")
+                    iteration -= 1
+                    continue
+                if _failover("Endpoint keeps rejecting this model's messages"):
+                    messages = repaired
+                    bad_shape = 0
+                    iteration -= 1
+                    continue
+                display.print_error(f"[{spec.name}] API error: {e}")
+                stopped_reason = "the endpoint rejected this model's messages"
+                break
             if _is_context_window_error(err):
                 trimmed, progressed = _handle_context_overflow(messages, client, model)
                 if progressed:
@@ -195,6 +400,7 @@ def run_agent_task(
                     iteration -= 1
                     continue
                 display.print_error(f"[{spec.name}] Context exhausted; stopping.")
+                stopped_reason = "context exhausted"
                 break
             if "Unterminated string" in err or "Extra data" in err:
                 popped = 0
@@ -209,12 +415,36 @@ def run_agent_task(
                     "complete, valid response.")})
                 iteration -= 1
                 continue
+            # Some other 400 this model keeps producing — try another model
+            # before giving up on the agent's work.
+            if _failover(f"{type(e).__name__}"):
+                iteration -= 1
+                continue
             display.print_error(f"[{spec.name}] API error: {e}")
             break
         except KeyboardInterrupt:
             display.stream_end(False)
             _restore_budget()
             raise
+        except Exception as e:  # noqa: BLE001 — connection died for good
+            # _stream_turn already retried transient failures with backoff. If we
+            # land here the model is effectively unreachable: continue the same
+            # transcript on another model rather than losing the whole run.
+            display.stream_end(False)
+            reason = ("Connection kept dropping" if _is_retryable_error(e)
+                      else type(e).__name__)
+            if _failover(reason):
+                iteration -= 1
+                continue
+            # Out of options. Stop here rather than churning — the work done so
+            # far is kept (transcript + summary), so this agent can be resumed
+            # once the backend recovers instead of starting over.
+            display.print_error(
+                f"[{spec.name}] {reason} and no model is reachable — stopping with "
+                f"the work done so far; resume this specialist once the backend is "
+                f"back. ({e})")
+            stopped_reason = reason.lower()
+            break
 
         content = response["content"]
         tool_calls = response["tool_calls"]
@@ -257,7 +487,15 @@ def run_agent_task(
 
             display.print_tool_call(name, args)
             _ev("tool_call", tool=name)
-            result, success = execute_tool(name, args, working_dir, permission_mode)
+            try:
+                result, success = execute_tool(name, args, working_dir, permission_mode)
+            except interrupt.StopRequested as stop:
+                # Carry the partial transcript out so the caller can save it and
+                # this agent stays resumable after the user's stop.
+                display.print_info(f"[{spec.name}] stopped by the user mid-tool.")
+                _restore_budget()
+                stop.transcript = messages      # type: ignore[attr-defined]
+                raise
             result = _cap_result(result, name)
             display.print_tool_result(name, result, success)
             _ev("tool_result", tool=name, ok=success)
@@ -289,6 +527,14 @@ def run_agent_task(
                         writes.append(p)
         final_text = ("(Agent returned no text summary.) Files written/modified: "
                       + (", ".join(sorted(set(writes))) if writes else "none recorded") + ".")
+
+    if stopped_reason:
+        # Say plainly that this is partial, so whoever reads the summary resumes
+        # the agent instead of treating the work as finished (or redoing it).
+        final_text = (
+            f"⚠ INCOMPLETE — stopped early: {stopped_reason}. Everything done so "
+            f"far is preserved; resume this agent to carry on rather than starting "
+            f"the task over.\n\n{final_text}")
 
     spec.status = AGENT_DONE
     if _foundry is not None:

@@ -60,3 +60,36 @@ def should_stop() -> bool:
     with _lock:
         ev = _events.get(threading.get_ident())
     return ev is not None and ev.is_set()
+
+
+# What the agent (and any later session that reads the history) is told about why
+# the run ended. Kept here so every layer reports a stop the same way.
+STOP_NOTICE = (
+    "[The user stopped this session.] Work was interrupted mid-task, so the last "
+    "action may be incomplete and any command that was running was killed. Nothing "
+    "here is a failure of the work itself. When the session resumes, check the "
+    "current state of the files before continuing, and do not redo steps that "
+    "already completed."
+)
+
+
+def wait(seconds: float, poll: float = 0.25) -> bool:
+    """Sleep, but wake immediately when a stop is requested for this thread.
+
+    Retry/backoff waits are the main reason a Stop used to take minutes to land:
+    a plain ``time.sleep(30)`` cannot be interrupted. Returns True if the wait was
+    cut short by a stop.
+    """
+    import time as _t
+    with _lock:
+        ev = _events.get(threading.get_ident())
+    if ev is None:
+        _t.sleep(seconds)
+        return False
+    return ev.wait(seconds)     # returns True as soon as the Event is set
+
+
+def raise_if_stopped() -> None:
+    """Raise ``StopRequested`` if a stop is pending for this thread."""
+    if should_stop():
+        raise StopRequested

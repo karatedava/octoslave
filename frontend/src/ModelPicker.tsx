@@ -13,12 +13,17 @@ export function ModelPicker(props: {
   if (!props.models.length) return null;
   const toggle = (m: string) =>
     props.setPool((p) => (p.includes(m) ? p.filter((x) => x !== m) : [...p, m]));
+  // A restored session may name a model the catalog no longer lists; keep it
+  // selectable rather than showing an empty dropdown.
+  const models = props.orchModel && !props.models.includes(props.orchModel)
+    ? [props.orchModel, ...props.models]
+    : props.models;
 
   return (
     <div className="model-picker">
       <label>{props.orchLabel}</label>
       <select value={props.orchModel} onChange={(e) => props.setOrchModel(e.target.value)}>
-        {props.models.map((m) => (
+        {models.map((m) => (
           <option key={m} value={m}>{m}</option>
         ))}
       </select>

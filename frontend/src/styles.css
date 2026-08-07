@@ -42,6 +42,9 @@ body {
 .dot.off { background: var(--bad); }
 .round-badge { font-size: 12px; font-weight: 600; padding: 3px 12px; border-radius: 999px;
   background: var(--accent); color: #fff; }
+/* which model this session actually runs on — muted, so it reads as metadata */
+.round-badge.model { background: var(--chip); color: #9ec1ff; font-weight: 500;
+  max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .toggle { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); cursor: pointer; }
 .toggle.big { font-size: 14px; color: var(--text); }
 
@@ -275,6 +278,13 @@ body {
 .sci-note.bad { color: var(--bad); border-color: #5a2626; }
 .sci-note.tool { color: var(--muted); }
 .sci-working { align-self: flex-start; color: var(--accent); font-size: 13px; padding: 4px 8px; }
+
+/* a spawned specialist holds the floor — its turn is offset and tinted so it
+   reads as a different voice from the orchestrator's */
+.sci-msg.byspec { margin-left: 26px; border-left: 3px solid #8b5cf6; background: #1a1526; }
+.sci-msg.byspec .sci-msg-who { color: #c89bff; }
+.sci-note.byspec { color: #b48ce0; border-color: #3a2b52; }
+.sci-note-who { color: #c89bff; margin-right: 6px; }
 
 /* artifact card */
 .sci-art { align-self: stretch; background: var(--panel); border: 1px solid var(--accent);

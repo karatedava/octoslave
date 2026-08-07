@@ -226,6 +226,21 @@ def _model_family(model: str) -> str:
 # strongest general-purpose coders on the default (e-INFRA) provider.
 FALLBACK_MODEL_FAMILIES: tuple[str, ...] = ("kimi", "glm", "deepseek")
 
+# Substrings marking non-chat models (embeddings/rerankers/audio). They must never
+# be offered in a model picker or chosen as a fallback for a chat agent. Covers the
+# common embedding families whose ids don't contain "embed" (e5, bge, gte, jina, …).
+NON_CHAT_MODEL_HINTS: tuple[str, ...] = (
+    "embed", "rerank", "whisper", "reranker",
+    "-e5-", "e5-large", "e5-mistral", "multilingual-e5", "bge-", "gte-",
+    "jina-embed", "nomic",
+)
+
+
+def is_chat_model(model: str) -> bool:
+    """False for embedding/rerank/audio model ids."""
+    m = (model or "").lower()
+    return bool(m) and not any(h in m for h in NON_CHAT_MODEL_HINTS)
+
 
 def pick_fallback_model(failed_model: str, available: list[str] | None) -> str | None:
     """Choose a substitute model to continue work the active model could not

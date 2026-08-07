@@ -14,8 +14,11 @@ type Artifact = {
   comments?: { text: string; at: string }[];
   ver?: number;   // bumped on each update → cache-busts the preview URL
 };
+// `who`/`icon` name the agent that produced the item — absent means the
+// orchestrator itself; set while a spawned specialist holds the floor.
+type Speaker = { who?: string; icon?: string };
 type Feed =
-  | { t: "msg"; id: number; role: Role; text: string; tone?: string }
+  | ({ t: "msg"; id: number; role: Role; text: string; tone?: string } & Speaker)
   | { t: "art"; id: number; art: Artifact };
 
 type Specialist = {
@@ -43,6 +46,7 @@ export default function Science() {
 
   const [feed, setFeed] = useState<Feed[]>([]);
   const [live, setLive] = useState("");            // streaming assistant draft
+  const [liveWho, setLiveWho] = useState<Speaker>({});  // who is speaking right now
   const [input, setInput] = useState("");
   const [specialists, setSpecialists] = useState<Specialist[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -61,17 +65,25 @@ export default function Science() {
   const [showPlan, setShowPlan] = useState(true);
 
   const feedId = useRef(0);
+  // Live mirror of the run settings. The socket handler is registered once (on
+  // mount), so anything it calls sees FIRST-RENDER state — which is how the
+  // opening message of a session used to go out with no model and land on the
+  // backend default. Reads go through this ref, never the closure.
+  const runCfg = useRef({ orchModel: "", pool: [] as string[], workingDir: "", remoteId: "" });
+  const runningRef = useRef(false);   // same reason: the handler can't see `running`
   const lastAssistant = useRef("");
   const pendingFirst = useRef<string>("");
   const resuming = useRef(false);
   const artIds = useRef<Set<string>>(new Set());
   const scrollRef = useRef<HTMLDivElement>(null);
+  const reconnected = useRef(false);   // false only until the first socket open
+  const pollTimer = useRef(0);         // set while polling a disconnected turn
 
   function push(item: Omit<Feed, "id">) {
     setFeed((f) => [...f, { ...(item as any), id: feedId.current++ }]);
   }
-  function note(text: string, tone?: string) {
-    push({ t: "msg", role: "note", text, tone } as any);
+  function note(text: string, tone?: string, from?: Speaker) {
+    push({ t: "msg", role: "note", text, tone, ...(from || {}) } as any);
   }
   function upsertArtifact(a: Artifact) {
     setArtifacts((arr) => {
@@ -100,6 +112,10 @@ export default function Science() {
   }, [feed, live]);
 
   useEffect(() => {
+    runCfg.current = { orchModel, pool, workingDir, remoteId };
+  }, [orchModel, pool, workingDir, remoteId]);
+
+  useEffect(() => {
     fetch("/api/remotes")
       .then((r) => r.json())
       .then((d) => setRemotes(Array.isArray(d.remotes) ? d.remotes : []))
@@ -109,57 +125,104 @@ export default function Science() {
       .then((d) => {
         const ms: string[] = Array.isArray(d.models) ? d.models : [];
         setModels(ms);
-        setOrchModel(d.default && ms.includes(d.default) ? d.default : ms[0] || "");
+        // Only seed the default if nothing is chosen yet — this request races
+        // with the session restore, and must never clobber a restored choice.
+        setOrchModel((cur) =>
+          cur || (d.default && ms.includes(d.default) ? d.default : ms[0] || ""));
       })
       .catch(() => {});
   }, []);
 
   useEffect(() => {
-    sock.onOpen(() => setConnected(true));
+    sock.onOpen(() => {
+      setConnected(true);
+      // A reconnect means a fresh server-side connection: a turn started on the
+      // old socket still runs, but its events (including science_done) can never
+      // reach us. Ask the server who is actually still working, so the tab can't
+      // sit "running" forever — or claim to be idle while a turn is alive.
+      if (reconnected.current) resyncRunning();
+      reconnected.current = true;
+    });
+    sock.onClose(() => setConnected(false));
     sock.onMessage((m) => {
       switch (m.type) {
         case "science_user":
           push({ t: "msg", role: "user", text: m.text } as any);
           break;
         case "stream_start":
+          setLiveWho(speakerOf(m));
           break;
         case "token":
           setLive((s) => s + (m.text || ""));
+          setLiveWho(speakerOf(m));
           break;
         case "reasoning":
           break;
-        case "stream_end":
+        case "stream_end": {
+          const from = speakerOf(m);
+          // An aborted stream is thrown away server-side — it never reaches the
+          // message history, so the model will redo the turn from scratch.
+          // Keeping the draft in the feed made a stalling run look like it was
+          // repeatedly "about to" act, when in fact nothing had been said yet.
+          if (m.aborted) {
+            setLive((s) => {
+              if (s.trim()) note("↺ That response was cut off mid-stream and discarded — "
+                + "the model will redo this step.", "bad", from);
+              return "";
+            });
+            setLiveWho({});
+            break;
+          }
           setLive((s) => {
             const t = s.trim();
             if (t) {
               lastAssistant.current = t;
-              push({ t: "msg", role: "assistant", text: t } as any);
+              push({ t: "msg", role: "assistant", text: t, ...from } as any);
             }
             return "";
           });
           break;
+        }
         case "science_reply": {
           const t = (m.text || "").trim();
+          const from = speakerOf(m);
           setLive((s) => {
             const draft = s.trim();
             if (draft) {
+              lastAssistant.current = draft;
+              push({ t: "msg", role: "assistant", text: draft, ...from } as any);
+            }
+            return "";
+          });
+          setLiveWho({});
+          if (t && t !== lastAssistant.current) {
+            lastAssistant.current = t;
+            push({ t: "msg", role: "assistant", text: t, tone: m.stopped ? "warn" : undefined } as any);
+          }
+          break;
+        }
+        // The ONLY end-of-turn signal: the server sends it once the turn thread
+        // has actually finished. A reply alone isn't enough (the orchestrator can
+        // keep working after one), and an error certainly isn't — a mid-run error
+        // is often recovered from, e.g. a dead model swapped for a fallback.
+        case "science_done":
+          setLive((s) => {
+            const draft = s.trim();
+            if (draft && draft !== lastAssistant.current) {
               lastAssistant.current = draft;
               push({ t: "msg", role: "assistant", text: draft } as any);
             }
             return "";
           });
-          if (t && t !== lastAssistant.current) {
-            lastAssistant.current = t;
-            push({ t: "msg", role: "assistant", text: t, tone: m.stopped ? "warn" : undefined } as any);
-          }
+          setLiveWho({});
+          runningRef.current = false;
           setRunning(false);
           break;
-        }
         case "tool_call":
-          note(`${toolIcon(m.name)} ${m.summary || m.name}`, "tool");
+          note(`${toolIcon(m.name)} ${m.summary || m.name}`, "tool", speakerOf(m));
           break;
         case "tool_result":
-          if (m.ok === false) note(`⚠ ${m.name} failed`, "bad");
+          if (m.ok === false) note(`⚠ ${m.name} failed`, "bad", speakerOf(m));
           break;
         case "todos":
           setTodos((m.todos || []).map((t: any) =>
@@ -170,13 +233,22 @@ export default function Science() {
           if (m.text) push({ t: "msg", role: "note", text: "🗺 Plan:\n" + m.text, tone: "info" } as any);
           break;
         case "science_specialist":
+          setLiveWho({});
           if (m.event === "start") {
-            setSpecialists((s) => [
-              ...s.filter((x) => x.id !== m.id),
-              { id: m.id, name: m.name, role: m.role, goal: m.goal, icon: m.icon || "🔬",
-                status: "working", summary: "", tools: m.tools || [] },
-            ]);
-            note(`${m.icon || "🔬"} Spun up specialist — ${m.name} (${m.role})`, "spec");
+            // A resumed specialist keeps its slot (and its previous summary) —
+            // it's the same agent picking its work back up, not a new one.
+            setSpecialists((s) => {
+              const prev = s.find((x) => x.id === m.id);
+              const next = {
+                id: m.id, name: m.name, role: m.role, goal: m.goal, icon: m.icon || "🔬",
+                status: "working", summary: m.resumed ? prev?.summary || "" : "",
+                tools: m.tools || [],
+              };
+              return prev ? s.map((x) => (x.id === m.id ? next : x)) : [...s, next];
+            });
+            note(m.resumed
+              ? `${m.icon || "🔬"} Resumed specialist — ${m.name} (continuing its earlier work)`
+              : `${m.icon || "🔬"} Spun up specialist — ${m.name} (${m.role})`, "spec");
             setSide("team");
           } else if (m.event === "done") {
             setSpecialists((s) => s.map((x) => x.id === m.id
@@ -198,11 +270,12 @@ export default function Science() {
           upsertArtifact({ id: m.id, rel: m.rel, path: m.path, caption: m.caption,
             kind: m.kind, provenance: m.provenance });
           if (isUpdate) {
-            note(`🔄 Updated — ${m.caption || m.rel}`, "ok");
+            note(`🔄 Updated — ${m.caption || m.rel}`, "ok", speakerOf(m));
             // scroll back to the refreshed card so the user sees the new version
             setTimeout(() => focusArtifact(m.id), 90);
           } else {
-            note(`🖼 Output ready — ${m.caption || m.rel} (comment below to refine)`, "spec");
+            note(`🖼 Output ready — ${m.caption || m.rel} (comment below to refine)`, "spec",
+              speakerOf(m));
             setSide("outputs");
           }
           break;
@@ -216,6 +289,20 @@ export default function Science() {
             (m.history || []).forEach((h: any) =>
               push({ t: "msg", role: h.role, text: h.text } as any));
             const snap = m.snapshot || {};
+            // Reopening (or a refresh, which skips the start form) must keep the
+            // models this session was started with — not fall back to the
+            // backend's default_model. But when the user just picked models on
+            // the start form (pendingFirst), THEIR choice wins over the stored one.
+            if (!pendingFirst.current) {
+              if (snap.model) {
+                setOrchModel(snap.model);
+                runCfg.current = { ...runCfg.current, orchModel: snap.model };
+              }
+              if (Array.isArray(snap.specialist_models) && snap.specialist_models.length) {
+                setPool(snap.specialist_models);
+                runCfg.current = { ...runCfg.current, pool: snap.specialist_models };
+              }
+            }
             setSpecialists(snap.specialists || []);
             setJobs(snap.jobs || []);
             setProv(snap.provenance || []);
@@ -242,14 +329,20 @@ export default function Science() {
           note(m.text, "info");
           break;
         case "error":
+          // Reported, but the turn keeps its running state until science_done.
           note(m.text, "bad");
-          setRunning(false);
           break;
       }
     });
     sock.connect();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Events carry `agent_name`/`agent_icon` only while a spawned specialist holds
+  // the floor; without them the orchestrator is speaking.
+  function speakerOf(m: any): Speaker {
+    return m && m.agent_name ? { who: m.agent_name, icon: m.agent_icon || "🔬" } : {};
+  }
 
   function nameOf(id: string): string {
     return specialists.find((s) => s.id === id)?.name || "Specialist";
@@ -263,9 +356,58 @@ export default function Science() {
     } catch { /* ignore */ }
   }
 
+  async function isSessionAlive(dir: string): Promise<boolean> {
+    const r = await fetch("/api/science/sessions");
+    const d = await r.json();
+    return !!(d.sessions || []).find((s: SessionMeta) => s.working_dir === dir)?.running;
+  }
+
+  // Called after the socket reconnects mid-turn. Our Stop button belonged to the
+  // old connection and the turn's events go nowhere now, so drop the local
+  // running flag; if the turn is still alive, keep the composer locked (that is
+  // what remoteRunning means) until it ends.
+  async function resyncRunning() {
+    const dir = runCfg.current.workingDir || "";
+    if (!dir || !runningRef.current) return;
+    runningRef.current = false;
+    setRunning(false);
+    let alive = false;
+    try {
+      alive = await isSessionAlive(dir);
+    } catch { /* treat as finished — better idle than stuck */ }
+    setRemoteRunning(alive);
+    note(alive
+      ? "⚠ Lost the live connection to the server — the turn is still running there. "
+        + "Watching for it to finish…"
+      : "⚠ Lost the live connection to the server — the turn is no longer running.", "bad");
+    if (alive) pollUntilIdle(dir);
+  }
+
+  function pollUntilIdle(dir: string) {
+    if (pollTimer.current) return;
+    const tick = async () => {
+      pollTimer.current = 0;
+      try {
+        if (await isSessionAlive(dir)) {
+          pollTimer.current = window.setTimeout(tick, 8000);
+          return;
+        }
+      } catch {
+        pollTimer.current = window.setTimeout(tick, 8000);
+        return;
+      }
+      setRemoteRunning(false);
+      note("✓ That turn finished — reopen the session to load what it produced.", "ok");
+    };
+    pollTimer.current = window.setTimeout(tick, 8000);
+  }
+
   function resetView() {
-    setFeed([]); setLive(""); setSpecialists([]); setJobs([]); setProv([]);
+    setFeed([]); setLive(""); setLiveWho({}); setSpecialists([]); setJobs([]); setProv([]);
     setTodos([]); setArtifacts([]);
+    setRunning(false);
+    runningRef.current = false;
+    if (pollTimer.current) { clearTimeout(pollTimer.current); pollTimer.current = 0; }
     lastAssistant.current = "";
     artIds.current = new Set();
   }
@@ -274,6 +416,8 @@ export default function Science() {
     if (!dir.trim()) return;
     resetView();
     setWorkingDir(dir);
+    // Synchronously, so the first message can't race the state update.
+    runCfg.current = { ...runCfg.current, workingDir: dir };
     setStarted(true);
     setShowSessions(false);
     setRemoteRunning(false);
@@ -318,9 +462,17 @@ export default function Science() {
   }
 
   function sendMessage(text: string) {
-    if (!text.trim() || running) return;
+    if (!text.trim() || runningRef.current) return;
+    runningRef.current = true;
     setRunning(true);
-    sock.send({ type: "science_message", message: text, working_dir: workingDir, remote_id: remoteId || null, model: orchModel || undefined, specialist_models: pool });
+    const c = runCfg.current;
+    sock.send({
+      type: "science_message", message: text,
+      working_dir: c.workingDir || workingDir,
+      remote_id: c.remoteId || null,
+      model: c.orchModel || undefined,
+      specialist_models: c.pool,
+    });
   }
   function onSend() {
     const t = input.trim();
@@ -332,9 +484,16 @@ export default function Science() {
     sock.send({ type: "stop" });
   }
   function comment(artId: string, text: string) {
-    if (!text.trim() || running) return;
+    if (!text.trim() || runningRef.current) return;
+    runningRef.current = true;
     setRunning(true);
-    sock.send({ type: "science_comment", artifact_id: artId, text, working_dir: workingDir, remote_id: remoteId || null });
+    // Same model/pool as a normal turn — a refine must not silently run on a
+    // different model from the rest of the session.
+    const c = runCfg.current;
+    sock.send({ type: "science_comment", artifact_id: artId, text,
+                working_dir: c.workingDir || workingDir,
+                remote_id: c.remoteId || null, model: c.orchModel || undefined,
+                specialist_models: c.pool });
   }
   function focusArtifact(id: string) {
     const el = document.getElementById("sciart-" + id);
@@ -369,6 +528,11 @@ export default function Science() {
             )}
           </div>
           {started && <span className="round-badge" title={workingDir}>{shortDir(workingDir)}</span>}
+          {started && orchModel && (
+            <span className="round-badge model" title={
+              `Orchestrator: ${orchModel}${pool.length ? ` · specialist pool: ${pool.join(", ")}` : ""}`
+            }>🧠 {orchModel}{pool.length ? ` +${pool.length}` : ""}</span>
+          )}
           <span className={"dot " + (connected ? "on" : "off")} title={connected ? "Connected" : "Disconnected"} />
           {running && <button className="btn danger" onClick={stop}>Stop</button>}
         </div>
@@ -483,13 +647,22 @@ export default function Science() {
                 <ArtifactCard key={it.id} art={it.art} workingDir={workingDir}
                   onComment={comment} running={running} />
               ) : it.role === "note" ? (
-                <div key={it.id} className={"sci-note " + (it.tone || "")}>{it.text}</div>
+                <div key={it.id} className={"sci-note " + (it.tone || "") + (it.who ? " byspec" : "")}>
+                  {it.who && <span className="sci-note-who">{it.icon} {it.who}</span>}
+                  {it.text}
+                </div>
               ) : (
-                <ChatBubble key={it.id} role={it.role} text={it.text} tone={it.tone} />
+                <ChatBubble key={it.id} role={it.role} text={it.text} tone={it.tone}
+                  who={it.who} icon={it.icon} />
               )
             )}
-            {live && <ChatBubble role="assistant" text={live} streaming />}
-            {running && !live && <div className="sci-working">● working…</div>}
+            {live && <ChatBubble role="assistant" text={live} streaming
+              who={liveWho.who} icon={liveWho.icon} />}
+            {running && !live && (
+              <div className="sci-working">
+                ● {liveWho.who ? `${liveWho.icon} ${liveWho.who}` : "Orchestrator"} working…
+              </div>
+            )}
           </main>
 
           <aside className="sci-side">
@@ -582,11 +755,12 @@ function SessionMenu({ sessions, current, onOpen, onNew, onForget }: {
   );
 }
 
-function ChatBubble({ role, text, tone, streaming }:
-  { role: Role; text: string; tone?: string; streaming?: boolean }) {
+function ChatBubble({ role, text, tone, streaming, who, icon }:
+  { role: Role; text: string; tone?: string; streaming?: boolean } & Speaker) {
+  const label = role === "user" ? "You" : who ? `${icon || "🔬"} ${who}` : "Orchestrator";
   return (
-    <div className={"sci-msg " + role + (tone ? " " + tone : "")}>
-      <div className="sci-msg-who">{role === "user" ? "You" : "Orchestrator"}</div>
+    <div className={"sci-msg " + role + (tone ? " " + tone : "") + (who ? " byspec" : "")}>
+      <div className="sci-msg-who">{label}</div>
       <div className="sci-msg-text">{text}{streaming && <span className="sci-caret">▋</span>}</div>
     </div>
   );
@@ -602,6 +776,7 @@ const TOOL_ICONS: Record<string, string> = {
   grep: "🔎", list_dir: "📁", web_search: "🌐", web_fetch: "🌐",
   bio_inspect: "🧬", present_output: "🖼", record_provenance: "📎",
   curate_dataset: "🗂", literature_search: "📚", spawn_specialist: "🔬",
+  continue_specialist: "🔁",
   submit_cluster_job: "🖥", check_cluster_job: "🖥", todo_write: "✅",
 };
 function toolIcon(name: string): string {
