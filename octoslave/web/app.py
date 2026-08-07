@@ -14,6 +14,7 @@ import asyncio
 import json
 import threading
 import uuid
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
@@ -570,6 +571,94 @@ _EDITABLE_EXT = {".md", ".txt", ".csv", ".tsv", ".json", ".html", ".htm",
 # "running" badge and guards against two connections driving the same session.
 _ACTIVE_SCIENCE: set[str] = set()
 
+# How many recent events a re-attaching viewer gets replayed. Enough to cover the
+# tool calls and streamed text of a long turn without holding a whole run in RAM.
+_HUB_BACKLOG = 600
+
+
+class _ScienceHub:
+    """Event fan-out for one running Science turn.
+
+    A turn's events used to go straight to the websocket connection that STARTED
+    it. Reloading the page therefore orphaned the run: the turn kept working, but
+    everything it emitted went to a socket nobody was reading, and the new page
+    could only sit on restored history with a locked composer.
+
+    The hub belongs to the SESSION instead, so any connection can attach — a
+    reload, a second tab, a browser reopened an hour later — and a late joiner
+    gets the recent backlog replayed before the live stream continues. Publishing
+    happens on the turn's worker thread, so each subscriber carries the event loop
+    it belongs to and is woken through ``call_soon_threadsafe``.
+    """
+
+    def __init__(self, key: str):
+        self.key = key
+        self.agent_ident: int | None = None   # thread id, so ANY viewer can Stop
+        self._subs: set[tuple] = set()        # {(loop, queue)}
+        self._backlog: "deque[dict]" = deque(maxlen=_HUB_BACKLOG)
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def publish(self, event: dict) -> None:
+        with self._lock:
+            # The sentinel is a control signal for the drain loops, not content —
+            # replaying it to a later viewer would end its stream immediately.
+            if event.get("type") != "_sentinel":
+                self._backlog.append(event)
+            subs = list(self._subs)
+        for loop, q in subs:
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, event)
+            except RuntimeError:      # that viewer's loop is gone
+                with self._lock:
+                    self._subs.discard((loop, q))
+
+    def attach(self, loop, q) -> list[dict]:
+        """Subscribe and return what has already happened this turn.
+
+        A turn that ALREADY finished hands back a trailing sentinel: the live
+        sentinel was published before this subscriber existed, and without it here
+        the caller's drain loop would wait for an event that can never come.
+        """
+        with self._lock:
+            self._subs.add((loop, q))
+            out = list(self._backlog)
+            if self._closed:
+                out.append({"type": "_sentinel"})
+            return out
+
+    def detach(self, loop, q) -> None:
+        with self._lock:
+            self._subs.discard((loop, q))
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+        self.publish({"type": "_sentinel"})
+
+
+_SCIENCE_HUBS: dict[str, _ScienceHub] = {}
+_HUBS_LOCK = threading.Lock()
+
+
+def _open_hub(key: str) -> _ScienceHub:
+    hub = _ScienceHub(key)
+    with _HUBS_LOCK:
+        _SCIENCE_HUBS[key] = hub
+    return hub
+
+
+def _get_hub(key: str) -> "_ScienceHub | None":
+    with _HUBS_LOCK:
+        return _SCIENCE_HUBS.get(key)
+
+
+def _close_hub(key: str) -> None:
+    with _HUBS_LOCK:
+        hub = _SCIENCE_HUBS.pop(key, None)
+    if hub is not None:
+        hub.close()
+
 
 @app.get("/api/science/sessions")
 async def science_sessions():
@@ -702,6 +791,72 @@ async def ws_endpoint(websocket: WebSocket):
             await recv_task
         except asyncio.CancelledError:
             pass
+
+    async def stream_science(hub: "_ScienceHub") -> None:
+        """Forward one Science turn's events to THIS socket until the turn ends.
+
+        Used by the connection that started the turn and by any that attach later
+        (a reload, a second tab). Each viewer gets its own queue, seeded with the
+        backlog, so re-attaching mid-run shows what has already happened instead
+        of a frozen page. Stop is routed through the hub's recorded thread id, so
+        it works from a viewer that did not start the run.
+        """
+        q: asyncio.Queue = asyncio.Queue()
+        for ev in hub.attach(loop, q):
+            q.put_nowait(ev)
+
+        async def _drain():
+            while True:
+                event = await q.get()
+                if event.get("type") == "_sentinel":
+                    return
+                try:
+                    await websocket.send_json(event)
+                except Exception:
+                    return
+
+        async def _recv():
+            while True:
+                try:
+                    raw = await websocket.receive_text()
+                except Exception:
+                    return          # this viewer's socket is gone
+                try:
+                    msg = json.loads(raw)
+                    mt = msg.get("type")
+                    if mt == "permission_response":
+                        resolve_permission(bool(msg.get("allow", False)))
+                    elif mt == "user_response":
+                        resolve_user_response(str(msg.get("answer", "")))
+                    elif mt in ("stop", "stop_chat"):
+                        ident = hub.agent_ident or state.get("agent_ident")
+                        if ident and interrupt.request_stop(ident):
+                            hub.publish({
+                                "type": "info",
+                                "text": "⏹ Stopping — killing the running command "
+                                        "and ending the turn.",
+                            })
+                except Exception:
+                    continue        # bad message — ignore it, keep watching
+
+        drain_task = asyncio.create_task(_drain())
+        recv_task = asyncio.create_task(_recv())
+        try:
+            # Whichever happens first: the turn ends (drain hits the sentinel) or
+            # this viewer disconnects (recv returns). Waiting only on the drain
+            # meant a viewer that closed mid-turn left its handler parked on an
+            # empty queue until the run happened to emit again.
+            await asyncio.wait({drain_task, recv_task},
+                               return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            hub.detach(loop, q)
+            for t in (drain_task, recv_task):
+                t.cancel()
+            for t in (drain_task, recv_task):
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     async def send(event: dict) -> None:
         try:
@@ -1528,18 +1683,42 @@ async def ws_endpoint(websocket: WebSocket):
                 working_dir = msg.get("working_dir") or state["working_dir"]
                 state["working_dir"] = working_dir
                 from ..science.session import ScienceSession
+                # Same key science_message registers under — the client may send an
+                # unresolved path, and a hub lookup that misses would silently put
+                # us back to the old "frozen page" behaviour.
+                key = str(Path(working_dir).expanduser().resolve())
+                live = _get_hub(key) if key in _ACTIVE_SCIENCE else None
                 sess = ScienceSession.load(working_dir)
-                if sess is None:
+                if sess is None and live is None:
                     await send({"type": "science_state", "exists": False,
                                 "working_dir": working_dir})
                 else:
-                    state["science_session"] = sess
+                    # A session whose FIRST turn is still running has nothing on
+                    # disk yet (it saves at end of turn) — but there is a live run
+                    # to watch, so this is very much an existing session.
+                    if sess is not None:
+                        state["science_session"] = sess
                     await send({"type": "science_state", "exists": True,
                                 "working_dir": working_dir,
-                                "task": sess.task,
-                                "running": sess.working_dir in _ACTIVE_SCIENCE,
-                                "history": _science_history(sess.messages),
-                                "snapshot": sess.snapshot()})
+                                "task": sess.task if sess else "",
+                                "running": key in _ACTIVE_SCIENCE,
+                                "attached": live is not None,
+                                "history": _science_history(sess.messages) if sess else [],
+                                "snapshot": sess.snapshot() if sess else {}})
+                    # A turn is in flight for this session — attach to it. Without
+                    # this the page just sat on restored history while the run kept
+                    # going somewhere it could no longer be seen. The backlog is
+                    # replayed first, so re-attaching mid-run shows what was missed.
+                    if live is not None:
+                        await send({"type": "info",
+                                    "text": "▶ This session has a turn in progress — "
+                                            "reconnected to it."})
+                        state["running"] = True
+                        try:
+                            await stream_science(live)
+                        finally:
+                            state["running"] = False
+                        await send({"type": "science_done"})
 
             elif mtype in ("science_message", "science_comment"):
                 # The UI marks itself busy the moment it sends a turn, and only a
@@ -1644,6 +1823,9 @@ async def ws_endpoint(websocket: WebSocket):
                 state["science_session"] = sess
                 state["running"] = True
                 _ACTIVE_SCIENCE.add(want)
+                # Events go to the SESSION's hub, not to this socket, so a reload
+                # or a second tab can attach to the turn instead of losing it.
+                hub = _open_hub(want)
                 # Record in the history index up front, so the session is
                 # reopenable even mid-run (before the first turn saves).
                 try:
@@ -1651,19 +1833,24 @@ async def ws_endpoint(websocket: WebSocket):
                     _science_index.record(sess.working_dir, sess.task or echo)
                 except Exception:
                     pass
-                await send({"type": "science_user", "text": echo,
-                            "artifact_id": msg.get("artifact_id")})
+                # Into the backlog too, so a viewer attaching later sees the
+                # message that started the turn.
+                hub.publish({"type": "science_user", "text": echo,
+                             "artifact_id": msg.get("artifact_id")})
 
                 def science_fn(um=user_message, sc=sess, cl=client, md=model,
                                rmt=remote, wd_key=want, rid=refine_id,
                                pool=specialist_models):
-                    display.set_event_callback(make_emit())
+                    display.set_event_callback(hub.publish)
                     interrupt.register()
                     state["agent_ident"] = threading.get_ident()
+                    # On the hub as well: a viewer that attached later must be able
+                    # to Stop the run it is watching.
+                    hub.agent_ident = threading.get_ident()
                     try:
                         run_science_turn(sc, um, cl, md,
                                          permission_mode="autonomous",
-                                         emit=make_emit(), remote=rmt,
+                                         emit=hub.publish, remote=rmt,
                                          refresh_artifact_id=rid,
                                          specialist_models=pool)
                     except interrupt.StopRequested:
@@ -1675,24 +1862,27 @@ async def ws_endpoint(websocket: WebSocket):
                             sc.save()
                         except Exception:
                             pass
-                        loop.call_soon_threadsafe(
-                            event_q.put_nowait,
+                        hub.publish(
                             {"type": "science_reply",
                              "text": "⏹ Stopped by you. Any running command was killed; "
                                      "the work so far is saved. Send a message to carry on.",
                              "stopped": True})
                     except Exception as exc:
-                        loop.call_soon_threadsafe(
-                            event_q.put_nowait, {"type": "error", "text": str(exc)})
+                        hub.publish({"type": "error", "text": str(exc)})
                     finally:
                         _ACTIVE_SCIENCE.discard(wd_key)
                         interrupt.unregister()
                         state["agent_ident"] = None
                         display.clear_event_callback()
-                        loop.call_soon_threadsafe(event_q.put_nowait, {"type": "_sentinel"})
+                        # Ends the stream for EVERY attached viewer, not just the
+                        # one that started the turn.
+                        _close_hub(wd_key)
 
                 threading.Thread(target=science_fn, daemon=True).start()
-                await stream_events()
+                try:
+                    await stream_science(hub)
+                finally:
+                    state["running"] = False
                 # Authoritative end-of-turn: the turn thread has finished (the
                 # sentinel drained). Recoverable mid-run errors (a model that
                 # stopped responding and got swapped for a fallback, a failed

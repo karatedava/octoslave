@@ -318,7 +318,19 @@ export default function Science() {
               artIds.current.add(a.id);
               upsertArtifact(a);
             });
-            setRemoteRunning(!!m.running);
+            // `attached` means the server hooked this socket up to a turn that is
+            // still in flight and is replaying its backlog: this tab is a live
+            // viewer, not a locked-out bystander. Only an unattachable run (no
+            // hub — e.g. started before a server restart) stays "busy elsewhere".
+            setRemoteRunning(!!m.running && !m.attached);
+            if (m.attached) {
+              runningRef.current = true;
+              setRunning(true);
+            } else if (m.running) {
+              // Running but not attachable (no hub — the turn predates a server
+              // restart). Nothing to stream, so fall back to polling for the end.
+              pollUntilIdle(m.working_dir || workingDir);
+            }
             if ((m.history || []).length) note("↩ Resumed a previous session.", "ok");
           } else if (resuming.current) {
             // auto-resume target no longer exists — fall back to the start screen
@@ -386,25 +398,24 @@ export default function Science() {
     return !!(d.sessions || []).find((s: SessionMeta) => s.working_dir === dir)?.running;
   }
 
-  // Called after the socket reconnects mid-turn. Our Stop button belonged to the
-  // old connection and the turn's events go nowhere now, so drop the local
-  // running flag; if the turn is still alive, keep the composer locked (that is
-  // what remoteRunning means) until it ends.
+  // Called after the socket reconnects. The old connection's events are gone, so
+  // reload the session on the NEW one: the server re-attaches us to the turn if
+  // it is still in flight and replays what we missed. Reloading (rather than
+  // patching state in place) also rebuilds the feed from scratch, so the restored
+  // history can't be appended on top of what is already on screen.
   async function resyncRunning() {
     const dir = runCfg.current.workingDir || "";
-    if (!dir || !runningRef.current) return;
-    runningRef.current = false;
-    setRunning(false);
+    if (!dir) return;
+    const wasRunning = runningRef.current;
     let alive = false;
     try {
       alive = await isSessionAlive(dir);
     } catch { /* treat as finished — better idle than stuck */ }
-    setRemoteRunning(alive);
+    if (!wasRunning && !alive) return;   // nothing was in flight; leave the view alone
+    openSession(dir, "", true);          // clears the feed, so note AFTER it
     note(alive
-      ? "⚠ Lost the live connection to the server — the turn is still running there. "
-        + "Watching for it to finish…"
+      ? "⚠ Lost the live connection — reconnecting to the turn still running there…"
       : "⚠ Lost the live connection to the server — the turn is no longer running.", "bad");
-    if (alive) pollUntilIdle(dir);
   }
 
   function pollUntilIdle(dir: string) {
