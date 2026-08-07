@@ -277,7 +277,27 @@ body {
 .sci-note.ok { color: var(--ok); }
 .sci-note.bad { color: var(--bad); border-color: #5a2626; }
 .sci-note.tool { color: var(--muted); }
+.sci-note.warn { color: var(--warn); border-color: #5a4a1e; }
 .sci-working { align-self: flex-start; color: var(--accent); font-size: 13px; padding: 4px 8px; }
+
+/* pending ask_user — the run is BLOCKED on this, so it outranks everything else
+   on screen and stays put while the feed scrolls under it */
+.sci-ask { align-self: stretch; background: var(--panel); border: 1px solid var(--warn);
+  border-left: 4px solid var(--warn); border-radius: 12px; padding: 12px 14px;
+  position: sticky; bottom: 0; box-shadow: 0 -6px 20px rgba(0, 0, 0, .45); }
+.sci-ask-head { display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; margin-bottom: 8px; }
+.sci-ask-tag { color: var(--warn); font-size: 12px; font-weight: 600; }
+.sci-ask-clock { color: var(--muted); font-size: 11px; font-family: ui-monospace, monospace; }
+.sci-ask-clock.urgent { color: var(--bad); }
+.sci-ask-q { white-space: pre-wrap; font-size: 14px; line-height: 1.5; margin-bottom: 10px; }
+.sci-ask-opts { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.sci-ask-row { display: flex; gap: 8px; }
+.sci-ask-row .inject-input { flex: 1; }
+.sci-ask-hint { color: var(--muted); font-size: 11px; margin-top: 8px; }
+/* In the Lab the card sits INSIDE the (already pinned) inject bar, so it drops
+   the sticky/shadow treatment and just fills the row. */
+.injectbar .sci-ask { position: static; box-shadow: none; flex: 1; }
 
 /* a spawned specialist holds the floor — its turn is offset and tinted so it
    reads as a different voice from the orchestrator's */

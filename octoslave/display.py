@@ -627,6 +627,9 @@ def _tool_summary(name: str, args: dict) -> str:
     if name == "remember":
         c = args.get("content", "")
         return (c[:90] + "…") if len(c) > 90 else c
+    if name == "ask_user":
+        q = args.get("question", "")
+        return (q[:90] + "…") if len(q) > 90 else q
     # Science / lab orchestration tools — without these the fallback prints raw
     # truncated JSON ('{"name": "Data Wrangler", "goal": "Acquire and cl…').
     if name == "spawn_specialist":
@@ -763,6 +766,11 @@ _ask_lock = _threading.Lock()
 _ask_event: "_threading.Event | None" = None
 _ask_answer: str = ""
 
+# How long a web-mode question stays open before the agent gives up and proceeds
+# on its own judgement. Sent to the browser with the question so the UI can show
+# a truthful countdown instead of hard-coding its own number.
+ASK_TIMEOUT_SECS = 600
+
 
 def resolve_user_response(answer: str) -> None:
     """Called from the web handler to unblock a pending ask_user request."""
@@ -789,11 +797,15 @@ def ask_user_question(question: str, options: list[str] | None = None) -> tuple[
         with _ask_lock:
             _ask_event = _threading.Event()
             _ask_answer = ""
-        _emit({"type": "user_question", "question": question, "options": options})
-        got = _ask_event.wait(timeout=600)  # 10-min window
+        _emit({"type": "user_question", "question": question, "options": options,
+               "timeout": ASK_TIMEOUT_SECS})
+        got = _ask_event.wait(timeout=ASK_TIMEOUT_SECS)
         with _ask_lock:
             answer = _ask_answer
             _ask_event = None
+        # Always tell the UI the question is over, or it leaves a prompt on screen
+        # that no longer has anything listening for its answer.
+        _emit({"type": "user_question_closed", "answered": bool(got)})
         if not got:
             return "", False
         return answer, True

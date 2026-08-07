@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { LabSocket } from "./ws";
 import { Nav } from "./Nav";
 import { ModelPicker } from "./ModelPicker";
+import { AskCard, askFromEvent, type Ask } from "./AskCard";
 
 type Role = "user" | "assistant" | "note";
 type Artifact = {
@@ -63,6 +64,10 @@ export default function Science() {
   const [pool, setPool] = useState<string[]>([]);
   const [todos, setTodos] = useState<{ content: string; status: string }[]>([]);
   const [showPlan, setShowPlan] = useState(true);
+  // A pending ask_user. The agent thread is BLOCKED on this — until it is
+  // answered (or expires) nothing else happens, so it gets its own always-visible
+  // prompt rather than a line in the scrolling feed.
+  const [ask, setAsk] = useState<Ask | null>(null);
 
   const feedId = useRef(0);
   // Live mirror of the run settings. The socket handler is registered once (on
@@ -109,7 +114,7 @@ export default function Science() {
 
   useEffect(() => {
     scrollRef.current?.scrollTo(0, scrollRef.current.scrollHeight);
-  }, [feed, live]);
+  }, [feed, live, ask]);
 
   useEffect(() => {
     runCfg.current = { orchModel, pool, workingDir, remoteId };
@@ -217,6 +222,9 @@ export default function Science() {
           setLiveWho({});
           runningRef.current = false;
           setRunning(false);
+          // A turn can't end with a live question — if one is still on screen
+          // (a stop, a crash), nothing is listening for the answer any more.
+          setAsk(null);
           break;
         case "tool_call":
           note(`${toolIcon(m.name)} ${m.summary || m.name}`, "tool", speakerOf(m));
@@ -325,6 +333,22 @@ export default function Science() {
             sendMessage(first);
           }
           break;
+        // The agent called ask_user and its thread is now blocked. Without a
+        // prompt here the question is unanswerable: the composer is locked for
+        // the duration of the turn, so the run just stalls until the server's
+        // timeout fires and it proceeds without the answer.
+        case "user_question":
+          setAsk(askFromEvent(m));
+          break;
+        case "user_question_closed":
+          setAsk((a) => {
+            if (a && !m.answered) {
+              note("⏳ That question timed out — the orchestrator is carrying on with "
+                + "its own best judgement.", "warn");
+            }
+            return null;
+          });
+          break;
         case "info":
           note(m.text, "info");
           break;
@@ -406,6 +430,7 @@ export default function Science() {
     setFeed([]); setLive(""); setLiveWho({}); setSpecialists([]); setJobs([]); setProv([]);
     setTodos([]); setArtifacts([]);
     setRunning(false);
+    setAsk(null);
     runningRef.current = false;
     if (pollTimer.current) { clearTimeout(pollTimer.current); pollTimer.current = 0; }
     lastAssistant.current = "";
@@ -482,6 +507,16 @@ export default function Science() {
   }
   function stop() {
     sock.send({ type: "stop" });
+  }
+  // Answer a blocked ask_user. This is NOT a new turn — the agent is parked
+  // inside a tool call waiting on this exact reply, so it goes out as a
+  // user_response and the running turn simply resumes.
+  function answerQuestion(text: string) {
+    const t = text.trim();
+    if (!t || !ask) return;
+    sock.send({ type: "user_response", answer: t });
+    setAsk(null);
+    push({ t: "msg", role: "user", text: t } as any);
   }
   function comment(artId: string, text: string) {
     if (!text.trim() || runningRef.current) return;
@@ -658,11 +693,12 @@ export default function Science() {
             )}
             {live && <ChatBubble role="assistant" text={live} streaming
               who={liveWho.who} icon={liveWho.icon} />}
-            {running && !live && (
+            {running && !live && !ask && (
               <div className="sci-working">
                 ● {liveWho.who ? `${liveWho.icon} ${liveWho.who}` : "Orchestrator"} working…
               </div>
             )}
+            {ask && <AskCard ask={ask} onAnswer={answerQuestion} />}
           </main>
 
           <aside className="sci-side">
@@ -687,7 +723,9 @@ export default function Science() {
           <footer className="sci-inputbar">
             <input
               className="inject-input"
-              placeholder={remoteRunning
+              placeholder={ask
+                ? "Answer the question above to let the turn continue…"
+                : remoteRunning
                 ? "Session is busy in another tab — reload state to continue…"
                 : "Message the orchestrator… (e.g. 'now compare against the AlphaFold model')"}
               value={input}
@@ -776,7 +814,7 @@ const TOOL_ICONS: Record<string, string> = {
   grep: "🔎", list_dir: "📁", web_search: "🌐", web_fetch: "🌐",
   bio_inspect: "🧬", present_output: "🖼", record_provenance: "📎",
   curate_dataset: "🗂", literature_search: "📚", spawn_specialist: "🔬",
-  continue_specialist: "🔁",
+  continue_specialist: "🔁", ask_user: "❓", remember: "🧠",
   submit_cluster_job: "🖥", check_cluster_job: "🖥", todo_write: "✅",
 };
 function toolIcon(name: string): string {

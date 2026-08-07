@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { LabSocket } from "./ws";
 import { Nav } from "./Nav";
+import { AskCard, askFromEvent, type Ask } from "./AskCard";
 import { ModelPicker } from "./ModelPicker";
 import type { Agent, ActivityItem, Decision } from "./types";
 
@@ -61,6 +62,9 @@ export default function App() {
   const [status, setStatus] = useState<string>("idle");
   const [autonomous, setAutonomous] = useState(true);
   const [awaiting, setAwaiting] = useState<null | { kind: string }>(null);
+  // A pending ask_user from an agent. Its thread is blocked until this is
+  // answered, so it outranks the inject bar in the footer.
+  const [ask, setAsk] = useState<Ask | null>(null);
 
   const [task, setTask] = useState("");
   const [workingDir, setWorkingDir] = useState("");
@@ -243,6 +247,7 @@ export default function App() {
           push("system", `Awaiting approval (${m.kind})`, "warn");
           break;
         case "lab_complete":
+          setAsk(null);       // nothing is listening for an answer once the run ends
           setPhase(m.stopped ? "stopped" : "complete");
           setStatus(m.stopped ? "stopped" : "complete");
           if (m.report) setReportPath(m.report);
@@ -252,6 +257,20 @@ export default function App() {
               " You can refine below — small notes patch the report, bigger ones run more rounds.",
             m.stopped ? "bad" : "ok"
           );
+          break;
+        // An agent was granted ask_user and called it — its thread is parked
+        // inside the tool until this is answered or the server's timeout fires.
+        case "user_question":
+          setAsk(askFromEvent(m));
+          break;
+        case "user_question_closed":
+          setAsk((a) => {
+            if (a && !m.answered) {
+              push("system", "That question timed out — the agent is carrying on "
+                + "with its own best judgement.", "warn");
+            }
+            return null;
+          });
           break;
         case "info":
           push("system", m.text, "info");
@@ -341,6 +360,18 @@ export default function App() {
   function stop() {
     sock.send({ type: "stop_lab" });
     setAwaiting(null);
+    setAsk(null);
+  }
+  // Answer a blocked ask_user. Not an injection — the agent is waiting on this
+  // exact reply inside the tool call, and resumes the moment it arrives.
+  function answerQuestion(text: string) {
+    const t = text.trim();
+    if (!t || !ask) return;
+    sock.send({ type: "user_response", answer: t });
+    setAsk(null);
+    // Filed under "injection" — it is user input into a live run, and that is the
+    // filter people look under for it. ("user" is not one of the filter kinds.)
+    push("injection", `Answered: ${t}`, "ok");
   }
 
   const running = started && status === "running";
@@ -435,7 +466,9 @@ export default function App() {
 
       {started && (
         <footer className="injectbar">
-          {awaiting ? (
+          {ask ? (
+            <AskCard ask={ask} onAnswer={answerQuestion} />
+          ) : awaiting ? (
             <div className="awaiting">
               <span>Paused for approval ({awaiting.kind}).</span>
               <button className="btn primary" onClick={approve}>Approve & continue</button>
