@@ -14,7 +14,7 @@ from prompt_toolkit.completion import Completer, Completion
 
 from . import display
 from . import __version__
-from .agent import make_client, run_agent, continue_agent, load_session_memory, save_session_memory, memory_file
+from .agent import make_client, run_agent, continue_agent, load_session_memory, redact_image_payloads, save_session_memory, memory_file
 from .council import (
     resolve_council_roles, run_council_agent, continue_council_agent,
     council_available, print_roles as print_council_roles,
@@ -1556,12 +1556,13 @@ def _handle_slash(cmd: str, state: dict, cfg: dict, messages: list, client) -> s
             from datetime import datetime as _dt
             sid = _uuid.uuid4().hex[:12]
             title = next((m["content"][:80] for m in messages
-                          if m.get("role") == "user" and m.get("content")),
+                          if m.get("role") == "user"
+                          and isinstance(m.get("content"), str) and m["content"]),
                          "OctoSlave conversation")
             (shared_dir / f"{sid}.json").write_text(_json.dumps({
                 "id": sid, "title": title, "model": state.get("model", ""),
                 "created_at": _dt.now().isoformat(timespec="seconds"),
-                "messages": messages,
+                "messages": redact_image_payloads(messages),
             }, indent=2))
             display.console.print(
                 f"[dim]Snapshot saved to[/dim] [bold]{shared_dir / (sid + '.json')}[/bold]\n"
@@ -3198,7 +3199,13 @@ def web(host, port, no_browser):
         threading.Thread(target=_open, daemon=True).start()
 
     from .web.app import app as _web_app
-    uvicorn.run(_web_app, host=host, port=port, log_level="warning")
+    # Agent turns run in worker threads, but a heavy one (big imports, a burst of
+    # tool output) can still stall the event loop past uvicorn's default 20s
+    # websocket ping timeout — which closes the browser's socket with a 1011 in
+    # the middle of a working session. The tab then has to re-attach to its own
+    # running turn. A long ping timeout keeps a busy backend from looking dead.
+    uvicorn.run(_web_app, host=host, port=port, log_level="warning",
+                ws_ping_interval=30, ws_ping_timeout=300)
 
 
 def main():

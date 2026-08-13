@@ -62,6 +62,11 @@ export default function Science() {
   const [models, setModels] = useState<string[]>([]);
   const [orchModel, setOrchModel] = useState("");
   const [pool, setPool] = useState<string[]>([]);
+  // Thinking models (kimi-k3, deepseek-thinking, …) stream a reasoning trace for
+  // minutes before their first visible token or tool call. Counting its
+  // characters turns a motionless "working…" line into visible progress; the
+  // trace itself is not shown. Matches the classic chat UI's "thinking…" label.
+  const [thinkChars, setThinkChars] = useState(0);
   const [todos, setTodos] = useState<{ content: string; status: string }[]>([]);
   const [showPlan, setShowPlan] = useState(true);
   // A pending ask_user. The agent thread is BLOCKED on this — until it is
@@ -156,12 +161,16 @@ export default function Science() {
           break;
         case "stream_start":
           setLiveWho(speakerOf(m));
+          setThinkChars(0);
           break;
         case "token":
           setLive((s) => s + (m.text || ""));
           setLiveWho(speakerOf(m));
+          setThinkChars(0);
           break;
         case "reasoning":
+          setThinkChars((n) => n + (m.text || "").length);
+          setLiveWho(speakerOf(m));
           break;
         case "stream_end": {
           const from = speakerOf(m);
@@ -706,7 +715,10 @@ export default function Science() {
               who={liveWho.who} icon={liveWho.icon} />}
             {running && !live && !ask && (
               <div className="sci-working">
-                ● {liveWho.who ? `${liveWho.icon} ${liveWho.who}` : "Orchestrator"} working…
+                ● {liveWho.who ? `${liveWho.icon} ${liveWho.who}` : "Orchestrator"}{" "}
+                {thinkChars > 0
+                  ? `thinking… (${thinkChars.toLocaleString()} chars)`
+                  : "working…"}
               </div>
             )}
             {ask && <AskCard ask={ask} onAnswer={answerQuestion} />}

@@ -57,6 +57,8 @@ from .agent import (
     _cap_result,
     _proactive_trim,
     configure_runtime,
+    drain_image_attachments,
+    model_supports_vision,
     load_system_prompt,
     load_session_memory,
     _rt,
@@ -68,6 +70,7 @@ from .tools import (
     init_mcp,
     configure_execution,
     running_background_processes,
+    set_vision_support,
 )
 from .config import (
     load_config,
@@ -682,7 +685,17 @@ def _recent_text(messages: list[dict], n: int = 8,
             continue
         content = m.get("content") or ""
         if not isinstance(content, str):
-            content = json.dumps(content, ensure_ascii=False)
+            # Multimodal turn: keep the text blocks and name the image, never
+            # dump a base64 payload into a reviewer's context digest.
+            parts = []
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "image_url":
+                    parts.append("[image attached]")
+                elif b.get("text"):
+                    parts.append(str(b["text"]))
+            content = " ".join(parts) if parts else json.dumps(content, ensure_ascii=False)
         if role == "assistant" and m.get("tool_calls"):
             names = ", ".join(tc["function"]["name"] for tc in m["tool_calls"])
             content = (content + f"  [calls: {names}]").strip()
@@ -772,6 +785,9 @@ def _council_loop(
         if new == active_worker:
             return
         active_worker = new
+        # Vision is per-model: the alternate family may or may not take images,
+        # so re-point the view_image gate at whoever is driving now.
+        set_vision_support(lambda: model_supports_vision(client, active_worker))
         display.print_info(
             f"{_TAG['worker']} switching model to [bold]{active_worker}[/bold] "
             f"[dim]({reason} — trying a different family)[/dim]"
@@ -1119,6 +1135,10 @@ def _council_loop(
             sig_streak[sig] = (sig_streak.get(sig, 0) + 1) if sig_epoch.get(sig) == edit_epoch else 1
             sig_epoch[sig] = edit_epoch
             turn_repeat = max(turn_repeat, sig_streak[sig])
+
+        # Attach anything view_image queued — after ALL of this turn's tool
+        # results, so the assistant turn's tool messages stay contiguous.
+        drain_image_attachments(messages)
 
         # A Stop clicked *during* tool execution (e.g. a long bash) should abort
         # before we spend more model calls on error/stall consults below.

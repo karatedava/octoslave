@@ -39,7 +39,7 @@ ROLES: dict[str, dict] = {
                   "bio_inspect", "uniprot_lookup", "pubchem_lookup",
                   "chembl_lookup", "geo_search", "ena_fetch",
                   "pdb_fetch", "alphafold_fetch",
-                  "pdf_ocr"],
+                  "pdf_ocr", "image_ocr", "view_image"],
     },
     "hypothesis": {
         "label": "Experiment Designer",
@@ -69,7 +69,8 @@ ROLES: dict[str, dict] = {
                   "glob", "grep", "list_dir",
                   "bio_inspect", "rdkit_describe", "pdb_fetch",
                   "alphafold_fetch", "uniprot_lookup", "pubchem_lookup",
-                  "chembl_lookup", "ena_fetch", "pdf_ocr"],
+                  "chembl_lookup", "ena_fetch", "pdf_ocr",
+                  "image_ocr", "view_image"],
     },
     "debugger": {
         "label": "Debugger",
@@ -90,7 +91,10 @@ ROLES: dict[str, dict] = {
         "max_iter": 15,
         "tools": ["read_file", "bash", "write_file", "list_dir",
                   "web_search", "glob",
-                  "bio_inspect", "rdkit_describe"],
+                  "bio_inspect", "rdkit_describe",
+                  # Judging a run means judging its figures: look at the plot
+                  # (view_image) and read its printed numbers (image_ocr).
+                  "image_ocr", "view_image"],
     },
     "orchestrator": {
         "label": "Orchestrator",
@@ -106,7 +110,10 @@ ROLES: dict[str, dict] = {
         "color": "bold bright_cyan",
         "default_model": "deepseek-v3.2",
         "max_iter": 40,
-        "tools": ["read_file", "write_file", "bash", "list_dir", "glob"],
+        "tools": ["read_file", "write_file", "bash", "list_dir", "glob",
+                  # The reporter embeds figures it never sees otherwise; let it
+                  # check a PNG is the right plot before shipping it.
+                  "image_ocr", "view_image"],
     },
     "merger": {
         "label": "Merger",

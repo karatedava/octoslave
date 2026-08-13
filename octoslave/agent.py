@@ -25,19 +25,30 @@ _STREAM_READ_TIMEOUT = httpx.Timeout(300.0, connect=30.0)
 from . import display
 from . import logger
 from . import interrupt
-from .tools import TOOL_DEFINITIONS, execute_tool, all_tool_definitions, valid_tool_names, set_tool_profile
+from .tools import (
+    TOOL_DEFINITIONS,
+    execute_tool,
+    all_tool_definitions,
+    valid_tool_names,
+    set_tool_profile,
+    set_vision_support,
+    take_image_attachments,
+)
 from .config import (
     load_config,
     constitution_enabled,
     OLLAMA_BASE_URL,
     DEFAULT_SOFT_CONTEXT_TOKENS,
+    configured_model_vision,
     configured_model_window,
     list_models,
+    parse_model_vision,
     parse_model_windows,
     pick_fallback_model,
     provider_window_override,
     remote_awareness_note,
     resolve_context_window,
+    resolve_vision_support,
 )
 
 
@@ -407,10 +418,13 @@ def _is_ollama_client(client) -> bool:
 def _ollama_model_info(client, model: str) -> dict:
     """Probe /api/show once per model: advertised context_length (capped to
     _OLLAMA_NUM_CTX_MAX; OCTOSLAVE_OLLAMA_NUM_CTX forces an exact value) and
-    whether the model has the 'thinking' capability. Cached; safe on any error."""
+    whether the model has the 'thinking' / 'vision' capabilities. Cached; safe on
+    any error. ``vision`` is None when /api/show couldn't be reached — Ollama
+    accepts images for a text-only model and simply ignores them, so an unknown
+    must not be optimistically read as "yes"."""
     if model in _OLLAMA_INFO_CACHE:
         return _OLLAMA_INFO_CACHE[model]
-    info = {"num_ctx": OLLAMA_NUM_CTX, "thinking": False}
+    info = {"num_ctx": OLLAMA_NUM_CTX, "thinking": False, "vision": None}
     try:
         import urllib.request
         base = str(client.base_url).rstrip("/")
@@ -428,7 +442,10 @@ def _ollama_model_info(client, model: str) -> dict:
                     if k.endswith("context_length") and isinstance(v, int)), None)
         if ctx and ctx > 0:
             info["num_ctx"] = min(ctx, _OLLAMA_NUM_CTX_MAX)
-        info["thinking"] = "thinking" in (data.get("capabilities") or [])
+        caps = data.get("capabilities") or []
+        info["thinking"] = "thinking" in caps
+        if caps:
+            info["vision"] = "vision" in caps
     except Exception:
         pass
     forced = os.environ.get("OCTOSLAVE_OLLAMA_NUM_CTX")
@@ -514,6 +531,366 @@ def _remote_model_window(client, model: str) -> int:
     return resolve_context_window(model, _remote_window_catalog(client))
 
 
+# ---------------------------------------------------------------------------
+# Vision (image input) capability
+# ---------------------------------------------------------------------------
+# `view_image` hands the model real pixels as an `image_url` content block. A
+# text-only vLLM worker answers that with a hard 400, so we have to know the
+# answer BEFORE sending — and "silently drop the image" is the one outcome we
+# must never allow, since the model would then reason about a picture it never
+# saw. Resolution order, most authoritative first:
+#   1. config `model_vision` override      — the user's explicit escape hatch
+#   2. the endpoint's advertised capability — litellm/OpenRouter surface it
+#   3. a live probe that makes the model PROVE it can see — definitive, cached
+#   4. name-pattern / family fallback      — only when the probe can't run
+# Every layer is cached per (base_url, model), so a session pays for step 3 at
+# most once per model, and only if view_image is actually called.
+#
+# The probe asks the model to name two randomly-chosen colours rather than just
+# checking that the request is accepted. That is not paranoia: measured against
+# the e-INFRA gateway, a text-only model (gpt-oss-120b) accepts an image_url
+# block with a clean 200 and simply never sees the image. An accept-based probe
+# would green-light exactly the case this whole capability gate exists to catch.
+
+_REMOTE_VISION_CACHE: dict[str, dict[str, bool]] = {}
+_MODEL_VISION_CACHE: dict[str, bool] = {}
+
+_VISION_PROBE_COLORS: dict[str, tuple[int, int, int]] = {
+    "red":    (220, 30, 30),
+    "green":  (30, 170, 60),
+    "blue":   (40, 70, 210),
+    "yellow": (240, 210, 40),
+}
+
+# Seconds to wait for the probe. e-INFRA cold-starts a model on first hit, and a
+# probe that times out returns None (inconclusive) rather than a false negative.
+_VISION_PROBE_TIMEOUT = float(os.environ.get("OCTOSLAVE_VISION_PROBE_TIMEOUT", "75"))
+
+
+def _solid_png(rgb: tuple[int, int, int], size: int = 64) -> str:
+    """base64 of a solid-colour PNG. Hand-rolled (zlib + struct) so the
+    capability probe never depends on Pillow being installed."""
+    import base64, struct, zlib
+    raw = b"".join(b"\x00" + bytes(rgb) * size for _ in range(size))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        body = tag + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, 9))
+           + chunk(b"IEND", b""))
+    return base64.b64encode(png).decode("ascii")
+
+
+def _vision_cache_key(client, model: str) -> str:
+    return f"{str(getattr(client, 'base_url', '')).rstrip('/')}|{model}"
+
+
+def _remote_vision_catalog(client) -> dict[str, bool]:
+    """{model_id: accepts_images} advertised by the endpoint's /v1/models, cached
+    per base_url. Most gateways (e-INFRA included) advertise nothing — an empty
+    dict just means "ask the probe"."""
+    base = str(getattr(client, "base_url", "")).rstrip("/")
+    if base in _REMOTE_VISION_CACHE:
+        return _REMOTE_VISION_CACHE[base]
+    flags: dict[str, bool] = {}
+    try:
+        import urllib.request
+        api_key = getattr(client, "api_key", "") or ""
+        req = urllib.request.Request(
+            f"{base}/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            flags = parse_model_vision(json.load(resp))
+    except Exception:
+        flags = {}
+    _REMOTE_VISION_CACHE[base] = flags
+    return flags
+
+
+def _probe_vision(client, model: str) -> bool | None:
+    """Make ``model`` prove it can see: name two randomly-chosen colours.
+
+    One non-streaming completion carrying two 64x64 solid-colour PNGs. Both
+    colours, in order, and neither of the two decoys → True. A vision refusal,
+    or an answer the model could only have guessed → False. None means the call
+    itself failed (timeout, network, cold start) and says nothing either way, so
+    the caller falls back to the static map.
+
+    Randomising which colours are used matters: a blind model that always
+    answers "red, blue" would otherwise pass whenever we happened to pick that
+    pair."""
+    for attempt in range(2):
+        verdict = _probe_vision_once(client, model)
+        if verdict == "refused":       # explicit 400 — no point asking twice
+            return False
+        # A wrong answer gets one second chance with a different colour pair: a
+        # weak-but-sighted model can fumble the format once, while a blind one
+        # has to guess the same 1-in-12 ordered pair twice running.
+        if verdict is not False or attempt == 1:
+            return verdict
+    return False
+
+
+def _probe_vision_once(client, model: str):
+    """One round of the colour test. True / False / None, or the string
+    ``"refused"`` when the endpoint rejected image input outright."""
+    import random
+    names = random.sample(sorted(_VISION_PROBE_COLORS), 2)
+    blocks: list[dict] = [{
+        "type": "text",
+        "text": ("Two images follow. Each is a single solid colour. Reply with "
+                 "exactly two words, lowercase, comma-separated: the colour of "
+                 "the first image, then the colour of the second. Choose from: "
+                 "red, green, blue, yellow."),
+    }]
+    for n in names:
+        blocks.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{_solid_png(_VISION_PROBE_COLORS[n])}"},
+        })
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": blocks}],
+            max_tokens=200,
+            timeout=_VISION_PROBE_TIMEOUT,
+        )
+    except BadRequestError as e:
+        # An explicit refusal is the clean answer; any other 400 (params,
+        # context) says nothing about vision.
+        return "refused" if _is_vision_unsupported_error(str(e)) else None
+    except Exception:
+        return None
+
+    try:
+        msg = resp.choices[0].message
+        answer = (msg.content or "" or getattr(msg, "reasoning_content", "") or "").lower()
+    except Exception:
+        return None
+    if not answer.strip():
+        # Thinking model that spent the whole budget reasoning — inconclusive.
+        return None
+    hits = [(answer.index(c), c) for c in _VISION_PROBE_COLORS if c in answer]
+    hits.sort()
+    return [c for _, c in hits] == names
+
+
+def model_supports_vision(client, model: str) -> bool:
+    """Can ``model`` be shown an actual image? Resolved once per (endpoint, model).
+
+    Falls back to False when nothing can settle it — view_image then refuses with
+    an explanation and points at image_ocr, which is the safe direction to err:
+    a wrong False costs a fallback, a wrong True costs a hard 400 mid-run."""
+    key = _vision_cache_key(client, model)
+    if key in _MODEL_VISION_CACHE:
+        return _MODEL_VISION_CACHE[key]
+
+    try:
+        resolved = configured_model_vision(model)
+    except Exception:
+        resolved = None
+    if resolved is None and _is_ollama_client(client):
+        # Ollama is authoritative about itself via /api/show, and must NOT be
+        # probed: it accepts an image for a text-only model and quietly drops it,
+        # so a probe would come back "supported" for every local model.
+        resolved = _ollama_model_info(client, model).get("vision")
+    else:
+        if resolved is None:
+            try:
+                resolved = _remote_vision_catalog(client).get(model)
+            except Exception:
+                resolved = None
+        if resolved is None:
+            resolved = _probe_vision(client, model)
+    if resolved is None:
+        # Nothing authoritative available (offline / probe inconclusive): fall
+        # back to the name-pattern and family tables.
+        try:
+            resolved = resolve_vision_support(model)
+        except Exception:
+            resolved = None
+    if resolved is None:
+        resolved = False
+    _MODEL_VISION_CACHE[key] = bool(resolved)
+    return bool(resolved)
+
+
+def note_vision_unsupported(client, model: str) -> None:
+    """Record that this model rejected an image, so nothing tries again. Called
+    from the 400-recovery path — the endpoint's own refusal outranks whatever the
+    probe or the static map concluded earlier."""
+    _MODEL_VISION_CACHE[_vision_cache_key(client, model)] = False
+
+
+_VISION_UNSUPPORTED_NEEDLES = (
+    "does not support image",
+    "does not support vision",
+    "doesn't support image",
+    "no multimodal",
+    "not multimodal",
+    # e-INFRA/vLLM's exact wording, measured: "<model> is not a multimodal model"
+    "not a multimodal",
+    "multimodal is not",
+    "image input is not supported",
+    "image_url is not supported",
+    "unsupported content type",
+    "invalid content type",
+    "content must be a string",
+    "expected string, got list",
+    "does not support multimodal",
+    "vision is not enabled",
+    "image support is not enabled",
+    "no image processor",
+    "model does not have a vision",
+)
+
+
+def _is_vision_unsupported_error(err_str: str) -> bool:
+    """True if a 400 means "this model cannot take images", as opposed to any
+    other bad request. Two shapes reach us: an explicit refusal from the router,
+    and a schema complaint from a text-only vLLM worker that only accepts a
+    string ``content`` — the latter is why we also require an image-ish word
+    before treating a generic type error as a vision failure."""
+    if not err_str:
+        return False
+    s = err_str.lower()
+    if any(n in s for n in _VISION_UNSUPPORTED_NEEDLES):
+        return True
+    mentions_image = "image" in s or "multimodal" in s or "vision" in s
+    return mentions_image and ("not support" in s or "unsupported" in s
+                               or "invalid" in s or "cannot" in s)
+
+
+# ---------------------------------------------------------------------------
+# Image attachments (view_image → conversation)
+# ---------------------------------------------------------------------------
+# A `role: "tool"` message's content must be a string in the Chat Completions
+# API, so view_image's pixels cannot ride back as a tool result. They are queued
+# thread-locally by the tool and drained here into a separate `role: "user"`
+# message. Two rules matter:
+#   * drain AFTER the whole tool_calls loop of a turn, never between two tool
+#     results — an assistant turn's tool messages must stay contiguous or strict
+#     servers reject the history;
+#   * keep only the most recent few images live, or every compaction carries
+#     megabytes of base64 forward forever.
+
+# Flat per-image cost for the chars/4 estimator. A 1280px image bills around
+# 1-1.5k tokens on most providers; measuring the base64 blob instead would
+# invent ~500k phantom tokens and send the compactor into a loop.
+_IMAGE_TOKEN_COST = 1_100
+
+# How many attached images stay visible. Older ones are replaced by a text stub
+# the model can act on (re-run view_image) — the pixels are the single largest
+# thing a history can carry, and stale ones are rarely re-read.
+_MAX_LIVE_IMAGES = int(os.environ.get("OCTOSLAVE_MAX_LIVE_IMAGES", "3"))
+
+_IMAGE_ELIDED_STUB = "[image elided to save context — re-run view_image to see it again]"
+
+
+def _is_image_block(block) -> bool:
+    return isinstance(block, dict) and block.get("type") == "image_url"
+
+
+def _has_image(msg: dict) -> bool:
+    content = msg.get("content")
+    return isinstance(content, list) and any(_is_image_block(b) for b in content)
+
+
+def _elide_old_images(messages: list[dict], keep: int = _MAX_LIVE_IMAGES) -> list[dict]:
+    """Replace all but the newest ``keep`` image attachments with a text stub.
+    Mutates nothing — returns the original list when there is nothing to do."""
+    idxs = [i for i, m in enumerate(messages) if _has_image(m)]
+    if len(idxs) <= max(0, keep):
+        return messages
+    stale = idxs[:len(idxs) - max(0, keep)]
+    out = list(messages)
+    for i in stale:
+        label = ""
+        for b in out[i].get("content") or []:
+            if isinstance(b, dict) and b.get("type") == "text":
+                label = str(b.get("text") or "")
+                break
+        out[i] = {**out[i], "content": f"{label}\n{_IMAGE_ELIDED_STUB}".strip()}
+    return out
+
+
+def drain_image_attachments(messages: list[dict]) -> list[dict]:
+    """Append any images view_image queued during this turn, as user messages.
+
+    Call once per turn, after every tool result has been appended. Returns the
+    same list object (appended in place) so callers can ignore the return."""
+    pending = take_image_attachments()
+    if not pending:
+        return messages
+    for att in pending:
+        blocks: list[dict] = [{
+            "type": "text",
+            "text": (f"Image you asked to see — {att['label']}"
+                     + (f" (looking for: {att['note']})" if att.get("note") else "")),
+        }]
+        blocks.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{att['mime']};base64,{att['b64']}",
+                "detail": "high",
+            },
+        })
+        messages.append({"role": "user", "content": blocks, "_image": True})
+    trimmed = _elide_old_images(messages)
+    if trimmed is not messages:
+        messages[:] = trimmed
+    return messages
+
+
+def redact_image_payloads(messages: list[dict]) -> list[dict]:
+    """Drop base64 image payloads before a transcript is written to disk.
+
+    A viewed figure is 0.5-1.5 MB of base64; a handful would turn a saved chat
+    into tens of megabytes re-read on every load. The text part is kept, so a
+    reopened conversation still shows which image was looked at and the model
+    can re-run view_image when it needs the pixels again."""
+    out: list[dict] = []
+    for m in messages:
+        content = m.get("content")
+        if not isinstance(content, list):
+            out.append(m)
+            continue
+        blocks = [b for b in content if not _is_image_block(b)]
+        if len(blocks) == len(content):
+            out.append(m)
+            continue
+        texts = [str(b.get("text") or "") for b in blocks if isinstance(b, dict)]
+        note = " ".join(t for t in texts if t).strip()
+        out.append({**m, "content": (note + " [image not stored]").strip()})
+    return out
+
+
+def strip_image_blocks(messages: list[dict]) -> tuple[list[dict], int]:
+    """Remove every image block from a history, leaving an explicit note in its
+    place. Used when the endpoint rejects image input mid-run: the model must be
+    told the picture is gone, never left believing it saw one."""
+    out: list[dict] = []
+    removed = 0
+    for m in messages:
+        content = m.get("content")
+        if not (isinstance(content, list) and any(_is_image_block(b) for b in content)):
+            out.append(m)
+            continue
+        removed += 1
+        texts = [str(b.get("text") or "") for b in content
+                 if isinstance(b, dict) and b.get("type") == "text"]
+        note = " ".join(t for t in texts if t).strip()
+        out.append({**m, "content": (
+            f"{note}\n[This model cannot accept images, so the picture was NOT "
+            f"shown to you. Do not describe it. Use image_ocr for its text, or "
+            f"read the underlying data.]").strip()})
+    return out, removed
+
+
 def _resolve_soft_budget(window: int | None = None) -> int:
     """Non-local proactive-trim budget.
 
@@ -548,6 +925,9 @@ def configure_runtime(client, model: str, prompt_profile: str) -> bool:
     window (live /v1/models catalog, else the static family map) and auto-size the
     trim budget to _CONTEXT_WINDOW_RATIO of it, unless soft_context_tokens pins an
     explicit override (see _resolve_soft_budget)."""
+    # Lazily, so the capability probe only costs a request if the model actually
+    # calls view_image — most runs never touch an image at all.
+    set_vision_support(lambda: model_supports_vision(client, model))
     if _is_ollama_client(client):
         meta = _ollama_model_info(client, model)
         num_ctx = meta["num_ctx"]
@@ -1268,7 +1648,15 @@ def _estimated_tokens(messages: list[dict]) -> int:
         elif isinstance(content, list):
             # vision-style multimodal content blocks
             for block in content:
-                if isinstance(block, dict):
+                if not isinstance(block, dict):
+                    continue
+                if _is_image_block(block):
+                    # An image bills a flat per-tile cost, NOT the length of its
+                    # base64 payload — measuring the blob (~2M chars) would
+                    # invent half a million phantom tokens and make the
+                    # compactor thrash on every single turn.
+                    total += _IMAGE_TOKEN_COST * 4
+                else:
                     total += len(json.dumps(block, ensure_ascii=False))
         tcs = m.get("tool_calls") or []
         for tc in tcs:
@@ -1299,7 +1687,7 @@ def _prune_stale_observations(messages: list[dict], target: int) -> tuple[list[d
     """Reclaim context by eliding the BODIES of the largest, oldest tool-result
     messages down to a one-line stub — deterministic, no LLM call, and it never
     removes a message (so it can't orphan an assistant ``tool_calls``). Only
-    ``role == 'tool'`` content is touched.
+    ``role == 'tool'`` content and attached images are touched.
 
     Protects ``messages[:2]`` (system + first user), the most recent
     ``_PRUNE_KEEP_RECENT`` observations (likely still in active use), and any
@@ -1311,13 +1699,24 @@ def _prune_stale_observations(messages: list[dict], target: int) -> tuple[list[d
     est = _estimated_tokens(messages)
     if est <= target:
         return messages, 0, 0
+    pruned_images = 0
+    # Attached images are user messages, so the tool-result pass below never sees
+    # them and they would ride out every compaction with their base64 intact.
+    # Under real pressure keep only the newest one.
+    squeezed = _elide_old_images(messages, keep=1)
+    if squeezed is not messages:
+        pruned_images = sum(1 for m in messages if _has_image(m)) - 1
+        messages = squeezed
+        est = _estimated_tokens(messages)
+        if est <= target:
+            return messages, pruned_images, 0
     candidates = [
         i for i, m in enumerate(messages)
         if i >= 2 and m.get("role") == "tool" and not m.get("_pruned")
         and len(m.get("content") or "") >= _PRUNE_MIN_RESULT_CHARS
     ]
     if len(candidates) <= _PRUNE_KEEP_RECENT:
-        return messages, 0, 0
+        return messages, pruned_images, 0
     # Keep the most recent observations intact; prune from the rest.
     prunable = candidates[:-_PRUNE_KEEP_RECENT]
     prunable.sort(key=lambda i: len(messages[i].get("content") or ""), reverse=True)
@@ -1339,8 +1738,8 @@ def _prune_stale_observations(messages: list[dict], target: int) -> tuple[list[d
         reclaimed += gained
         need -= gained
     if pruned == 0:
-        return messages, 0, 0
-    return out, pruned, reclaimed
+        return messages, pruned_images, 0
+    return out, pruned + pruned_images, reclaimed
 
 
 def _proactive_trim(
@@ -1687,16 +2086,18 @@ def _simple_completion(client: OpenAI, model: str, messages: list, max_tokens: i
 # Read-only tools the model may use while orienting itself before it plans.
 # Deliberately excludes everything that writes, runs commands, or hits the
 # network so the orientation pass can never mutate state or stall on a slow
-# command — it just looks at the local workdir, code, and data. OCR is included
-# (local, read-only) so the model can also orient on image/scanned files (PNG,
-# JPG, scanned PDFs) instead of being blind to non-text inputs.
+# command — it just looks at the local workdir, code, and data. OCR and
+# view_image are included (local, read-only) so the model can also orient on
+# image/scanned files (PNG, JPG, scanned PDFs) instead of being blind to
+# non-text inputs.
 _ORIENT_TOOLS = frozenset({"read_file", "list_dir", "glob", "grep", "bio_inspect",
-                           "image_ocr", "pdf_ocr"})
+                           "image_ocr", "pdf_ocr", "view_image"})
 
 _ORIENT_PROMPT = (
     "Before you plan, ORIENT yourself in the working directory. Using ONLY "
-    "read-only tools (list_dir, glob, grep, read_file, bio_inspect; and image_ocr / "
-    "pdf_ocr to read text from image or scanned-PDF files): explore the directory "
+    "read-only tools (list_dir, glob, grep, read_file, bio_inspect; image_ocr / "
+    "pdf_ocr to read text from image or scanned-PDF files; view_image to look at "
+    "a figure yourself): explore the directory "
     "layout, read the task and any files it references, and inspect the specific "
     "code and data you will need to change — including images/scans via OCR if "
     "those are what's present. Do NOT write, edit, or run anything yet. When you "
@@ -1787,6 +2188,9 @@ def _orientation_phase(
             result = _cap_result(result, name)
             display.print_tool_result(name, result, success)
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+        # Anything view_image queued this round is attached AFTER every tool
+        # result — an assistant turn's tool messages must stay contiguous.
+        drain_image_attachments(messages)
     else:
         # Loop ran out of rounds while the model was still actively exploring
         # (never emitted a no-tool-calls "READY" turn to break out). Tell it
@@ -2087,6 +2491,7 @@ def run_agent(
     remote: dict | None = None,
     extra_system: str = "",
     model_pool: list[str] | None = None,
+    compute_node: dict | None = None,
 ) -> list[dict]:
     if permission_mode is None:
         cfg = load_config()
@@ -2122,8 +2527,12 @@ def run_agent(
     # profiles that are routed to a remote get the whole-session framing. Tell the
     # model which nodes exist so it can offload heavy work — on request or its own
     # judgement. Harmless no-op when nothing is configured.
-    if remote or prompt_profile == "science":
-        note = remote_awareness_note(active=remote,
+    # ``compute_node`` is the node this session offloads HEAVY jobs to (Science):
+    # the agent's own tools stay local, so it is not passed as ``remote`` — but the
+    # prompt must still say WHICH configured node is this session's default, or
+    # with several remotes the model has to guess which one to submit to.
+    if remote or compute_node or prompt_profile == "science":
+        note = remote_awareness_note(active=remote or compute_node,
                                      job_submission=(prompt_profile == "science"))
         if note:
             system_prompt = system_prompt + "\n\n" + note
@@ -2354,6 +2763,21 @@ def _robust_stream(
                 "Use /compact to summarise history, or /clear to start fresh."
             )
             return None, "fatal", messages
+        elif _is_vision_unsupported_error(err_str) and any(_has_image(m) for m in messages):
+            # We attached an image to a model that turns out not to take them
+            # (our probe said otherwise, or a failover moved the run onto a
+            # text-only model). Strip the pixels, remember the refusal so
+            # view_image stops offering them, and retry — with an explicit note
+            # in place of each image so the model never believes it saw one.
+            stripped, n = strip_image_blocks(messages)
+            note_vision_unsupported(client, model)
+            display.print_info(
+                f"[bold]{model}[/bold] does not accept image input — removed "
+                f"{n} attached image(s) and retrying (use image_ocr instead)."
+            )
+            logger.log_info("Image input rejected by model — stripped and retrying.",
+                            model=model, images=n)
+            return None, "retry", stripped
         elif _is_model_unavailable_error(err_str):
             # The backend can't serve this model at all (dead deployment, stale
             # id). Nothing to fix in the conversation — hand back "fatal_conn" so
@@ -2717,6 +3141,12 @@ def _agent_loop(
                     _redundant_calls += 1
                     label = args.get("file_path") or args.get("path") or args.get("pattern") or args.get("command") or ""
                     repeated_reads.append(f"{name}({label})")
+
+        # Every tool result for this turn is in; now attach anything view_image
+        # queued. It has to land here rather than beside its own tool message —
+        # a user message wedged between two tool results breaks the contiguity
+        # strict OpenAI-compatible servers require.
+        drain_image_attachments(messages)
 
         # Track consecutive error turns and inject a recovery nudge when stuck.
         if _turn_had_error:

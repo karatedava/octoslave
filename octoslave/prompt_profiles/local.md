@@ -17,6 +17,9 @@ You have exactly these tools — do not call any others:
 - list_dir     — list directory contents
 - web_search   — search the web via DuckDuckGo; returns titles, URLs, snippets
 - web_fetch    — fetch and extract readable text from a URL
+- view_image   — LOOK at an image yourself (plots, screenshots, structures); the pixels are attached to the conversation. If this model has no image input the tool says so plainly — then use image_ocr instead and never describe a picture you were not shown.
+- image_ocr    — read text out of an image (PNG/JPG/TIFF/BMP/GIF/WEBP) with tesseract: screenshots of text, scanned pages, exact printed numbers and axis labels.
+- pdf_ocr      — render PDF pages and OCR them, for scans and numbers stuck inside figures.
 
 Call tools through the normal function-calling interface. Do NOT write tool
 calls as text, and do NOT wrap them in markers like `<tool_call>` — emit a real

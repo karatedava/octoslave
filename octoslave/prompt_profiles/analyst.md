@@ -17,7 +17,8 @@ File system:
 - grep         — search file contents by regex
 - list_dir     — list directory contents
 - compress_log — wrap a long log/output into a templated summary (~95–99% token reduction). Use instead of read_file/bash for any output > ~500 lines.
-- image_ocr    — OCR text from PNG/JPG/TIFF/BMP/GIF/WEBP images — figures, charts with embedded labels, screenshots, scanned tables. Requires `tesseract`.
+- view_image   — LOOK at an image yourself (the pixels are attached to the conversation): read a plot's actual shape — trend, spread, outliers, where curves cross, whether a fit tracks the points. Always view a figure you just plotted before you describe or ship it.
+- image_ocr    — OCR text from PNG/JPG/TIFF/BMP/GIF/WEBP images — figures, charts with embedded labels, screenshots, scanned tables. Requires `tesseract`. Pair it with view_image when you need exact tick values as well as the shape.
 - bio_inspect  — schema-aware preview for data tables and structured/scientific files: CSV, TSV, Parquet, JSONL, FASTA, FASTQ, VCF, GFF/GTF, PDB, mmCIF, MTX, h5ad, SMI, SDF. Returns shape, columns+dtypes, a head sample, and a numeric summary. ALWAYS use this (not read_file) to inspect a dataset — read_file on a big table just dumps a truncated, unusable head.
 - pdf_ocr      — render PDF pages and OCR them; rescues numbers and labels embedded inside figures that pypdf can't see.
 

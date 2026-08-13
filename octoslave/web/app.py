@@ -30,7 +30,7 @@ from .. import interrupt
 from ..display import resolve_permission, resolve_user_response
 from ..agent import (
     continue_agent, make_client, run_agent, list_prompt_profiles,
-    save_session_memory,
+    redact_image_payloads, save_session_memory,
 )
 from ..council import (
     resolve_council_roles, run_council_agent, continue_council_agent, council_available,
@@ -137,9 +137,10 @@ def _mcp_snapshot() -> dict:
 
 def _chat_title(messages: list) -> str:
     for m in messages:
-        if m.get("role") == "user" and m.get("content"):
+        if m.get("role") == "user" and isinstance(m.get("content"), str) and m["content"]:
             return m["content"][:80]
     return "Untitled"
+
 
 def _save_chat(messages: list, model: str = "", chat_id: str = "",
                working_dir: str = "", remote_id: str | None = None) -> str:
@@ -166,7 +167,7 @@ def _save_chat(messages: list, model: str = "", chat_id: str = "",
         "remote_id": remote_id,
         "created_at": created_at,
         "updated_at": now,
-        "messages": messages,
+        "messages": redact_image_payloads(messages),
     }
     (CHATS_DIR / f"{chat_id}.json").write_text(json.dumps(data, indent=2))
     return chat_id
@@ -268,7 +269,12 @@ async def view_shared(share_id: str):
     parts = []
     for m in data.get("messages", []):
         role = m.get("role", "")
-        content = (m.get("content") or "").strip()
+        raw = m.get("content")
+        # Multimodal turns carry a list of blocks; render only their text.
+        if isinstance(raw, list):
+            raw = " ".join(str(b.get("text") or "") for b in raw
+                           if isinstance(b, dict) and b.get("type") == "text")
+        content = (raw or "").strip()
         if not content or role == "system":
             continue
         klass = "u" if role == "user" else "a"

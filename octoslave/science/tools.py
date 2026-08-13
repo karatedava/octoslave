@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import posixpath
+import shlex
 import subprocess
 import threading
 import time
@@ -548,6 +549,25 @@ def _parse_slurm_id(text: str) -> str:
     return ""
 
 
+# How much of a job's log a poll may return. A tail-only clip loses the START of
+# the output, which for a probe/setup job is exactly the part that matters (the
+# hostname, the GPU, the versions) — the model then re-submits the same job to
+# see it, and can lose it again. Clip the MIDDLE instead and say so.
+_JOB_OUT_BUDGET = 6000
+
+
+def _clip_job_output(text: str, budget: int = _JOB_OUT_BUDGET) -> str:
+    """Keep the head and the tail of ``text``, marking what was dropped."""
+    if len(text) <= budget:
+        return text
+    head = budget // 3
+    tail = budget - head
+    return (f"{text[:head]}\n"
+            f"… [{len(text) - budget:,} characters omitted from the middle — "
+            f"read the log itself if you need them] …\n"
+            f"{text[-tail:]}")
+
+
 def _run_check_job(args: dict, working_dir: str) -> tuple[str, bool]:
     ctx = _compute_ctx()
     if ctx is None:
@@ -558,26 +578,40 @@ def _run_check_job(args: dict, working_dir: str) -> tuple[str, bool]:
         return f"No job '{jid}'. Known jobs: " + \
                ", ".join(f"{j.name}({j.id})" for j in ctx.session.jobs), False
 
+    try:
+        lines = max(1, min(1000, int(args.get("lines") or 120)))
+    except (TypeError, ValueError):
+        lines = 120
     remote = _remote_for(job.remote_id or "")
     try:
-        status, out = _poll_job(job, remote, ctx)
+        status, out = _poll_job(job, remote, ctx, lines=lines)
     except Exception as exc:  # noqa: BLE001
         status, out = "unknown", str(exc)
 
     job.status = status
     if out:
-        job.output = out[-4000:]
+        job.output = _clip_job_output(out, 4000)
     # persist by re-adding through the session lock path
     for j in ctx.session.jobs:
         if j.id == job.id:
             j.status, j.output = job.status, job.output
     ctx.session.save()
     _emit_job(job)
-    return (f"Job '{job.name}' ({job.id}) on {job.remote_label}: {status}.\n"
-            f"{out[-1500:] if out else ''}", True)
+    return (f"Job '{job.name}' ({job.id}) on {job.remote_label}: {status}. "
+            f"Log: {_job_log_path(job, remote, ctx)}\n"
+            f"{_clip_job_output(out) if out else ''}", True)
 
 
-def _poll_job(job: Job, remote, ctx) -> tuple[str, str]:
+def _job_log_path(job: Job, remote, ctx) -> str:
+    """Where this job's output is being written (on the node, or locally)."""
+    if job.scheduler == "slurm":
+        return f"(scheduler output under {job.cwd})"
+    if remote:
+        return posixpath.join(job.cwd or ".", f"science_{job.id}.log")
+    return str(ctx.session.science_dir / "jobs" / f"{job.id}.log")
+
+
+def _poll_job(job: Job, remote, ctx, lines: int = 120) -> tuple[str, str]:
     if job.scheduler == "slurm":
         cmd = (f"sacct -j {job.handle} --format=State,Elapsed,ExitCode "
                f"--noheader --parsable2 2>/dev/null | head -1 || "
@@ -603,7 +637,7 @@ def _poll_job(job: Job, remote, ctx) -> tuple[str, str]:
     alive_cmd = (f"S=$(ps -o stat= -p {job.handle} 2>/dev/null | tr -d ' '); "
                  f"case \"$S\" in ''|Z*) echo GONE;; *) echo ALIVE;; esac")
     alive = _run_anywhere(alive_cmd, job.cwd, remote).strip()
-    tail = _run_anywhere(f"tail -n 40 {log} 2>/dev/null", job.cwd, remote)
+    tail = _run_anywhere(f"tail -n {lines} {log} 2>/dev/null", job.cwd, remote)
     status = "running" if "ALIVE" in alive else "done"
     return status, tail
 
@@ -623,6 +657,49 @@ def _emit_job(job: Job) -> None:
                    "status": job.status, "remote": job.remote_label,
                    "scheduler": job.scheduler, "handle": job.handle,
                    "output": job.output[-1500:]})
+
+
+def _run_write_cluster_file(args: dict, working_dir: str) -> tuple[str, bool]:
+    """Write text straight to a file ON the compute node.
+
+    Without this there is no way to put a script, module, or config on the node:
+    submit_cluster_job only takes a command, and fetch_cluster_file only goes the
+    other way. Agents therefore improvised — building the tree in the LOCAL /tmp
+    and shelling out to their own `ssh` — which puts work back on the machine the
+    user asked to keep free, and hides those commands from the Jobs panel.
+    """
+    ctx = _compute_ctx()
+    if ctx is None:
+        return "Compute context unavailable.", False
+    raw = str(args.get("path", "") or args.get("remote_path", "")).strip()
+    if not raw:
+        return "write_cluster_file needs a `path` (on the compute node).", False
+    content = args.get("content")
+    if content is None:
+        return "write_cluster_file needs `content` (the text to write).", False
+    if not isinstance(content, str):
+        content = json.dumps(content, indent=2)
+    remote_id = str(args.get("remote_id", "")).strip() or ctx.session.remote_id or ""
+    remote = _remote_for(remote_id)
+    if not remote:
+        return ("write_cluster_file needs a remote compute node, but none is "
+                "selected for this session — write the file locally instead.", False)
+    from ..remote import RemoteSession
+    sess = RemoteSession.get(remote)
+    ws = _remote_workspace(remote, ctx.session)
+    remote_path = raw if posixpath.isabs(raw) else posixpath.join(ws, raw)
+    try:
+        parent = posixpath.dirname(remote_path)
+        if parent:
+            sess.mkdirs(parent)
+        sess.write_text(remote_path, content)
+        if str(args.get("executable", "")).strip().lower() in ("1", "true", "yes"):
+            sess.run(f"chmod +x {shlex.quote(remote_path)}", None, timeout=30)
+    except Exception as exc:  # noqa: BLE001
+        return f"write_cluster_file: failed to write {remote_path}: {exc}", False
+    return (f"Wrote {len(content):,} characters to '{remote_path}' on "
+            f"{remote.get('name', remote_id)}. Run it with submit_cluster_job "
+            f"(paths relative to the session workspace {ws}).", True)
 
 
 def _run_fetch_cluster_file(args: dict, working_dir: str) -> tuple[str, bool]:
@@ -875,11 +952,34 @@ SCIENCE_TOOL_DEFINITIONS = [
         }, "required": ["name", "command"]}}},
     {"type": "function", "function": {
         "name": "check_cluster_job",
-        "description": "Check the status and tail the output of a job submitted with "
-                       "submit_cluster_job.",
+        "description": "Check the status and read the output of a job submitted with "
+                       "submit_cluster_job. Long output is clipped in the MIDDLE (head "
+                       "and tail are both kept) and the log's path is returned, so "
+                       "there is never a need to re-submit a job just to see what it "
+                       "printed.",
         "parameters": {"type": "object", "properties": {
             "job_id": {"type": "string"},
+            "lines": {"type": "integer", "description": "How many trailing log lines "
+                      "to read (default 120, max 1000)."},
         }, "required": ["job_id"]}}},
+    {"type": "function", "function": {
+        "name": "write_cluster_file",
+        "description": "Write a file (script, module, config, submit script) directly "
+                       "ON the compute node — nothing is created on the local machine. "
+                       "This is how you put code on the node: build the project there "
+                       "with write_cluster_file, then run it with submit_cluster_job. "
+                       "Do NOT assemble files in the local /tmp and ssh them across by "
+                       "hand — that loads the machine the user wants left free and the "
+                       "commands never appear in the Jobs panel.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Path on the node. A relative "
+                     "path resolves against the session workspace; parent directories "
+                     "are created."},
+            "content": {"type": "string", "description": "Full text of the file."},
+            "executable": {"type": "boolean", "description": "chmod +x it (for scripts)."},
+            "remote_id": {"type": "string", "description": "Configured remote id "
+                          "(optional; defaults to the session's compute node)."},
+        }, "required": ["path", "content"]}}},
     {"type": "function", "function": {
         "name": "fetch_cluster_file",
         "description": "Copy a LIGHTWEIGHT result file (a plot, a UMAP/embedding "
@@ -949,6 +1049,7 @@ _RUNNERS = {
     "continue_specialist": _run_continue_specialist,
     "submit_cluster_job": _run_submit_job,
     "check_cluster_job": _run_check_job,
+    "write_cluster_file": _run_write_cluster_file,
     "fetch_cluster_file": _run_fetch_cluster_file,
     "present_output": _run_present_output,
     "record_provenance": _run_record_provenance,
@@ -971,7 +1072,8 @@ def unregister() -> None:
 
 # The cluster-job subset — reused by the Lab (which does not want the rest of the
 # science toolset). Backed by the thread-local compute context (set_compute_context).
-CLUSTER_TOOL_NAMES = ("submit_cluster_job", "check_cluster_job", "fetch_cluster_file")
+CLUSTER_TOOL_NAMES = ("submit_cluster_job", "check_cluster_job",
+                      "write_cluster_file", "fetch_cluster_file")
 
 
 def register_cluster_tools() -> None:

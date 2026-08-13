@@ -81,7 +81,8 @@ def run_science_turn(
                 user_message, model, wd, client,
                 prompt_profile="science", permission_mode=permission_mode,
                 enable_plan=False, enable_verify=False, enable_memory=True,
-                remote=None, extra_system=pool_note, model_pool=fallbacks,
+                remote=None, compute_node=remote,
+                extra_system=pool_note, model_pool=fallbacks,
             )
         else:
             messages = continue_agent(

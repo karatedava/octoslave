@@ -59,7 +59,11 @@ Long-running jobs (model training, servers, large simulations, big data jobs) �
 - stop_process   — terminate a background job by id (SIGTERM, then SIGKILL)
   Pattern: `run_background` the job → do other useful work → `check_process` periodically until it reports `exited` → read its output. This keeps you responsive instead of frozen waiting on one long bash call.
 - compress_log — wrap a long log/command output into a templated summary via the `codag` CLI; ~95–99% token reduction while preserving rare errors/tracebacks. Use instead of read_file/bash whenever the output exceeds ~500 lines.
-- image_ocr    — OCR text out of image files (PNG/JPG/TIFF/BMP/GIF/WEBP) — screenshots, scanned docs, photos of text, figure labels. Requires the `tesseract` binary. For PDFs use pdf_ocr instead.
+
+Images — two different tools, pick by what you need out of the picture:
+- view_image   — SEE the image yourself; the actual pixels are attached to the conversation. This is the tool for anything where the *shape* is the information: plots and charts (is the trend real, where do the curves cross, does the fit follow the points, are there outliers), molecular structures, gels and blots, micrographs, rendered figures you just produced, UI screenshots you must judge visually. After generating a figure, look at it before claiming it is correct.
+- image_ocr    — READ text out of an image (PNG/JPG/TIFF/BMP/GIF/WEBP) with tesseract — screenshots of text, scanned documents, and exact printed numbers such as axis ticks or table cells. Requires the `tesseract` binary. For PDFs use pdf_ocr instead.
+  Use both on one figure when you need the shape *and* the precise numbers. If the active model has no image input, view_image says so plainly and you fall back to image_ocr or the underlying data — never describe an image you were not actually shown.
 
 Task control:
 - todo_write   — maintain a task checklist for multi-step work; pass the FULL list each time (it replaces the previous one), keep exactly one item 'in_progress', mark items 'completed' as you go. Shows live progress in the UI. Skip it for trivial single-step requests.

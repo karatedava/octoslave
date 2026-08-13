@@ -29,13 +29,24 @@ from ..agent import (
     _is_malformed_history_error,
     _is_model_unavailable_error,
     _is_retryable_error,
+    _is_vision_unsupported_error,
+    _has_image,
     _proactive_trim,
     _stream_completion,
+    drain_image_attachments,
     independent_soft_budget,
+    model_supports_vision,
+    note_vision_unsupported,
     repair_messages,
+    strip_image_blocks,
     ModelRestorer,
 )
-from ..tools import all_tool_definitions, execute_tool
+from ..tools import (
+    all_tool_definitions,
+    current_vision_support,
+    execute_tool,
+    set_vision_support,
+)
 from .llm import strip_tool_markup
 from .state import AgentSpec, AGENT_DONE, AGENT_WORKING
 
@@ -230,7 +241,14 @@ def run_agent_task(
     if _sb:
         _RT.soft_budget = _sb
 
+    # Same save/restore for the view_image capability gate: a specialist may run
+    # on a different model than its caller, and in Science this loop is nested on
+    # the caller's own thread.
+    _prev_vision = current_vision_support()
+    set_vision_support(lambda: model_supports_vision(client, model))
+
     def _restore_budget():
+        set_vision_support(_prev_vision)
         if _had_budget:
             _RT.soft_budget = _prev_budget
         elif hasattr(_RT, "soft_budget"):
@@ -364,6 +382,18 @@ def run_agent_task(
                                     f"no alternative model was found.")
                 stopped_reason = "no reachable model"
                 break
+            if _is_vision_unsupported_error(err) and any(_has_image(m) for m in messages):
+                # An attached image reached a model that can't take one (wrong
+                # guess, or a failover moved us onto a text-only model). Strip
+                # the pixels, remember it, and retry — with a note in their
+                # place so the specialist never thinks it saw the figure.
+                messages, n_img = strip_image_blocks(messages)
+                note_vision_unsupported(client, model)
+                display.print_info(
+                    f"[{spec.name}] {model} does not accept images — removed "
+                    f"{n_img} attachment(s) and retrying.")
+                iteration -= 1
+                continue
             if _is_malformed_history_error(err):
                 # Repair what we can; if there's nothing left to repair, drop the
                 # last exchange; if it STILL fails, this model and this endpoint
@@ -500,6 +530,9 @@ def run_agent_task(
             display.print_tool_result(name, result, success)
             _ev("tool_result", tool=name, ok=success)
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+        # Images view_image queued go in after every tool result, never between
+        # two of them (strict servers require contiguous tool messages).
+        drain_image_attachments(messages)
         display.print_separator()
 
     if not final_text.strip() and last_reasoning.strip():

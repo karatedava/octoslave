@@ -139,7 +139,10 @@ def _serve() -> None:
     """Start the FastAPI/uvicorn web server (blocking)."""
     import uvicorn
     from octoslave.web.app import app as _web_app
-    uvicorn.run(_web_app, host=_WEB_HOST, port=_WEB_PORT, log_level="error")
+    # Long ws ping timeout: a busy agent turn can stall the event loop past the
+    # 20s default, which would drop the tab's socket mid-run (see main.web).
+    uvicorn.run(_web_app, host=_WEB_HOST, port=_WEB_PORT, log_level="error",
+                ws_ping_interval=30, ws_ping_timeout=300)
 
 
 def _run_headless() -> None:

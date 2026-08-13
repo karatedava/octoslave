@@ -21,7 +21,7 @@ from pathlib import Path
 from openai import OpenAI, BadRequestError
 
 from . import display
-from .agent import _cap_result, _compact_and_trim as _trim_messages
+from .agent import _cap_result, _compact_and_trim as _trim_messages, drain_image_attachments
 from .tools import TOOL_DEFINITIONS, execute_tool
 
 # ---------------------------------------------------------------------------
@@ -285,6 +285,7 @@ def _run_vault_agent(
             result = _cap_result(result, name)
             display.print_tool_result(name, result, success)
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+        drain_image_attachments(messages)
 
     return True
 

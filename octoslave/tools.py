@@ -1,4 +1,5 @@
 import atexit
+import base64
 import json
 import os
 import posixpath
@@ -312,6 +313,35 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "view_image",
+            "description": (
+                "LOOK at an image yourself — the actual pixels are attached to the "
+                "conversation so you can see them. Use this for anything where the "
+                "picture is the information: plots and charts (read trends, outliers, "
+                "where curves cross, whether a fit is bad), molecular structures, gels "
+                "and blots, micrographs, UI screenshots you must judge visually, "
+                "rendered figures you just produced. "
+                "This is NOT image_ocr: image_ocr extracts text with tesseract and is "
+                "the right tool for scanned documents, screenshots of text, and reading "
+                "exact printed numbers/labels. Use both on the same figure when you "
+                "need the shape AND the precise tick values. "
+                "The image arrives as a separate message right after this tool's reply. "
+                "Requires a vision-capable model — if the active model has no image "
+                "input the call fails and says so; it never silently drops the image."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the image file (PNG/JPG/TIFF/BMP/GIF/WEBP), absolute or relative to the working dir. Large images are downscaled automatically."},
+                    "note": {"type": "string", "description": "Optional: what you are looking for (e.g. 'does the red curve plateau?'). Attached alongside the image to keep your own intent in view."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "apply_patch",
             "description": (
                 "Apply MULTIPLE find-and-replace edits to a SINGLE file in one call. "
@@ -551,6 +581,16 @@ LOCAL_TOOL_ALLOWLIST = frozenset({
     "read_file", "write_file", "edit_file", "bash",
     "glob", "grep", "list_dir",
     "web_search", "web_fetch",
+    # Local vision models (llava, gemma3, qwen-vl, minicpm-v) are a common
+    # reason to run Ollama at all. Safe on a text-only local model too: Ollama's
+    # /api/show reports the vision capability, so view_image refuses outright
+    # rather than handing over an image the runner would silently drop.
+    "view_image",
+    # ...and the fallback that refusal points at MUST be reachable here. Most
+    # local models are text-only, so this is exactly the profile where OCR is
+    # the only way to get at an image at all — granting view_image without it
+    # would leave a blind model with no route to the picture.
+    "image_ocr", "pdf_ocr",
 })
 
 
@@ -633,7 +673,7 @@ _EXEC = threading.local()
 # mode these run against a local temp mirror (input staged in, new outputs
 # pushed back) — they need local Python libs (rdkit/pymupdf/pandas) that we do
 # not assume exist on the remote host.
-_STAGED_TOOLS = frozenset(BIO_TOOL_NAMES) | {"image_ocr"}
+_STAGED_TOOLS = frozenset(BIO_TOOL_NAMES) | {"image_ocr", "view_image"}
 
 
 def configure_execution(remote_cfg: dict | None) -> None:
@@ -981,6 +1021,12 @@ def _run_staged_tool(name, args, sess, working_dir) -> tuple[str, bool]:
         try:
             if name == "image_ocr":
                 result, ok = _image_ocr(working_dir=tmp, **local_args)
+            elif name == "view_image":
+                # Label with the path the model asked for, not the temp basename
+                # we staged it to. `label` is ours to set, so a model that also
+                # passed one must not collide with it.
+                local_args.pop("label", None)
+                result, ok = _view_image(working_dir=tmp, label=str(val or ""), **local_args)
             else:
                 result, ok = execute_bio_tool(name, local_args, tmp)
         finally:
@@ -1095,6 +1141,11 @@ def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str =
             if _sess is not None:
                 return _run_staged_tool("image_ocr", args, _sess, working_dir)
             return _image_ocr(working_dir=working_dir, **args)
+        elif name == "view_image":
+            _sess = _remote()
+            if _sess is not None:
+                return _run_staged_tool("view_image", args, _sess, working_dir)
+            return _view_image(working_dir=working_dir, **args)
         elif name in BIO_TOOL_NAMES:
             _sess = _remote()
             if _sess is not None:
@@ -1166,6 +1217,7 @@ _REQUIRED_STR_ARGS: dict[str, tuple[str, ...]] = {
     "web_fetch": ("url",),
     "crawl_tree": ("root_url",),
     "image_ocr": ("path",),
+    "view_image": ("path",),
     # bio tools that need a string input
     "bio_inspect": ("path",),
     "rdkit_describe": ("smiles",),
@@ -1239,6 +1291,7 @@ _ARG_HINTS: dict[str, str] = {
     "web_fetch": "Pass `url` as a fully-qualified http(s) URL.",
     "crawl_tree": "Pass `root_url` as a fully-qualified http(s) URL.",
     "image_ocr": "Pass `path` to an image file (PNG/JPG/TIFF/BMP/GIF/WEBP).",
+    "view_image": "Pass `path` to an image file (PNG/JPG/TIFF/BMP/GIF/WEBP) to look at it yourself.",
     "pdf_ocr": "Pass `path` to a PDF file. Use `pages` to limit page range.",
     "bio_inspect": "Pass `path` to a data table (CSV/TSV/Parquet/JSONL) or bio/chem data file.",
     "rdkit_describe": "Pass `smiles` (e.g. {\"smiles\": \"CC(=O)O\"}).",
@@ -2535,6 +2588,218 @@ def _image_ocr(
         hint = "" if preprocess else " Try preprocess=true for noisy/low-contrast images."
         return header + f"(no text extracted —{hint} image may contain no readable text)", True
     return header + text, True
+
+
+# ---------------------------------------------------------------------------
+# view_image — hand the model the actual pixels
+# ---------------------------------------------------------------------------
+# The Chat Completions API this agent speaks requires a `role: "tool"` message's
+# content to be a plain string, so an image cannot travel back as a tool result.
+# Instead the tool returns a short text ack and parks the encoded image on this
+# thread's pending queue; the agent loop drains the queue after the turn's tool
+# results and appends the pixels as a separate `role: "user"` message (see
+# agent.drain_image_attachments). Queue is thread-local, like the rest of _EXEC,
+# so parallel agents never cross-contaminate.
+
+# A 300-DPI matplotlib PNG is ~2 MB and every provider downsamples it anyway.
+_VIEW_IMAGE_MAX_EDGE = 1280
+_VIEW_IMAGE_MAX_BYTES = 1_500_000
+
+
+def set_vision_support(check) -> None:
+    """Declare whether THIS thread's model can accept image input.
+
+    ``check`` is a bool, a zero-arg callable returning bool (evaluated lazily, so
+    a live capability probe only costs a request if view_image is actually
+    called), or None for "unknown" — unknown lets the image through and relies on
+    the agent's 400-recovery to strip it if the endpoint refuses."""
+    _EXEC.vision_check = check
+
+
+def current_vision_support():
+    """The raw check installed for this thread (bool | callable | None). Lets a
+    nested run (Lab/Science specialist) save and restore the ambient setting."""
+    return getattr(_EXEC, "vision_check", None)
+
+
+def vision_supported() -> bool | None:
+    check = getattr(_EXEC, "vision_check", None)
+    if check is None or isinstance(check, bool):
+        return check
+    try:
+        return bool(check())
+    except Exception:
+        return None
+
+
+def take_image_attachments() -> list[dict]:
+    """Drain this thread's pending image attachments (oldest first)."""
+    pending = getattr(_EXEC, "image_attachments", None)
+    if not pending:
+        return []
+    _EXEC.image_attachments = []
+    return pending
+
+
+def _queue_image_attachment(entry: dict) -> None:
+    pending = getattr(_EXEC, "image_attachments", None)
+    if pending is None:
+        pending = []
+        _EXEC.image_attachments = pending
+    pending.append(entry)
+
+
+def _encode_for_vision(img, max_bytes: int) -> tuple[str, bytes]:
+    """Serialise a PIL image to (mime, bytes) under ``max_bytes``.
+
+    PNG first — plots, gels and structures are line art, where PNG is both
+    smaller and sharper than JPEG. Only photographic content overflows the
+    budget, and that is exactly the content JPEG handles well."""
+    import io
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    if buf.tell() <= max_bytes:
+        return "image/png", buf.getvalue()
+
+    flat = img
+    if flat.mode not in ("RGB", "L"):
+        from PIL import Image
+        bg = Image.new("RGB", flat.size, (255, 255, 255))
+        bg.paste(flat, mask=flat.split()[-1] if flat.mode in ("RGBA", "LA") else None)
+        flat = bg
+    for quality in (85, 70, 55):
+        buf = io.BytesIO()
+        flat.save(buf, format="JPEG", quality=quality, optimize=True)
+        if buf.tell() <= max_bytes:
+            return "image/jpeg", buf.getvalue()
+    # Still oversized (very large photo): halve it and take whatever JPEG gives.
+    flat = flat.resize((max(1, flat.width // 2), max(1, flat.height // 2)))
+    buf = io.BytesIO()
+    flat.save(buf, format="JPEG", quality=70, optimize=True)
+    return "image/jpeg", buf.getvalue()
+
+
+# Formats every vision endpoint accepts verbatim. TIFF/BMP must be converted
+# first, which needs Pillow.
+_VIEW_IMAGE_RAW_MIMES = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp",
+}
+
+
+def _view_image_raw(resolved: Path, display_path: str, note: str) -> tuple[str, bool]:
+    """Attach an image without Pillow: only viable if it is already small enough
+    and in a format the providers take as-is."""
+    mime = _VIEW_IMAGE_RAW_MIMES.get(resolved.suffix.lower())
+    if mime is None:
+        return (
+            f"Cannot view a {resolved.suffix} image without Pillow (it needs "
+            f"converting first). Run `pip install pillow`, or convert the file "
+            f"to PNG and view that.",
+            False,
+        )
+    try:
+        blob = resolved.read_bytes()
+    except OSError as e:
+        return f"Could not read image: {e}", False
+    if len(blob) > _VIEW_IMAGE_MAX_BYTES:
+        return (
+            f"Image is {len(blob) // 1024} KB, over the "
+            f"{_VIEW_IMAGE_MAX_BYTES // 1024} KB limit, and Pillow is not "
+            f"installed to downscale it. Run `pip install pillow`, or save the "
+            f"figure at a lower dpi and view that.",
+            False,
+        )
+    _queue_image_attachment({
+        "label": display_path,
+        "mime": mime,
+        "b64": base64.b64encode(blob).decode("ascii"),
+        "note": (note or "").strip(),
+    })
+    return (
+        f"Attached {Path(display_path).name} — {len(blob) // 1024} KB. The image "
+        f"itself follows in the next message; read it there.",
+        True,
+    )
+
+
+def _view_image(
+    path: str,
+    working_dir: str,
+    note: str = "",
+    label: str = "",
+) -> tuple[str, bool]:
+    """Show an image to the model itself (plots, structures, gels, micrographs).
+
+    Returns a text ack; the pixels are queued for the agent loop to attach."""
+    supported = vision_supported()
+    if supported is False:
+        return (
+            "This model cannot accept image input, so the picture was NOT shown "
+            "to you — do not describe it as if you had seen it. Use image_ocr to "
+            "read any text/labels in it, inspect the underlying data file, or "
+            "switch to a vision-capable model. (Override the detection with "
+            "`model_vision` in config.json if this model really does see images.)",
+            False,
+        )
+
+    resolved = _resolve(path, working_dir)
+    if not resolved.exists():
+        return f"File not found: {path}", False
+    if not resolved.is_file():
+        return f"Not a file: {path}", False
+    if resolved.suffix.lower() not in _IMAGE_EXTS:
+        return (
+            f"Unsupported image format: {resolved.suffix!r}. "
+            f"Supported: {sorted(_IMAGE_EXTS)}. For PDFs, render a page to PNG "
+            f"first (or use pdf_ocr for text).",
+            False,
+        )
+
+    try:
+        from PIL import Image
+    except ImportError:
+        # Pillow is an optional extra, so fall back to sending the file as-is.
+        # That covers most real figures (a default-DPI matplotlib PNG is well
+        # under the cap); only oversized or non-web formats actually need the
+        # resizer, and those say so instead of failing vaguely.
+        return _view_image_raw(resolved, label or path, note)
+
+    try:
+        img = Image.open(str(resolved))
+        img.load()
+    except Exception as e:
+        return f"Could not open image: {e}", False
+
+    width, height = img.size
+    if img.mode not in ("RGB", "RGBA", "L"):
+        img = img.convert("RGB")
+    scale = _VIEW_IMAGE_MAX_EDGE / max(width, height)
+    if scale < 1:
+        img = img.resize((max(1, round(width * scale)), max(1, round(height * scale))),
+                         Image.LANCZOS)
+
+    try:
+        mime, blob = _encode_for_vision(img, _VIEW_IMAGE_MAX_BYTES)
+    except Exception as e:
+        return f"Could not encode image for viewing: {e}", False
+
+    display_path = label or path
+    _queue_image_attachment({
+        "label": display_path,
+        "mime": mime,
+        "b64": base64.b64encode(blob).decode("ascii"),
+        "note": (note or "").strip(),
+    })
+
+    sent = f"{img.width}x{img.height}" if scale < 1 else f"{width}x{height}"
+    scaled = f" (downscaled from {width}x{height})" if scale < 1 else ""
+    return (
+        f"Attached {Path(display_path).name} — {sent}{scaled}, "
+        f"{len(blob) // 1024} KB. The image itself follows in the next message; "
+        f"read it there.",
+        True,
+    )
 
 
 def _glob(pattern: str, working_dir: str, path: str = None) -> tuple[str, bool]:

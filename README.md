@@ -506,6 +506,17 @@ troubleshooting).
 
 **Web** — `web_search`, `web_fetch`, `crawl_tree` (BFS website crawler, Playwright-aware)
 
+**Images** — `view_image` shows the model the actual pixels, so it can read a plot's shape,
+inspect a structure or micrograph, or judge a screenshot; `image_ocr` extracts text and exact
+printed numbers with tesseract. Use both on one figure when you need the shape *and* the values.
+`view_image` only fires on a model that can really see: octoslave checks the `model_vision`
+config override, then the endpoint's advertised capability, then a one-off live probe that makes
+the model name two random colours — measured against e-INFRA, a text-only model accepts an image
+with a clean `200` and silently ignores it, so "the request worked" proves nothing. On a
+text-only model the tool refuses and says so rather than letting the model narrate a picture it
+never saw. Large images are downscaled to 1280 px (needs Pillow; smaller PNG/JPEG/GIF/WEBP files
+are sent as-is without it), and only the newest few stay in context.
+
 **Lab runtime expansion** *(active only inside the Autonomous Lab)* — `request_tool` (build &
 register a new Python tool at runtime), `request_agent` (add a specialist to the team),
 `request_mcp` (connect a registry MCP server). These are off in single-agent / chat mode.
@@ -529,6 +540,11 @@ Precedence: **environment variable** → `~/.octoslave/config.json` → built-in
 | `OCTOSLAVE_MODEL` / `OCTOSLAVE_BACKEND` | Default model / backend (`einfra` / `ollama` / `nim`) |
 | `OCTOSLAVE_PERMISSION_MODE` | `autonomous` / `controlled` / `supervised` |
 | `OCTOSLAVE_CONSTITUTION` | Constitution layer: `1`/`0` (default on; config key `constitution`) |
+| `OCTOSLAVE_MAX_LIVE_IMAGES` | How many viewed images stay in context (default 3; older ones become a stub) |
+| `OCTOSLAVE_VISION_PROBE_TIMEOUT` | Seconds to wait for the one-off vision capability probe (default 75) |
+
+**Vision override:** `"model_vision": {"my-model": true}` in `~/.octoslave/config.json` forces
+`view_image` on or off for a model whose capability is detected wrongly.
 
 **Permission modes:** `autonomous` (default, no prompts), `controlled` (ask before any
 modifying action), `supervised` (ask before file edits only). See

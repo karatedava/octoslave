@@ -417,6 +417,143 @@ def resolve_context_window(model: str, live: dict[str, int] | None = None) -> in
     return DEFAULT_CONTEXT_WINDOW
 
 
+# ---------------------------------------------------------------------------
+# Vision (image input) capability
+# ---------------------------------------------------------------------------
+# Sending an `image_url` content block to a text-only vLLM worker is a hard 400,
+# so `view_image` has to know whether the active model can actually see. The
+# authority is a live probe (agent._probe_vision sends one tiny image); these
+# tables are the offline fallback for when the probe can't run, plus the manual
+# `model_vision` config override for a deployment we guess wrong about.
+#
+# Substring patterns, matched lowercased, most-specific first. A True match means
+# "this build accepts image input"; False pins a known text-only model whose name
+# would otherwise be caught by a broader pattern below it.
+PATTERN_VISION_MODELS: tuple[tuple[str, bool], ...] = (
+    # Text-only builds that sit under a multimodal family name.
+    ("qwen3-coder",   False),
+    ("gemma-3n",      False),
+    # Explicitly multimodal builds.
+    ("-vl",           True),   # qwen2.5-vl, kimi-vl, internvl-…, glm-4.1v-vl
+    ("vl-",           True),
+    ("vision",        True),
+    ("llava",         True),
+    ("pixtral",       True),
+    ("multimodal",    True),
+    ("minicpm-v",     True),
+    ("molmo",         True),
+    ("idefics",       True),
+    ("llama-4",       True),   # Scout / Maverick are natively multimodal
+    ("llama4",        True),
+    ("gemma-3",       True),   # Gemma 3/4 (except the 1b text-only build)
+    ("gemma3",        True),
+    ("gemma-4",       True),
+    ("gemma4",        True),
+    ("mistral-medium", True),  # Mistral Medium 3.x accepts images
+    ("mistral-small-3", True),
+    ("gpt-4o",        True),
+    ("gpt-5",         True),
+    ("glm-4.5v",      True),
+    ("glm-4.6v",      True),
+    ("glm-5v",        True),
+    ("phi-4-multimodal", True),
+    ("granite-vision", True),
+    ("step-1v",       True),
+)
+
+# Families with no multimodal build in general circulation. Anything not matched
+# by a pattern and not in this map is treated as unknown (the caller probes).
+FAMILY_VISION: dict[str, bool] = {
+    "deepseek": False,
+    "gpt":      False,   # gpt-oss-120b; the gpt-4o/gpt-5 patterns above win first
+}
+
+# Fields an OpenAI-compatible /v1/models entry may use to advertise image input.
+# litellm surfaces `supports_vision`, OpenRouter nests input modalities under
+# `architecture`. e-INFRA advertises neither — hence the probe.
+_VISION_FLAG_FIELDS = ("supports_vision", "supports_image_input", "vision")
+_MODALITY_FIELDS = ("input_modalities", "modalities", "input_modality")
+
+
+def parse_model_vision(models_payload: dict) -> dict[str, bool]:
+    """Extract ``{model_id: accepts_images}`` from a /v1/models JSON payload.
+
+    Only returns entries the gateway actually advertises — a model absent from
+    the result is *unknown*, not text-only, so the caller can fall back to a
+    probe instead of wrongly refusing."""
+    def _pluck(d: dict) -> bool | None:
+        for f in _VISION_FLAG_FIELDS:
+            v = d.get(f)
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, str) and v.strip().lower() in ("true", "false"):
+                return v.strip().lower() == "true"
+        for f in _MODALITY_FIELDS:
+            v = d.get(f)
+            if isinstance(v, str):
+                v = [v]
+            if isinstance(v, list) and v:
+                return any("image" in str(x).lower() for x in v)
+        return None
+
+    out: dict[str, bool] = {}
+    for m in (models_payload or {}).get("data", []):
+        if not isinstance(m, dict):
+            continue
+        mid = m.get("id")
+        if not mid:
+            continue
+        val = _pluck(m)
+        if val is None:
+            for nested in ("architecture", "meta", "config", "model_info"):
+                sub = m.get(nested)
+                if isinstance(sub, dict):
+                    val = _pluck(sub)
+                    if val is not None:
+                        break
+        if val is not None:
+            out[mid] = val
+    return out
+
+
+def configured_model_vision(model: str, cfg: dict | None = None) -> bool | None:
+    """Manual per-model vision flag from config ``model_vision``
+    (``{model_id: true|false}``), or None when unset. The user's escape hatch for
+    a deployment we detect wrong — set false to stop octoslave sending images to
+    a model that 400s on them, true to force it on for a build we don't know."""
+    if cfg is None:
+        cfg = load_config()
+    m = cfg.get("model_vision") or {}
+    if not isinstance(m, dict):
+        return None
+    for key in (model, (model or "").lower()):
+        if key in m:
+            val = m[key]
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                return val.strip().lower() in ("1", "true", "yes", "on")
+    return None
+
+
+def resolve_vision_support(model: str, live: dict[str, bool] | None = None) -> bool | None:
+    """Best offline guess at whether ``model`` accepts image input.
+
+    Returns True/False when a live advertisement, name pattern, or family map
+    settles it, and **None when genuinely unknown** — the caller (agent) turns a
+    None into a live probe rather than guessing."""
+    if live and model in live:
+        return live[model]
+    m = (model or "").lower()
+    for pat, ok in PATTERN_VISION_MODELS:
+        if pat in m:
+            return ok
+    fam = _model_family(model)
+    if fam in FAMILY_VISION:
+        return FAMILY_VISION[fam]
+    return None
+
+
 def resolve_council_models(
     available: list[str] | None = None,
     overrides: dict | None = None,
@@ -820,6 +957,11 @@ def load_config() -> dict:
         # and the built-in map doesn't know (e.g. a new kimi/glm build). Empty = use
         # auto-detection. Highest priority in agent._remote_model_window.
         "model_context_windows": {},
+        # Optional per-model vision override, {model_id: true|false}. Decides
+        # whether `view_image` may hand this model an actual image. Empty = auto
+        # (advertised capability → name pattern → one-off live probe). Set false
+        # for a deployment that 400s on image input, true to force it on.
+        "model_vision": {},
         "nim_api_key": "",
         "nim_url": NIM_BASE_URL,
         "role_models_einfra": {},
@@ -1217,13 +1359,22 @@ def remote_awareness_note(active: dict | None = None, cfg: dict | None = None,
                 mark = "  ← this session's default node" if r.get("id") == active_id else ""
                 lines.append(f"- {_label(r)}{mark}")
             lines.append(
-                "Workflow: submit_cluster_job(remote_id=…, command=…) to run the heavy "
-                "step on the node → check_cluster_job to poll it → when it finishes, "
-                "fetch_cluster_file the LIGHTWEIGHT result (a plot, a UMAP/embedding "
-                "projection, a small summary table) back to the local session, then "
-                "present_output it so the user sees it. Big files, models, and "
-                "intermediates STAY on the node — fetch only what the user should see. "
-                "With no node configured, just do it locally."
+                "Workflow: write_cluster_file(path=…, content=…) to put scripts and "
+                "code ON the node → submit_cluster_job(remote_id=…, command=…) to run "
+                "the heavy step there → check_cluster_job to poll it → when it "
+                "finishes, fetch_cluster_file the LIGHTWEIGHT result (a plot, a "
+                "UMAP/embedding projection, a small summary table) back to the local "
+                "session, then present_output it so the user sees it. Big files, "
+                "models, and intermediates STAY on the node — fetch only what the user "
+                "should see. With no node configured, just do it locally."
+            )
+            lines.append(
+                "Never assemble files in the LOCAL /tmp and copy them over with your "
+                "own `ssh`/`scp`/`rsync` command: that puts work back on the machine "
+                "the node exists to spare, guesses at credentials the tools already "
+                "hold, and hides the run from the Jobs panel (no status, no polling, "
+                "no stop). Use the cluster tools — they reuse one multiplexed "
+                "connection and record every job."
             )
         return "\n".join(lines)
 

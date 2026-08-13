@@ -18,7 +18,8 @@ File system:
 - grep         — search file contents by regex
 - list_dir     — list directory contents
 - compress_log — wrap a long log/command output into a templated summary (~95–99% token reduction, errors preserved). Use instead of read_file/bash for build logs, test output, CI traces, anything > ~500 lines.
-- image_ocr    — extract text from PNG/JPG/TIFF/BMP/GIF/WEBP screenshots or scans (bug-report screenshots, UI mockups). Requires `tesseract`.
+- view_image   — LOOK at an image yourself (pixels attached to the conversation): judge a UI screenshot, a mockup, or a rendered chart visually — layout, alignment, what is actually broken in a bug-report screenshot.
+- image_ocr    — extract text from PNG/JPG/TIFF/BMP/GIF/WEBP screenshots or scans (error messages and stack traces in a screenshot, scanned specs). Requires `tesseract`.
 
 Web:
 - web_search   — search the web via DuckDuckGo; returns titles, URLs, snippets
