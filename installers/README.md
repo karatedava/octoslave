@@ -154,6 +154,46 @@ To cut a release:
 
 ---
 
+## In-App Updates
+
+Users do **not** have to reinstall when a new release ships. `octoslave/updater.py`
+detects how the running copy was installed and knows the right upgrade path for
+each. The web UI shows an "Update to X" pill in the sidebar; the terminal has
+`ots update`.
+
+| Install method | Detected via | Upgrade performed |
+|---|---|---|
+| pip / venv | `sys.prefix != sys.base_prefix` | `pip install --upgrade octoslave[extras]==X` |
+| pipx | `/pipx/venvs/` in `sys.executable` | `pipx install --force octoslave[extras]==X` |
+| Homebrew | Cellar path | `brew update && brew upgrade octoslave` |
+| Linux AppImage | `$APPIMAGE` set | download the new `.AppImage`, keep the old one as `.old`, atomic rename |
+| macOS `.app` | `.app/Contents/` in `sys.executable` | download DMG → stage the bundle → detached helper swaps it once we exit → relaunch |
+| Windows | frozen + `win32` | download `OctoSlave-Windows-Installer.exe` → run it `/SILENT` after we exit → relaunch |
+| source checkout | editable dist / `pyproject.toml` next door | **not automatic** — prints `git pull && pip install -e '.[all]'` |
+
+Notes for maintainers:
+
+- **Release asset names must stay version-less.** The updater downloads from
+  `releases/download/vX.Y.Z/OctoSlave-macOS.dmg` (and the Windows/Linux
+  equivalents). The CI `release` job's "Normalize installer filenames" step is
+  what guarantees those names — do not add versions back into them.
+- **The GitHub release tag is the source of truth for "latest".** PyPI is tried
+  first for the Python install methods because it is faster, with the git tag as
+  the fallback, so a release that has not reached PyPI yet still installs.
+- **Frozen builds need `_build_version.txt`.** PyInstaller ships no dist-info, so
+  `importlib.metadata` cannot see a version inside a bundle. Each spec stamps
+  `build/version_stamp/_build_version.txt` into the bundle and
+  `octoslave/__init__.py` reads it first when `sys.frozen` is set. Without it every
+  installer would report `0.0.0+unknown` and think every release is an upgrade.
+- Checks are cached in `~/.octoslave/update.json` for 6 h (GitHub allows 60
+  unauthenticated API calls/hour per IP — one shared HPC login node burns that
+  quickly). Users can skip a version or turn checks off; `OCTOSLAVE_NO_UPDATE_CHECK=1`
+  disables them entirely for air-gapped deployments.
+- Test a path without cutting a release with `OCTOSLAVE_INSTALL_METHOD=appimage`
+  (etc.) and `OCTOSLAVE_UPDATE_REPO=<your-fork>`.
+
+---
+
 ## Troubleshooting
 
 **PyImportError / missing module at runtime:**  

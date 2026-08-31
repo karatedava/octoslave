@@ -2047,19 +2047,26 @@ def _cap_result(result: str, tool_name: str) -> str:
     )
 
 
-def _simple_completion(client: OpenAI, model: str, messages: list, max_tokens: int = 600) -> str:
-    """Completion without tools — used for planning and verification (Thinker/
-    Verifier consults, plan authoring, Ultra debate).
+# A thinking model spends its token budget on reasoning BEFORE it emits a single
+# visible character, so the small budgets these internal consults ask for (a
+# one-line verdict, a short plan) can be swallowed whole: the call comes back
+# with finish_reason="length", plenty of reasoning tokens and empty content.
+# That is not a dead endpoint and not a verdict — it is a budget that was too
+# small, so the retry must be BIGGER, not identical. Observed need on a 27B
+# thinking grader with a full verifier prompt: ~1.7-2.2K reasoning tokens.
+_THINKING_RETRY_TOKENS = 4000
 
-    Streams internally so a user Stop (web UI) aborts these background calls
-    *promptly* instead of blocking up to the 120s request timeout — council mode
-    issues many of these per turn, so a non-interruptible version made Stop feel
-    unresponsive. Tokens are NOT surfaced to the display (these are internal
-    consults, not the worker's visible turn). Raises ``interrupt.StopRequested``
-    on stop; returns "" on any transport error."""
+
+def _stream_simple(client: OpenAI, model: str, messages: list, max_tokens: int) -> tuple[str, bool, str]:
+    """One non-tool streaming call. Returns ``(content, saw_reasoning, finish_reason)``.
+
+    ``finish_reason`` is "" when the transport failed. Raises
+    ``interrupt.StopRequested`` on a user stop."""
     extra = {"extra_body": _ollama_extra_body()} if _is_ollama_client(client) else {}
+    parts: list[str] = []
+    saw_reasoning = False
+    finish_reason = ""
     try:
-        parts: list[str] = []
         with client.chat.completions.create(
             model=model,
             messages=messages,
@@ -2073,14 +2080,43 @@ def _simple_completion(client: OpenAI, model: str, messages: list, max_tokens: i
                     raise interrupt.StopRequested
                 if not chunk.choices:
                     continue
-                delta = chunk.choices[0].delta
+                choice = chunk.choices[0]
+                delta = choice.delta
+                if getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None):
+                    saw_reasoning = True
                 if delta.content:
                     parts.append(delta.content)
-        return "".join(parts).strip()
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
     except interrupt.StopRequested:
         raise
     except Exception:
-        return ""
+        return "", saw_reasoning, ""
+    return "".join(parts).strip(), saw_reasoning, finish_reason or "stop"
+
+
+def _simple_completion(client: OpenAI, model: str, messages: list, max_tokens: int = 600) -> str:
+    """Completion without tools — used for planning and verification (Thinker/
+    Verifier consults, plan authoring, Ultra debate).
+
+    Streams internally so a user Stop (web UI) aborts these background calls
+    *promptly* instead of blocking up to the 120s request timeout — council mode
+    issues many of these per turn, so a non-interruptible version made Stop feel
+    unresponsive. Tokens are NOT surfaced to the display (these are internal
+    consults, not the worker's visible turn).
+
+    When a thinking model burns the whole budget reasoning and returns nothing,
+    the call is retried once with a much larger budget — an empty answer here is
+    read by callers as "this model is unreachable", which would wrongly demote a
+    perfectly healthy grader or planner. Raises ``interrupt.StopRequested`` on
+    stop; returns "" on any transport error."""
+    text, saw_reasoning, finish = _stream_simple(client, model, messages, max_tokens)
+    if not text and (finish == "length" or (saw_reasoning and finish)):
+        # Thinking budget, not a sick endpoint: ask again with room to finish.
+        bigger = max(_THINKING_RETRY_TOKENS, max_tokens * 8)
+        if bigger > max_tokens:
+            text, _, _ = _stream_simple(client, model, messages, bigger)
+    return text
 
 
 # Read-only tools the model may use while orienting itself before it plans.

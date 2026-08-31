@@ -44,6 +44,15 @@ datas = [
     (str(OCTOSLAVE_PKG / "web" / "lab_static"), "octoslave/web/lab_static"),
 ]
 
+# Version stamp — PyInstaller ships no dist-info, so importlib.metadata cannot
+# see a version inside the bundle. octoslave/__init__.py reads this file first
+# when frozen; without it the app reports 0.0.0+unknown and the in-app updater
+# would offer to "upgrade" to every release forever.
+_STAMP_DIR = ROOT / "build" / "version_stamp"
+_STAMP_DIR.mkdir(parents=True, exist_ok=True)
+(_STAMP_DIR / "_build_version.txt").write_text(VERSION)
+datas.append((str(_STAMP_DIR / "_build_version.txt"), "octoslave"))
+
 # ---------------------------------------------------------------------------
 # Hidden imports (modules loaded at runtime by FastAPI / uvicorn / click)
 # ---------------------------------------------------------------------------
@@ -52,7 +61,7 @@ hidden = [
     "octoslave.agent", "octoslave.interrupt", "octoslave.config", "octoslave.display",
     "octoslave.logger", "octoslave.parallel", "octoslave.research",
     "octoslave.tools", "octoslave.tools_bio", "octoslave.tools_cryo",
-    "octoslave.remote", "octoslave.vault",
+    "octoslave.remote", "octoslave.vault", "octoslave.updater",
     "octoslave.web.app", "octoslave.wizard",
     "octoslave.mcp_client", "octoslave.mcp_registry",
     # octoslave Lab (dynamic multi-agent) — imported lazily, so list explicitly

@@ -2,6 +2,7 @@
 
 import os
 import sys
+import time
 from pathlib import Path
 
 import click
@@ -227,6 +228,15 @@ def run(task, model, working_dir, api_key, base_url, local, prompt_profile, inte
     else:
         mode_tag = "[bold #5c9cf5]supervised[/bold #5c9cf5]"
     display.console.print(f"[dim #7a7d86]permission mode: {mode_tag}[/dim #7a7d86]")
+
+    # Update notice. Cache-only, so startup never waits on the network — the
+    # refresh happens on a daemon thread and shows up on the next launch.
+    from . import updater
+    _notice = updater.cached_notice()
+    if _notice:
+        display.console.print(f"[#fab283]↑ {_notice}[/#fab283]")
+    updater.check_in_background()
+
     display.console.print()
 
     display.print_task(task)
@@ -3206,6 +3216,76 @@ def web(host, port, no_browser):
     # running turn. A long ping timeout keeps a busy backend from looking dead.
     uvicorn.run(_web_app, host=host, port=port, log_level="warning",
                 ws_ping_interval=30, ws_ping_timeout=300)
+
+
+@cli.command()
+@click.option("--check", "check_only", is_flag=True, default=False,
+              help="Only report whether a newer release exists")
+@click.option("--yes", "-y", "assume_yes", is_flag=True, default=False,
+              help="Install without asking for confirmation")
+def update(check_only, assume_yes):
+    """Update OctoSlave to the latest release.
+
+    Works out how this copy was installed (pip, pipx, Homebrew, AppImage, the
+    macOS app or the Windows installer) and runs the right upgrade for it, so
+    nobody has to download an installer by hand. The web UI exposes the same
+    thing as an "Update to X" button in the sidebar.
+    """
+    from . import updater
+
+    info = updater.check(force=True)
+    method = info["method_label"]
+
+    if info["error"] and not info["latest"]:
+        display.print_error(f"Could not reach GitHub: {info['error']}")
+        sys.exit(1)
+
+    display.console.print()
+    display.console.print(
+        f"  [dim]installed[/dim] [bold]{info['current']}[/bold]   "
+        f"[dim]latest[/dim] [bold]{info['latest']}[/bold]   [dim]({method})[/dim]"
+    )
+
+    if not info["available"]:
+        display.console.print("  [#7fd88f]Already up to date.[/#7fd88f]\n")
+        return
+
+    if not info["self_update"]:
+        display.console.print(f"\n  [#f5a742]{info['hint']}[/#f5a742]\n")
+        sys.exit(1)
+
+    if check_only:
+        display.console.print(
+            f"  [#fab283]Update available.[/#fab283] Run [bold]ots update[/bold] to install it.\n"
+        )
+        return
+
+    if not assume_yes and not click.confirm(f"  Install {info['latest']}?", default=True):
+        return
+
+    display.console.print()
+    updater.start_update(info["latest"])
+
+    # Mirror the background job's log to the terminal as it lands.
+    shown = 0
+    while True:
+        st = updater.status()
+        for line in st["log"][shown:]:
+            display.console.print(f"  [dim]{line}[/dim]")
+        shown = len(st["log"])
+        if st["state"] != "running":
+            break
+        time.sleep(0.4)
+
+    if st["state"] == "error":
+        display.print_error(st["error"] or "Update failed.")
+        display.console.print(f"  Manual download: {info['url']}\n")
+        sys.exit(1)
+
+    display.console.print(
+        f"\n  [#7fd88f]Updated to {info['latest']}.[/#7fd88f] "
+        f"[dim]Restart OctoSlave to use it.[/dim]\n"
+    )
 
 
 def main():

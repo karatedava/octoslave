@@ -94,6 +94,25 @@ The Lab web UI ships **prebuilt** (in `octoslave/web/lab_static/`), so no Node.j
 install or run. Only if you modify the frontend (`frontend/`) do you need to rebuild it:
 `npm ci --prefix frontend && npm run build --prefix frontend` (Node 18+).
 
+### Staying up to date
+
+OctoSlave updates itself — no reinstalling when a new release lands.
+
+- **Web UI** — an **Update to X** button appears in the sidebar. Click it for the
+  release notes and a one-click install.
+- **Terminal** — `ots update` (or `ots update --check` to only look).
+
+It works out how you installed OctoSlave (pip, pipx, Homebrew, the `.dmg`,
+`.exe` or `.AppImage`) and runs the right upgrade for it. The installer builds
+replace themselves and reopen; Python installs just ask you to restart.
+
+Checks hit the GitHub Releases API at most once every 6 hours and are cached.
+Set `OCTOSLAVE_NO_UPDATE_CHECK=1` to switch them off entirely (air-gapped and
+HPC deployments), or use **Skip this version** in the dialog to silence one release.
+
+> Working from a git clone (`pip install -e .`)? That stays manual on purpose —
+> `git pull && pip install -e ".[all]"`.
+
 ### Configure your API key
 
 ```bash
@@ -184,6 +203,7 @@ ots config [options]             # setup wizard, or pass flags directly
 ots models [--local]             # list available models
 ots vault-improve PATH [options] # autonomous vault improvement
 ots batch TASKS_FILE [options]   # run tasks one-per-line, with resume
+ots update [--check]             # upgrade to the latest release in place
 
 ots <command> --help             # full flag reference for any command
 ```

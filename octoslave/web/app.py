@@ -36,6 +36,7 @@ from ..council import (
     resolve_council_roles, run_council_agent, continue_council_agent, council_available,
 )
 from ..parallel import run_parallel_agents
+from .. import updater
 from ..config import (
     load_config,
     resolve_backend, list_providers,
@@ -189,6 +190,58 @@ def _science_history(messages: list) -> list[dict]:
             continue
         out.append({"role": role, "text": content.strip()})
     return out
+
+# ---------------------------------------------------------------------------
+# Self-update endpoints
+#
+# The web UI polls /api/update/check on load and shows a pill when a newer
+# release exists; /apply runs the platform-appropriate upgrade on a background
+# thread and /status streams its log back. See octoslave/updater.py.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/update/check")
+async def update_check(force: bool = False):
+    """Latest release vs. the running version. Never raises — a dead network
+    must not turn into an error toast in the UI."""
+    return await asyncio.to_thread(updater.check, force)
+
+
+@app.post("/api/update/apply")
+async def update_apply(payload: dict | None = None):
+    version = (payload or {}).get("version") or None
+    return await asyncio.to_thread(updater.start_update, version)
+
+
+@app.get("/api/update/status")
+async def update_status():
+    return updater.status()
+
+
+@app.post("/api/update/quit")
+async def update_quit():
+    """Exit so the staged installer/bundle swap can complete.
+
+    Only meaningful for the macOS .app and Windows installer paths, where a
+    detached helper is already waiting on this PID. Refused otherwise, so a
+    stray call can never kill someone's running agent.
+    """
+    st = updater.status()
+    if st["state"] != "done" or not st["will_quit"]:
+        return {"quitting": False, "reason": "No staged update is waiting for a restart."}
+    updater.quit_soon()
+    return {"quitting": True}
+
+
+@app.post("/api/update/dismiss")
+async def update_dismiss(payload: dict | None = None):
+    """Stop nagging: skip one version, or turn update checks off entirely."""
+    data = payload or {}
+    if "enabled" in data:
+        updater.set_checks_enabled(bool(data["enabled"]))
+    if data.get("skip"):
+        updater.skip_version(str(data["skip"]))
+    return {"ok": True}
+
 
 # ---------------------------------------------------------------------------
 # Chat REST endpoints

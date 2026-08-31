@@ -7,11 +7,28 @@
 #
 # Output: dist/ots   (used by build_appimage.sh to create the AppImage)
 
+import os
 import sys
 from pathlib import Path
 
 ROOT = Path(SPECPATH).parent.parent
 OCTOSLAVE_PKG = ROOT / "octoslave"
+
+def _resolve_version() -> str:
+    """Single-source the build version: OTS_VERSION env (set by CI from the git
+    tag / pyproject) wins; otherwise read pyproject.toml directly."""
+    env = os.environ.get("OTS_VERSION", "").strip()
+    if env:
+        return env
+    try:
+        import tomllib
+        with open(ROOT / "pyproject.toml", "rb") as f:
+            return tomllib.load(f)["project"]["version"]
+    except Exception:
+        return "0.0.0"
+
+
+VERSION = _resolve_version()
 
 block_cipher = None
 
@@ -22,11 +39,20 @@ datas = [
     (str(OCTOSLAVE_PKG / "web" / "lab_static"), "octoslave/web/lab_static"),
 ]
 
+# Version stamp — PyInstaller ships no dist-info, so importlib.metadata cannot
+# see a version inside the bundle. octoslave/__init__.py reads this file first
+# when frozen; without it the app reports 0.0.0+unknown and the in-app updater
+# would offer to "upgrade" to every release forever.
+_STAMP_DIR = ROOT / "build" / "version_stamp"
+_STAMP_DIR.mkdir(parents=True, exist_ok=True)
+(_STAMP_DIR / "_build_version.txt").write_text(VERSION)
+datas.append((str(_STAMP_DIR / "_build_version.txt"), "octoslave"))
+
 hidden = [
     "octoslave.agent", "octoslave.interrupt", "octoslave.config", "octoslave.display",
     "octoslave.logger", "octoslave.parallel", "octoslave.research",
     "octoslave.tools", "octoslave.tools_bio", "octoslave.tools_cryo",
-    "octoslave.remote", "octoslave.vault",
+    "octoslave.remote", "octoslave.vault", "octoslave.updater",
     "octoslave.web.app", "octoslave.wizard",
     "octoslave.mcp_client", "octoslave.mcp_registry",
     "octoslave.lab", "octoslave.lab.runner", "octoslave.lab.state",

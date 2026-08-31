@@ -15,6 +15,7 @@ import {
   dismissChatEmptyState
 } from './components.js?v=20260630c';
 import { scrollToBottom, autoResizeTextarea, renderMarkdown, esc } from './utils.js?v=20260429';
+import { initUpdater } from './update.js?v=20260828a';
 
 // Export functions to global scope for inline handlers
 window.sendWs = sendMsg;   // used by the exec (local/remote) toggle in components.js
@@ -981,6 +982,9 @@ function initApp() {
 
   // Expose for slash-commands.js
   window.setChatRunningExternal = setChatRunning;
+
+  // Update pill — checks GitHub for a newer release (cached server-side).
+  initUpdater();
 
   // Parallel-agents popover
   initParallelPopover();
