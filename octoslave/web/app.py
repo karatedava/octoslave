@@ -12,15 +12,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 import uuid
 from collections import deque
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from queue import Empty, Queue
 from typing import Any
 
-from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect,
+)
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -399,24 +402,83 @@ async def serve_index():
 async def upload_file(
     file: UploadFile = File(...),
     working_dir: str = Form("."),
+    remote_id: str = Form(""),
 ):
-    """Save an uploaded file into <working_dir>/.uploads/ and return its path."""
-    upload_dir = Path(working_dir) / ".uploads"
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    """Save an uploaded file into ``<working_dir>/.uploads/`` and return its path.
 
-    filename = Path(file.filename).name  # strip any client-side path components
-    dest = upload_dir / filename
-    # avoid clobbering existing files
-    if dest.exists():
-        stem, suffix, i = dest.stem, dest.suffix, 1
-        while dest.exists():
-            dest = upload_dir / f"{stem}_{i}{suffix}"
-            i += 1
-
+    ``working_dir`` belongs to whichever machine the session runs on. On a remote
+    session that is the SSH host, not this one — writing there locally either
+    fails outright (there is no /storage on a laptop) or, worse, quietly creates
+    a local tree the remote agent can never read. So a remote upload is staged in
+    a temp file and scp'd to the host, and the path handed back is the remote one.
+    """
+    filename = Path(file.filename or "upload").name  # strip client-side path parts
     content = await file.read()
-    dest.write_bytes(content)
-    return {"path": str(dest.resolve()), "name": filename, "size": len(content)}
 
+    remote = get_remote(None, remote_id) if remote_id else None
+    if remote_id and remote is None:
+        # Falling back to a local write would put the file on the wrong machine
+        # under a path the agent will never find. Say so instead.
+        raise HTTPException(status_code=400,
+                            detail=f"Unknown remote '{remote_id}' — reconnect the host and try again.")
+    if remote is not None:
+        try:
+            path = await asyncio.to_thread(_push_upload, remote, working_dir, filename, content)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Could not copy {filename} to {remote.get('name') or remote_id}: {exc}",
+            )
+        return {"path": path, "name": filename, "size": len(content), "remote": remote_id}
+
+    upload_dir = Path(working_dir).expanduser() / ".uploads"
+    try:
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        dest = _free_name(upload_dir / filename, lambda p: p.exists())
+        dest.write_bytes(content)
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"Could not save {filename}: {exc}")
+    return {"path": str(dest.resolve()), "name": filename, "size": len(content), "remote": None}
+
+
+def _free_name(dest, exists):
+    """First free ``name``, ``name_1``, ``name_2``… so an upload never clobbers."""
+    if not exists(dest):
+        return dest
+    stem, suffix = dest.stem, dest.suffix
+    for i in range(1, 1000):
+        cand = dest.with_name(f"{stem}_{i}{suffix}")
+        if not exists(cand):
+            return cand
+    return dest.with_name(f"{stem}_{uuid.uuid4().hex[:8]}{suffix}")
+
+
+def _push_upload(remote: dict, working_dir: str, filename: str, content: bytes) -> str:
+    """Stage ``content`` on the remote host under ``<working_dir>/.uploads/``.
+
+    Runs on a worker thread — every step here is a blocking ssh/scp round trip.
+    """
+    import posixpath
+    import tempfile
+    from ..remote import RemoteSession
+
+    sess = RemoteSession.get(remote)
+    base = working_dir or remote.get("remote_dir") or "."
+    upload_dir = posixpath.join(base, ".uploads")
+    sess.mkdirs(upload_dir)
+
+    dest = _free_name(PurePosixPath(upload_dir) / filename, lambda p: sess.exists(str(p)))
+    fd, staged = tempfile.mkstemp(prefix="ots_upload_")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(content)
+        sess.push(staged, str(dest))
+    finally:
+        try:
+            os.unlink(staged)
+        except OSError:
+            pass
+    return str(dest)
 
 
 @app.get("/api/pick-dir")

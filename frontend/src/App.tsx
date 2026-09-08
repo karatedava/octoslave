@@ -313,12 +313,16 @@ export default function App() {
       const fd = new FormData();
       fd.append("file", f);
       fd.append("working_dir", workingDir);
+      // A remote run's working dir is on the SSH host: the server must scp the
+      // file there, or the path we hand the agents points at the wrong machine.
+      if (remoteId) fd.append("remote_id", remoteId);
       try {
         const r = await fetch("/api/upload", { method: "POST", body: fd });
         const d = await r.json();
-        if (d.path) setAttachments((a) => [...a, { name: d.name, path: d.path }]);
+        if (r.ok && d.path) setAttachments((a) => [...a, { name: d.name, path: d.path }]);
+        else push("injection", `Attach failed: ${d?.detail || f.name}`, "warn");
       } catch {
-        /* ignore upload failure */
+        push("injection", `Attach failed: ${f.name}`, "warn");
       }
     }
     if (attachInput.current) attachInput.current.value = "";

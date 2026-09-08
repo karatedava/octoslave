@@ -222,15 +222,23 @@ export async function uploadFile(file) {
   const formData = new FormData();
   formData.append('file', file);
   formData.append('working_dir', workingDir);
-  
+  // On a remote session the working dir lives on the SSH host, so the server has
+  // to copy the file THERE — otherwise the path we attach points at a machine
+  // the agent isn't running on.
+  const remoteId = window.getRemoteId ? window.getRemoteId() : null;
+  if (remoteId) formData.append('remote_id', remoteId);
+
   try {
     const response = await fetch('/api/upload', {
       method: 'POST',
       body: formData,
     });
-    
-    if (!response.ok) throw new Error('Upload failed');
-    
+
+    if (!response.ok) {
+      const detail = await response.json().catch(() => null);
+      throw new Error(detail?.detail || 'Upload failed');
+    }
+
     const data = await response.json();
     window.appState.attachedFiles.push(data);
     
@@ -238,7 +246,7 @@ export async function uploadFile(file) {
     return data;
   } catch (err) {
     console.error('Failed to upload file:', err);
-    appendChatError(`Failed to upload ${file.name}`);
+    appendChatError(err?.message || `Failed to upload ${file.name}`);
     return null;
   }
 }
