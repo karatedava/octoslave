@@ -229,6 +229,8 @@ export async function initUpdater() {
     return;                       // offline: stay completely silent
   }
   renderPill();
+  // The update pill on the other pages links here as /#update.
+  if (location.hash === '#update' && info && info.available) openDialog();
 
   // An update left mid-flight by a page reload should reattach, not restart.
   try {

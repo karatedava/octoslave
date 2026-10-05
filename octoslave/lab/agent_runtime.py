@@ -20,6 +20,7 @@ from openai import OpenAI, BadRequestError
 
 from .. import display
 from .. import interrupt
+from .. import steer
 from ..agent import (
     _RT,
     _cap_result,
@@ -54,6 +55,14 @@ from .state import AgentSpec, AGENT_DONE, AGENT_WORKING
 _MAX_TURN_RETRIES = 2
 _RETRY_BACKOFF_SECS = 30
 _DEFAULT_MAX_ITER = 40
+# Steps before the budget runs out at which the agent is told to wrap up.
+_BUDGET_WARNING_STEPS = 3
+_BUDGET_WARNING = (
+    f"You have {_BUDGET_WARNING_STEPS} steps left in your budget. Finish or "
+    "safely pause the step you are on, then stop calling tools and write your "
+    "final report — state plainly what is done and what is NOT finished, so the "
+    "work can be resumed rather than redone."
+)
 
 # Failover budget. Each switch costs _MAX_TURN_RETRIES × _RETRY_BACKOFF_SECS of
 # waiting, so an unbounded loop would churn for hours getting nowhere. A turn that
@@ -176,8 +185,14 @@ def run_agent_task(
     emit=None,
     history: list[dict] | None = None,
     model_pool: list[str] | None = None,
+    setting: str = "lab",
 ) -> tuple[list[dict], str]:
     """Run ``spec`` against ``task`` and return ``(transcript, final_text)``.
+
+    ``setting`` — who the agent works for: ``"lab"`` (a member of the autonomous
+    Lab team) or ``"science"`` (a specialist dispatched by the Science
+    orchestrator). It only shapes the system prompt (see
+    build_agent_system_prompt).
 
     ``context`` is extra shared-state material (prior findings, the agenda)
     appended to the user message. ``emit`` is an optional event callback used to
@@ -221,7 +236,7 @@ def run_agent_task(
         messages = _resumable(history) + [{"role": "user", "content": "\n".join(user_blocks)}]
     else:
         messages = [
-            {"role": "system", "content": build_agent_system_prompt(spec, working_dir)},
+            {"role": "system", "content": build_agent_system_prompt(spec, working_dir, setting)},
             {"role": "user", "content": "\n".join(user_blocks)},
         ]
 
@@ -232,9 +247,11 @@ def run_agent_task(
     # Science never call configure_runtime, so without this the thread-local budget
     # is the module default (~96K) — throttling a large-window specialist (e.g. GLM
     # ~1M) to a fraction of its capacity. A specialist owns its message history, so
-    # save/restore the ambient thread-local: in Science the orchestrator's own
-    # run_agent loop calls this NESTED on the same thread, and must get its budget
-    # back when the specialist returns.
+    # save/restore the ambient thread-local: this loop can run nested on a caller's
+    # own thread (the Lab, and a Science specialist the orchestrator chose to wait
+    # for), which must get its budget back when the specialist returns. On a
+    # background Science specialist the thread is its own, so this is a no-op —
+    # and two specialists on different models never see each other's budget.
     _had_budget = hasattr(_RT, "soft_budget")
     _prev_budget = getattr(_RT, "soft_budget", None)
     _sb = independent_soft_budget(client, model)
@@ -242,8 +259,8 @@ def run_agent_task(
         _RT.soft_budget = _sb
 
     # Same save/restore for the view_image capability gate: a specialist may run
-    # on a different model than its caller, and in Science this loop is nested on
-    # the caller's own thread.
+    # on a different model than its caller, and this loop can be nested on the
+    # caller's own thread.
     _prev_vision = current_vision_support()
     set_vision_support(lambda: model_supports_vision(client, model))
 
@@ -315,6 +332,7 @@ def run_agent_task(
     final_text = ""
     last_reasoning = ""   # kimi often answers in reasoning_content w/ empty content
     summary_nudged = False
+    budget_warned = False
     while iteration < max_iter:
         iteration += 1
         # A user Stop must end the specialist too, not just the orchestrator that
@@ -533,7 +551,23 @@ def run_agent_task(
         # Images view_image queued go in after every tool result, never between
         # two of them (strict servers require contiguous tool messages).
         drain_image_attachments(messages)
+        # A message the user sent to the orchestrator while this specialist works
+        # (web Science) is shown to it as an FYI, so it can change course without
+        # waiting to report back. No-op outside a steerable Science turn.
+        steer.relay(messages, spec.name)
+        # Near the step budget: ask for a report while there are still steps to
+        # write one. Without this an agent simply stops mid-task, and its last
+        # narration line ("While that runs, let me…") becomes its whole report.
+        if not budget_warned and iteration >= max_iter - _BUDGET_WARNING_STEPS:
+            budget_warned = True
+            messages.append({"role": "user", "content": _BUDGET_WARNING})
         display.print_separator()
+    else:
+        # The budget ran out while the agent was still calling tools: whatever it
+        # last said is not a report of finished work.
+        stopped_reason = stopped_reason or "it used its whole step budget mid-task"
+        final_text = ""
+        last_reasoning = ""   # mid-task thinking is no more a report than the text
 
     if not final_text.strip() and last_reasoning.strip():
         # kimi-k2.x frequently puts its entire answer in reasoning_content and
@@ -585,45 +619,113 @@ def run_agent_task(
 # System-prompt construction
 # ---------------------------------------------------------------------------
 
+# Who the agent works for, by setting. Kept domain-agnostic: the same runtime
+# serves any problem the Lab or a Science session takes on.
+_SETTINGS = {
+    "lab": {
+        "intro": ("a specialist member of an autonomous research lab working on a "
+                  "shared goal with a small team of other agents and a human "
+                  "collaborator"),
+        "lead": "the team and the human collaborator",
+        "layout": ("Put your work under lab/projects/<subproject>/ in clearly named "
+                   "subfolders (or wherever your instructions say)."),
+    },
+    "science": {
+        "intro": ("a specialist dispatched by a research orchestrator, which works "
+                  "with a human researcher. You own one bounded piece of their "
+                  "project; the orchestrator reviews your report, checks your files, "
+                  "and decides what happens next"),
+        "lead": "the orchestrator",
+        "layout": ("Use the project's existing layout (look first — e.g. data/, "
+                   "results/, analysis/) and write your outputs where your brief "
+                   "says, or beside the outputs of the same kind. Do not invent a "
+                   "parallel tree for your own work."),
+    },
+}
+
 # NOTE: any literal { } here would crash load_system_prompt-style formatting; we
-# build this with f-strings and pass no further .format(), so braces are safe.
+# build this with .format() on our own fields only, so no other braces may appear.
 _AGENT_HEADER = """\
-You are {name}, a specialist member of an autonomous research lab working on a \
-shared goal with a small team of other agents and a human collaborator.
+You are {name}, {intro}.
 
 Your role: {role}
 Your expertise: {expertise}
-Your goal on this team: {goal}
+Your goal: {goal}
 
-Operating principles:
-- You work inside a single project working directory: {working_dir}
-- Keep the file system ORGANIZED. Put your work under lab/projects/<subproject>/ \
-in clearly named subfolders. Never scatter files at the top level.
-- Be concrete and rigorous. Prefer doing real work with your tools over \
-describing what could be done. Do not fabricate results — run code, read files, \
-verify.
-- You only have the tools the Director granted you ({tool_list}). If you need a \
-capability none of your tools provide, you can expand at runtime: call \
-`request_tool` to have a new tool built and registered (then call it), \
-`request_agent` to add a teammate, or `request_mcp` to connect a known data/service \
-server. Use these sparingly and only when genuinely blocked.
-- When you have finished your task, stop calling tools and give a concise final \
-summary of what you did, what you found, and where you wrote outputs.
+How to work:
+- Understand the assignment before you act. Read your instructions and any \
+shared context in full, and work out what deliverable is wanted and what \
+"done" looks like. Nobody can answer questions while you run: if something is \
+ambiguous, take the most sensible reading, say which in your report, and proceed.
+- Stay inside your assignment. Do not drift into neighbouring work; if you \
+notice something important outside your remit, mention it in your report.
+- Look before you build. You work in one project directory: {working_dir}. \
+Check what already exists there (data, scripts, earlier outputs) and build on \
+it rather than redoing it.
+- Do real work with your tools, and never fabricate data, results, or \
+citations — run code, read files, query real sources.
+- Check your own output before you report it: run the code, sanity-check the \
+numbers, and look at any figure or page you produced (view_image, if you have \
+it). Report a problem you found honestly rather than papering over it.
+- Do not flail. If the same approach fails two or three times, stop, and report \
+what blocks you and what you tried — that is more useful than a long string \
+of guesses.
+- Keep files organised. {layout} Create a directory when you write the first \
+file into it — never pre-create empty scaffolding — and keep scratch work out \
+of the top level.
+- Your tools: {tool_list}.{expansion}
+
+When you are done, stop calling tools and write your report. It is all \
+{lead} sees of your work, so make it complete on its own:
+1. Outcome — did you achieve the goal: done, partial, or blocked, in a sentence.
+2. Results — the concrete findings, with the numbers.
+3. Files — the exact path of everything you created or changed, and what each is.
+4. Caveats — assumptions you made, what you could not verify, anything that \
+looks off.
+5. Next — what remains or what you would do next, if anything.
 
 Today's date: {date}.
 """
 
+_EXPANSION = (" If you need a capability none of your tools provide, you can expand "
+              "at runtime: `request_tool` has a new tool built and registered (then "
+              "call it), `request_agent` adds a teammate, `request_mcp` connects a "
+              "known data/service server. Use these sparingly, only when genuinely "
+              "blocked.")
 
-def build_agent_system_prompt(spec: AgentSpec, working_dir: str) -> str:
+_ADVISOR_HEADER = """\
+You are {name}, {intro}.
+
+Your role: {role}
+Your expertise: {expertise}
+Your goal: {goal}
+
+You are a discussion-only advisor: you have no tools, so contribute through \
+reasoning — be concrete, say what you are unsure of, and never present a guess \
+as a finding. Today's date: {date}.
+"""
+
+
+def build_agent_system_prompt(spec: AgentSpec, working_dir: str,
+                              setting: str = "lab") -> str:
     from datetime import datetime
-    prompt = _AGENT_HEADER.format(
-        name=spec.name,
-        role=spec.role,
-        expertise=spec.expertise,
-        goal=spec.goal,
-        working_dir=working_dir,
-        tool_list=", ".join(spec.tools) or "none — you are a discussion-only advisor",
+    ctx = _SETTINGS.get(setting, _SETTINGS["lab"])
+    fields = dict(
+        name=spec.name, intro=ctx["intro"], role=spec.role,
+        expertise=spec.expertise, goal=spec.goal,
         date=datetime.now().strftime("%Y-%m-%d"),
+    )
+    if not spec.tools:
+        return _ADVISOR_HEADER.format(**fields)
+    # Only advertise the runtime-expansion tools to an agent that actually has
+    # them (Lab members do; Science specialists do not).
+    from .foundry import META_TOOL_NAMES
+    has_meta = any(t in spec.tools for t in META_TOOL_NAMES)
+    prompt = _AGENT_HEADER.format(
+        working_dir=working_dir, layout=ctx["layout"], lead=ctx["lead"],
+        tool_list=", ".join(t for t in spec.tools if t not in META_TOOL_NAMES),
+        expansion=_EXPANSION if has_meta else "",
+        **fields,
     )
     # Compute-node awareness (hybrid model). The lab runs locally; when a node is
     # configured for the run, code-capable agents get the cluster-job tools —

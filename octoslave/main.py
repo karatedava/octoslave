@@ -302,7 +302,7 @@ def run(task, model, working_dir, api_key, base_url, local, prompt_profile, inte
 
     messages = run_agent(
         task, cfg["model"], cfg["working_dir"], client,
-        prompt_profile, cfg["permission_mode"],
+        effective_profile, cfg["permission_mode"],
         enable_plan=enable_plan,
         enable_verify=enable_verify,
         enable_memory=enable_memory,
@@ -1128,8 +1128,10 @@ def _repl_loop(client, cfg: dict, messages: list[dict]):
                 bottom_toolbar=_make_toolbar(state),
             ).strip()
         except KeyboardInterrupt:
-            display.console.print("[dim]\n(Ctrl+C — use /exit or Ctrl+D to quit)[/dim]")
-            messages = []
+            # Ctrl+C at the prompt just drops the line being typed (the usual
+            # terminal habit) — it must not throw away the conversation.
+            display.console.print("[dim](Ctrl+C — line cleared. /clear starts a new "
+                                  "conversation; /exit or Ctrl+D quits)[/dim]")
             continue
         except EOFError:
             display.console.print("[dim]\nBye.[/dim]")
@@ -1159,6 +1161,7 @@ def _repl_loop(client, cfg: dict, messages: list[dict]):
                         state["working_dir"], state["permission_mode"],
                         ultra=state.get("ultra", False),
                         remote=state.get("remote"),
+                        prompt_profile=state["prompt_profile"],
                     )
                 else:
                     messages = continue_agent(
@@ -1166,6 +1169,7 @@ def _repl_loop(client, cfg: dict, messages: list[dict]):
                         state["working_dir"], client,
                         state["permission_mode"],
                         remote=state.get("remote"),
+                        prompt_profile=state["prompt_profile"],
                     )
             else:
                 plan_out: list[str] = []
@@ -1213,8 +1217,15 @@ def _repl_loop(client, cfg: dict, messages: list[dict]):
                         _note = verify_out[-1][:200]
                     save_session_memory(state["working_dir"], user_input, status=_status, note=_note, remote=state.get("remote"))
         except KeyboardInterrupt:
-            display.console.print("\n[dim]Interrupted.[/dim]")
-            messages = []
+            # Keep the conversation up to the interruption (the agent loop already
+            # returns cleanly for a Ctrl+C mid-tool; this catches one landing in a
+            # planning/verification call). note_stopped repairs a half-finished
+            # round and tells the model the user cut it short.
+            from .agent import note_stopped
+            messages = note_stopped(messages) if any(
+                m.get("role") == "system" for m in messages) else []
+            display.console.print("\n[dim]Interrupted — the conversation so far is kept; "
+                                  "send a message to continue, or /clear to start over.[/dim]")
 
 
 def _handle_slash(cmd: str, state: dict, cfg: dict, messages: list, client) -> str | None:
@@ -1266,11 +1277,32 @@ def _handle_slash(cmd: str, state: dict, cfg: dict, messages: list, client) -> s
                     mark = " [green]←[/green]" if m == state["model"] else ""
                     display.console.print(f"  {m}{mark}")
         else:
+            known: list[str] = []
+            try:
+                if state["backend"] == "ollama":
+                    known = ollama_list_models(state["ollama_url"]) or []
+                elif state["backend"] == "nim":
+                    known = nim_list_models(state.get("nim_url", NIM_BASE_URL), state.get("nim_api_key", "")) or []
+                else:
+                    known = einfra_list_models(state.get("base_url", BASE_URL), state.get("api_key", "")) or []
+            except Exception:
+                known = []
+            if known and arg not in known:
+                close = [m for m in known if arg.lower() in m.lower()]
+                if len(close) == 1:
+                    arg = close[0]
+                else:
+                    display.print_error(
+                        f"'{arg}' is not served by this backend."
+                        + (f" Did you mean: {', '.join(close[:6])}?" if close else " See /model for the list."))
+                    return "ok"
             state["model"] = arg
+            # The history is model-agnostic, so the conversation carries over —
+            # switch models mid-task without losing context (/clear to start over).
             display.console.print(
                 f"[dim]Model set to[/dim] [bold magenta]{arg}[/bold magenta]"
+                + ("[dim] — conversation kept[/dim]" if messages else "")
             )
-            messages.clear()
         return "ok"
 
     if name == "/local":
@@ -1638,25 +1670,15 @@ def _handle_slash(cmd: str, state: dict, cfg: dict, messages: list, client) -> s
         if not messages:
             display.print_info("No conversation to compact.")
             return "ok"
-        summary_task = (
-            "Summarise this conversation so far into a compact context block that preserves "
-            "all key findings, code written, hypotheses, and decisions. Keep it under 400 words."
-        )
         try:
-            new_msgs = continue_agent(messages, summary_task, state["model"],
-                                       state["working_dir"], client)
-            # Keep: system prompt (index 0) + the assistant's summary reply (last
-            # assistant message). This guarantees the system prompt is always present.
-            system_msg = next((m for m in new_msgs if m.get("role") == "system"), None)
-            summary_msg = next(
-                (m for m in reversed(new_msgs) if m.get("role") == "assistant"), None
-            )
-            messages.clear()
-            if system_msg:
-                messages.append(system_msg)
-            if summary_msg:
-                messages.append(summary_msg)
-            display.print_info("History compacted.")
+            from .agent import compact_conversation
+            before = len(messages)
+            compacted = compact_conversation(messages, client, state["model"])
+            if not compacted:
+                display.print_info("Couldn't compact — the model returned no summary. History unchanged.")
+                return "ok"
+            messages[:] = compacted
+            display.print_info(f"History compacted ({before} messages → {len(compacted)}).")
         except Exception as e:
             display.print_error(str(e))
         return "ok"
@@ -2706,31 +2728,46 @@ class _AtFileCompleter(Completer):
                   ".parallel", ".uploads", ".pytest_cache", "dist", "build"}
     _MAX = 40
 
+    # Index freshness and cost bounds. The walk runs on the prompt's thread, so
+    # it must stay fast even when the working dir is $HOME or a huge repo (or an
+    # iCloud-backed folder where each directory read can be slow).
+    _TTL = 15.0           # seconds before a cached index is rebuilt (new files show up)
+    _MAX_FILES = 3000
+    _MAX_VISITS = 20000   # directory entries examined, kept or not
+    _MAX_SECONDS = 0.6
+
     def __init__(self, state: dict):
         self.state = state
-        self._cache: dict[str, list[str]] = {}
+        self._cache: dict[str, tuple[float, list[str]]] = {}
 
     def _index(self, root: Path) -> list[str]:
         key = str(root)
-        if key in self._cache:
-            return self._cache[key]
+        hit = self._cache.get(key)
+        if hit and time.monotonic() - hit[0] < self._TTL:
+            return hit[1]
         out: list[str] = []
+        visits = 0
+        t0 = time.monotonic()
         try:
-            for p in root.rglob("*"):
-                if not p.is_file():
-                    continue
-                rel_parts = p.parts[len(root.parts):]
-                if any(part in self._SKIP_DIRS for part in rel_parts):
-                    continue
-                if any(part.startswith(".") and len(part) > 1 for part in rel_parts):
-                    continue
-                out.append(str(p.relative_to(root)))
-                if len(out) >= 2000:
+            for dirpath, dirnames, filenames in os.walk(root):
+                # Prune in place so skipped trees (node_modules, .git, venvs) are
+                # never descended into — filtering afterwards still walked them.
+                dirnames[:] = sorted(d for d in dirnames
+                                     if d not in self._SKIP_DIRS and not d.startswith("."))
+                rel_dir = os.path.relpath(dirpath, root)
+                for fn in filenames:
+                    visits += 1
+                    if fn.startswith("."):
+                        continue
+                    out.append(fn if rel_dir == "." else os.path.join(rel_dir, fn))
+                visits += len(dirnames)
+                if (len(out) >= self._MAX_FILES or visits >= self._MAX_VISITS
+                        or time.monotonic() - t0 > self._MAX_SECONDS):
                     break
         except Exception:
             pass
-        out.sort(key=lambda s: (s.count("/"), len(s), s))
-        self._cache[key] = out
+        out.sort(key=lambda s: (s.count(os.sep), len(s), s))
+        self._cache[key] = (time.monotonic(), out)
         return out
 
     def get_completions(self, document, complete_event):
@@ -3208,6 +3245,9 @@ def web(host, port, no_browser):
             webbrowser.open(url)
         threading.Thread(target=_open, daemon=True).start()
 
+    # The request guard (web/app.py) relaxes its Host check only when the server
+    # is deliberately exposed beyond loopback.
+    os.environ["OCTOSLAVE_WEB_HOST"] = host
     from .web.app import app as _web_app
     # Agent turns run in worker threads, but a heavy one (big imports, a burst of
     # tool output) can still stall the event loop past uvicorn's default 20s

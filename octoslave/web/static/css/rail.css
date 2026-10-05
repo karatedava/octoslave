@@ -1,0 +1,278 @@
+/**
+ * OctoSlave — the shared app rail (left navigation).
+ *
+ * ONE definition for every page: the Chat page (static/index.html) and the React
+ * pages (Science at /science, Autonomous Research at /lab) all load this file
+ * and render the same markup, so the menu sits in the same place and looks the
+ * same everywhere. The theme tokens are scoped to the rail itself, so it keeps
+ * this look even on a page whose own stylesheet defines --accent etc. differently.
+ */
+
+.sidebar {
+  --sidebar-w:    160px;
+  --bg-elevated:  #16171d;
+  --surface:      #1e1f28;
+  --border:       #2a2b35;
+  --primary:      #fab283;
+  --primary-glow: rgba(250, 178, 131, 0.08);
+  --secondary:    #5c9cf5;
+  --accent:       #9d7cd8;
+  --accent-glow:  rgba(157, 124, 216, 0.1);
+  --text:         #d0d1d6;
+  --text-muted:   #7a7d86;
+  --success:      #7fd88f;
+  --error:        #e06c75;
+  --radius-sm:    8px;
+  --font:         'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --mono:         'JetBrains Mono', 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-family: var(--font);
+  font-size: 15.5px;
+  line-height: 1.6;
+  box-sizing: border-box;
+  -webkit-font-smoothing: antialiased;
+}
+.sidebar *, .sidebar *::before, .sidebar *::after { box-sizing: border-box; margin: 0; }
+
+/* ════════════════════════════════════════════════════════════
+   LEFT SIDEBAR (icon-nav style)
+══════════════════════════════════════════════════════════ */
+.sidebar {
+  position: fixed;
+  top: 0; left: 0; bottom: 0;
+  width: var(--sidebar-w);
+  background: var(--bg-elevated);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  z-index: 90;
+  user-select: none;
+  transition: width 0.2s ease;
+}
+
+/* Brand */
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.brand-logo {
+  width: 32px;
+  height: 32px;
+  object-fit: contain;
+  border-radius: 7px;
+  transition: transform 0.15s;
+  flex-shrink: 0;
+}
+
+.brand-logo:hover { transform: scale(1.08); }
+
+.brand-name {
+  display: inline;
+  font-size: 14.5px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--primary);
+  white-space: nowrap;
+}
+
+/* Navigation */
+.sidebar-nav {
+  flex: 1;
+  padding: 8px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.nav-btn {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 12px;
+  width: 100%;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 500;
+  font-family: var(--font);
+  line-height: 1.6;           /* buttons don't inherit it; links do — keep them identical */
+  transition: all 0.15s ease;
+  text-align: left;
+  position: relative;
+}
+
+.nav-btn:hover {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.nav-btn.active {
+  background: var(--primary-glow);
+  color: var(--primary);
+}
+
+.nav-btn.active::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 50%;
+  transform: translateY(-50%);
+  width: 3px; height: 18px;
+  background: var(--primary);
+  border-radius: 0 2px 2px 0;
+}
+
+.nav-btn span { display: inline; }
+
+.nav-link { text-decoration: none; }
+
+.nav-icon {
+  flex-shrink: 0;
+  opacity: 0.8;
+  transition: opacity 0.12s;
+}
+
+.nav-btn.active .nav-icon,
+.nav-btn:hover .nav-icon { opacity: 1; }
+
+/* Sidebar bottom */
+.sidebar-bottom {
+  padding: 8px 6px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sidebar-history-btn {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  width: 100%;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  padding: 8px 14px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  font-family: var(--font);
+  transition: all 0.12s;
+  text-align: left;
+}
+
+.sidebar-history-btn:hover {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.sidebar-history-btn span { display: inline; }
+
+.sidebar-status {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  padding: 6px 10px;
+  flex-wrap: wrap;
+}
+
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--error);
+  flex-shrink: 0;
+  transition: background 0.3s, box-shadow 0.3s;
+}
+
+.status-dot.connected {
+  background: var(--success);
+  box-shadow: 0 0 6px rgba(127, 216, 143, 0.4);
+}
+
+.model-tag {
+  display: inline;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-family: var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.backend-pill {
+  display: inline-flex;
+  align-items: center;
+  font-size: 9.5px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+}
+
+.backend-pill[data-backend="einfra"] { background: var(--accent-glow); color: var(--accent); }
+.backend-pill[data-backend="ollama"] { background: rgba(127, 216, 143, 0.12); color: var(--success); }
+.backend-pill[data-backend="nim"]    { background: rgba(92, 156, 245, 0.12); color: var(--secondary); }
+
+
+/* The update pill (filled by js/update.js on the Chat page, by the rail
+   component on the React pages). */
+.sidebar .update-pill { cursor: pointer; font-family: var(--font); }
+.update-pill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--primary-glow);
+  border: 1px solid rgba(250, 178, 131, 0.3);
+  color: var(--primary);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+}
+
+.update-pill:hover { background: rgba(250, 178, 131, 0.16); }
+.update-pill svg { flex-shrink: 0; }
+.update-pill span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+
+/* The page area next to the rail on the React pages (the Chat page uses its
+   own <main> with the same offset). */
+.app-page {
+  margin-left: 160px;
+  height: 100vh;
+  position: relative;
+  overflow: hidden;
+}
+
+/* Narrow viewports: collapse the rail to icons only. */
+@media (max-width: 720px) {
+  .sidebar { --sidebar-w: 56px; }
+  .app-page { margin-left: 56px; }
+  .sidebar .brand-name,
+  .sidebar .nav-btn span,
+  .sidebar .sidebar-history-btn span,
+  .sidebar .model-tag,
+  .sidebar .backend-pill,
+  .sidebar .update-pill span {
+    display: none;
+  }
+  .sidebar .update-pill { justify-content: center; padding: 7px; }
+  .sidebar-brand { padding: 14px 0; justify-content: center; }
+  .nav-btn { justify-content: center; padding: 12px; }
+  .sidebar-history-btn { justify-content: center; padding: 8px; }
+  .sidebar-status { justify-content: center; padding: 2px 4px; }
+}

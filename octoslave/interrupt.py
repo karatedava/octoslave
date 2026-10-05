@@ -27,6 +27,10 @@ class StopRequested(KeyboardInterrupt):
 
 _lock = threading.Lock()
 _events: dict[int, threading.Event] = {}
+# Child thread -> its parent's Event (see adopt). The Event object itself, not the
+# parent's thread id: ids are reused once a thread exits, and a child must never
+# end up following some unrelated later thread.
+_parents: dict[int, threading.Event] = {}
 
 
 def register(ident: int | None = None) -> threading.Event:
@@ -35,6 +39,7 @@ def register(ident: int | None = None) -> threading.Event:
     ev = threading.Event()
     with _lock:
         _events[ident] = ev
+        _parents.pop(ident, None)
     return ev
 
 
@@ -43,6 +48,35 @@ def unregister(ident: int | None = None) -> None:
     ident = threading.get_ident() if ident is None else ident
     with _lock:
         _events.pop(ident, None)
+        _parents.pop(ident, None)
+
+
+def adopt(parent_ident: int) -> threading.Event:
+    """Register the CURRENT thread as a helper of ``parent_ident``.
+
+    A worker that farms work out to helper threads (Science specialists) needs
+    the user's Stop to reach those helpers too, so a helper stops when its parent
+    is stopped. It also gets an Event of its own, so the parent can end a helper
+    WITHOUT stopping itself (``request_stop`` on the helper's id) — e.g. when the
+    parent fails and must not leave helpers running behind it. Returns the
+    helper's own Event.
+    """
+    ev = threading.Event()
+    me = threading.get_ident()
+    with _lock:
+        _events[me] = ev
+        parent = _events.get(parent_ident)
+        if parent is not None:
+            _parents[me] = parent
+        else:
+            _parents.pop(me, None)
+    return ev
+
+
+def _mine() -> tuple["threading.Event | None", "threading.Event | None"]:
+    me = threading.get_ident()
+    with _lock:
+        return _events.get(me), _parents.get(me)
 
 
 def request_stop(ident: int) -> bool:
@@ -56,10 +90,11 @@ def request_stop(ident: int) -> bool:
 
 
 def should_stop() -> bool:
-    """True if a stop has been requested for the *current* thread."""
-    with _lock:
-        ev = _events.get(threading.get_ident())
-    return ev is not None and ev.is_set()
+    """True if a stop has been requested for the *current* thread (or, for a
+    helper thread, for the thread that started it)."""
+    own, parent = _mine()
+    return bool((own is not None and own.is_set())
+                or (parent is not None and parent.is_set()))
 
 
 # What the agent (and any later session that reads the history) is told about why
@@ -81,12 +116,25 @@ def wait(seconds: float, poll: float = 0.25) -> bool:
     cut short by a stop.
     """
     import time as _t
-    with _lock:
-        ev = _events.get(threading.get_ident())
-    if ev is None:
+    own, parent = _mine()
+    if own is None and parent is None:
         _t.sleep(seconds)
         return False
-    return ev.wait(seconds)     # returns True as soon as the Event is set
+    if parent is None:
+        return own.wait(seconds)    # returns True as soon as the Event is set
+    # A helper listens to two Events; wait on its own in short slices and check
+    # the parent's between them.
+    deadline = _t.monotonic() + seconds
+    while True:
+        if parent.is_set() or (own is not None and own.is_set()):
+            return True
+        left = deadline - _t.monotonic()
+        if left <= 0:
+            return False
+        if own is not None:
+            own.wait(min(poll, left))
+        else:
+            _t.sleep(min(poll, left))
 
 
 def raise_if_stopped() -> None:

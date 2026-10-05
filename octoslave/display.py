@@ -765,6 +765,12 @@ def print_todos(todos: list[dict]):
 _ask_lock = _threading.Lock()
 _ask_event: "_threading.Event | None" = None
 _ask_answer: str = ""
+# One question at a time. Several agents can run at once (the Science
+# orchestrator and its specialists), but the pending question above — and the
+# browser's answer to it — are a single slot: a second asker would overwrite the
+# first, leaving it waiting on nothing and sending the answer to the wrong agent.
+# So an asker holds the floor until its question is answered or closed.
+_ask_floor = _threading.Lock()
 
 # How long a web-mode question stays open before the agent gives up and proceeds
 # on its own judgement. Sent to the browser with the question so the UI can show
@@ -793,19 +799,39 @@ def ask_user_question(question: str, options: list[str] | None = None) -> tuple[
 
     # Web mode: emit and wait for resolve_user_response.
     if getattr(_tl, "emit", None) is not None:
+        from . import interrupt
         global _ask_event, _ask_answer
-        with _ask_lock:
-            _ask_event = _threading.Event()
-            _ask_answer = ""
-        _emit({"type": "user_question", "question": question, "options": options,
-               "timeout": ASK_TIMEOUT_SECS})
-        got = _ask_event.wait(timeout=ASK_TIMEOUT_SECS)
-        with _ask_lock:
-            answer = _ask_answer
-            _ask_event = None
-        # Always tell the UI the question is over, or it leaves a prompt on screen
-        # that no longer has anything listening for its answer.
-        _emit({"type": "user_question_closed", "answered": bool(got)})
+        # Wait for the floor (another agent may be asking right now), but never
+        # past a Stop.
+        while not _ask_floor.acquire(timeout=1.0):
+            if interrupt.should_stop():
+                return "", False
+        try:
+            ev = _threading.Event()
+            with _ask_lock:
+                _ask_event = ev
+                _ask_answer = ""
+            _emit({"type": "user_question", "question": question, "options": options,
+                   "timeout": ASK_TIMEOUT_SECS})
+            got = False
+            deadline = _time.monotonic() + ASK_TIMEOUT_SECS
+            while True:
+                left = deadline - _time.monotonic()
+                if left <= 0:
+                    break
+                if ev.wait(min(1.0, left)):
+                    got = True
+                    break
+                if interrupt.should_stop():
+                    break
+            with _ask_lock:
+                answer = _ask_answer
+                _ask_event = None
+            # Always tell the UI the question is over, or it leaves a prompt on
+            # screen that no longer has anything listening for its answer.
+            _emit({"type": "user_question_closed", "answered": bool(got)})
+        finally:
+            _ask_floor.release()
         if not got:
             return "", False
         return answer, True

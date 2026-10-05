@@ -34,7 +34,12 @@ window.deleteChat = (id) => { window.deleteChatImpl && window.deleteChatImpl(id)
 // Server message handler
 // ──────────────────────────────────────────────────────────────
 function handleServerMessage(msg) {
-  console.log('[app] Received message:', msg.type, msg);
+  // Every token passes through here — logging them all floods the console and
+  // slows long streams. Opt in with `window.OTS_DEBUG = true` in devtools.
+  if (window.OTS_DEBUG) console.log('[app] Received message:', msg.type, msg);
+  if (['stream_start', 'token', 'reasoning', 'tool_call', 'plan', 'todos'].includes(msg.type)) {
+    window.appState.turnActivity = true;
+  }
 
   // Parallel-mode routing: events tagged with a candidate_index belong to a
   // running multi-agent run and should update the live panel rather than the
@@ -57,11 +62,14 @@ function handleServerMessage(msg) {
     case 'stream_start':  onStreamStart(); break;
     case 'token':         onToken(msg.text); break;
     case 'reasoning':     onReasoning(msg.text); break;
-    case 'stream_end':    onStreamEnd(); break;
+    case 'stream_end':    onStreamEnd(msg.aborted); break;
     case 'tool_call':     onToolCall(msg); break;
     case 'tool_result':   onToolResult(msg.name, msg.ok, msg.preview); break;
     case 'plan':          onPlan(msg.text); break;
-    case 'done':          onDone(msg.iterations, msg.stopped); break;
+    // `done` ends ONE agent loop (council runs several per turn); only the
+    // server's `turn_end` says the whole turn is over.
+    case 'done':          onLoopDone(msg.iterations, msg.stopped); break;
+    case 'turn_end':      onTurnEnd(msg); break;
     case 'info':          appendChatInfo(msg.text); break;
     case 'error':         onServerError(msg.text); break;
     case 'cleared':       break;
@@ -325,6 +333,9 @@ function sendChat() {
   }
 
   appendUserMessage(fullText);
+  window.appState.turnActivity = false;
+  window.appState.lastIterations = 0;
+  window.appState.lastStopped = false;
   textarea.value = '';
   autoResizeTextarea(textarea);
   document.getElementById('chat-attachments').innerHTML = '';
@@ -459,13 +470,20 @@ function onToken(text) {
   scrollToBottom(document.getElementById('chat-messages'));
 }
 
-function onStreamEnd() {
+function onStreamEnd(aborted) {
   window._reasoningChars = 0;
   if (currentAssistantBubble) {
     currentAssistantBubble.classList.remove('streaming-cursor');
     currentAssistantBubble.classList.remove('waiting-for-response');
     currentAssistantBubble.removeAttribute('data-reasoning-label');
-    currentAssistantBubble.innerHTML = renderMarkdown(streamBuffer);
+    if (aborted && streamBuffer.trim()) {
+      // The server threw this partial reply away and the model will redo the
+      // step — don't leave it looking like something the agent actually said.
+      currentAssistantBubble.innerHTML =
+        '<div class="msg-discarded">↺ Response cut off mid-stream and discarded — retrying this step.</div>';
+    } else {
+      currentAssistantBubble.innerHTML = renderMarkdown(streamBuffer);
+    }
   }
   currentAssistantBubble = null;
   currentToolCallsDiv    = null;
@@ -668,6 +686,28 @@ function onPlan(text) {
   scrollToBottom(container);
 }
 
+function onLoopDone(iterations, stopped) {
+  window._reasoningChars = 0;
+  window.appState.lastIterations = (window.appState.lastIterations || 0) + (iterations || 0);
+  if (stopped) window.appState.lastStopped = true;
+}
+
+function onTurnEnd(msg) {
+  const iterations = window.appState.lastIterations || 0;
+  const stopped = !!(msg.stopped || window.appState.lastStopped);
+  window.appState.lastIterations = 0;
+  window.appState.lastStopped = false;
+  if (parallelLive.active) { setChatRunning(false); return; }
+  if (msg.error) {   // already shown by the `error` event
+    setChatRunning(false);
+    if (window.appState.messages.length > 0) {
+      sendMsg({ type: 'save_chat', chat_id: window.appState.currentChatId || '' });
+    }
+    return;
+  }
+  onDone(iterations, stopped);
+}
+
 function onDone(iterations, stopped) {
   setChatRunning(false);
   // Clear any still-running tool timer (e.g. stopped mid-execution).
@@ -689,7 +729,10 @@ function onDone(iterations, stopped) {
 
 function onServerError(text) {
   appendChatError(text);
-  setChatRunning(false);
+  // An error DURING a turn is often recovered from (a retried request, a model
+  // swapped for a fallback) — the turn only ends on `turn_end`. An error before
+  // the turn produced anything (bad request, "already running") ends it here.
+  if (!window.appState.turnActivity) setChatRunning(false);
 }
 
 function setChatRunning(running) {
@@ -717,10 +760,17 @@ function setChatRunning(running) {
 // ──────────────────────────────────────────────────────────────
 
 function onChatLoaded(msg) {
-  window.appState.messages = msg.messages || [];
-  window.appState.model = msg.model || '';
   window.appState.currentChatId = msg.id || null;
   window.appState.chatIsFirst = false;
+  // A reconnect re-loads the chat only to restore the server's copy of the
+  // history; the conversation on screen is already right.
+  if (msg.silent) return;
+  // `display` is the readable conversation (no system prompt, tool traffic or
+  // the agent loop's internal nudges); older servers only send `messages`.
+  const shown = (msg.display || (msg.messages || []).filter(m =>
+    (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.trim()));
+  window.appState.messages = shown;
+  window.appState.model = msg.model || '';
 
   // Restore the execution context this chat ran in: working directory and,
   // for a remote session, the same SSH host — so a follow-up continues in the
@@ -736,7 +786,7 @@ function onChatLoaded(msg) {
   container.innerHTML = '';
   window._lastTodoCard = null;  // the old card node was just detached
 
-  msg.messages.forEach(m => {
+  shown.forEach(m => {
     if (m.role === 'user') {
       const div = document.createElement('div');
       div.className = 'msg msg-user';
@@ -745,7 +795,7 @@ function onChatLoaded(msg) {
     } else if (m.role === 'assistant') {
       const div = document.createElement('div');
       div.className = 'msg msg-assistant';
-      div.innerHTML = `<div class="msg-bubble">${renderMarkdown(m.content)}</div>`;
+      div.innerHTML = `<div class="msg-bubble"><div class="md-content">${renderMarkdown(m.content)}</div></div>`;
       container.appendChild(div);
     }
   });
@@ -959,6 +1009,17 @@ function initApp() {
       document.getElementById('tab-' + tab).classList.add('active');
     });
   });
+  initSettingsPage();
+  // The rail on the other pages (Science, Autonomous Research) links here as
+  // /#settings (optionally /#settings/<section>) — open it straight away, and
+  // again whenever the hash changes within this page.
+  const openFromHash = () => {
+    if (!location.hash.startsWith('#settings')) return;
+    document.querySelector('.nav-btn[data-tab="settings"]')?.click();
+    window.showSettingsSection(location.hash.split('/')[1] || 'overview');
+  };
+  openFromHash();
+  window.addEventListener('hashchange', openFromHash);
 
   // Chat input
   const textarea = document.getElementById('chat-textarea');
@@ -1149,6 +1210,14 @@ function initApp() {
       if (window.appState.running) {
         window.appState.running = false;
         setChatRunning(false);
+        appendChatInfo('Reconnected. The live output of the running task was lost; '
+          + 'if it finished, its result is in the saved chat.');
+      }
+      // A new connection starts with an EMPTY server-side history. Without this,
+      // the next message is silently treated as a brand-new conversation and
+      // the model loses everything said before the disconnect.
+      if (window.appState.currentChatId) {
+        sendMsg({ type: 'load_chat', chat_id: window.appState.currentChatId, silent: true });
       }
     },
     () => {
@@ -1176,16 +1245,11 @@ function renderProvidersList(providers, active) {
   host.innerHTML = providers.map(p => {
     const tag = p.kind === 'custom' ? 'custom' : 'built-in';
     const isActive = p.id === active;
-    const activeTag = isActive ? '<span class="provider-tag tag-active">active</span>' : '';
+    const activeTag = isActive ? '<span class="provider-tag tag-active">In use</span>' : '';
     const url = p.base_url ? `<span class="provider-url">${esc(p.base_url)}</span>` : '<span class="provider-url"></span>';
-    const actions = p.kind === 'custom'
-      ? `<div class="provider-actions">
-           <button class="btn-link" data-act="use" data-id="${esc(p.id)}">use</button>
-           <button class="btn-link btn-link-danger" data-act="remove" data-id="${esc(p.id)}">remove</button>
-         </div>`
-      : `<div class="provider-actions">
-           <button class="btn-link" data-act="use" data-id="${esc(p.id)}">use</button>
-         </div>`;
+    const useBtn = isActive ? '' : `<button class="btn-link" data-act="use" data-id="${esc(p.id)}">Use</button>`;
+    const actions = `<div class="provider-actions">${useBtn}${p.kind === 'custom'
+      ? `<button class="btn-link btn-link-danger" data-act="remove" data-id="${esc(p.id)}">Remove</button>` : ''}</div>`;
     return `
       <div class="provider-row${p.kind === 'builtin' ? ' provider-builtin' : ''}${isActive ? ' provider-active' : ''}">
         <span class="provider-name">${esc(p.name)}</span>
@@ -1317,8 +1381,11 @@ window.renderRemotesCard = function () {
   if (!host) return;
   const remotes = window.appState.remotes || [];
   const active = window.appState.remoteId;
+  setSettingsCount('settings-count-remotes', remotes.length);
+  const form = document.getElementById('remote-add-form');
   if (!remotes.length) {
-    host.innerHTML = '<div class="remotes-empty">No remote hosts yet. Add one below.</div>';
+    host.innerHTML = '<div class="settings-empty">No remote hosts yet. Add one below to run the agent on another machine.</div>';
+    if (form && !form.dataset.touched) form.open = true;
     return;
   }
   host.innerHTML = remotes.map(r => {
@@ -1328,10 +1395,10 @@ window.renderRemotesCard = function () {
       <div class="remote-row${isActive ? ' remote-active' : ''}">
         <span class="remote-name">${esc(r.name || r.id)}</span>
         <span class="remote-target">${target}<span class="remote-dir">:${esc(r.remote_dir || '.')}</span></span>
-        ${isActive ? '<span class="provider-tag tag-active">active</span>' : ''}
+        ${isActive ? '<span class="provider-tag tag-active">In use</span>' : ''}
         <div class="remote-actions">
-          <button class="btn-link" data-ract="use" data-id="${esc(r.id)}">use</button>
-          <button class="btn-link btn-link-danger" data-ract="remove" data-id="${esc(r.id)}">remove</button>
+          ${isActive ? '' : `<button class="btn-link" data-ract="use" data-id="${esc(r.id)}">Use</button>`}
+          <button class="btn-link btn-link-danger" data-ract="remove" data-id="${esc(r.id)}">Remove</button>
         </div>
       </div>`;
   }).join('');
@@ -1351,19 +1418,92 @@ window.renderRemotesCard = function () {
 };
 
 window.openRemotesConfig = function () {
-  // Switch to the Settings tab and scroll the Remotes card into view.
+  // Switch to Settings → Remote hosts with the add form open.
   document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
   document.querySelector('.nav-btn[data-tab="settings"]')?.classList.add('active');
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
   document.getElementById('tab-settings')?.classList.add('active');
-  const card = document.getElementById('remotes-card');
-  if (card) {
-    card.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    card.classList.add('card-flash');
-    setTimeout(() => card.classList.remove('card-flash'), 1200);
-    document.getElementById('remote-host')?.focus();
-  }
+  window.showSettingsSection('remotes');
+  const form = document.getElementById('remote-add-form');
+  if (form) form.open = true;
+  document.getElementById('remote-host')?.focus();
 };
+
+// ──────────────────────────────────────────────────────────────
+// Settings page: section menu, chat defaults, catalog search
+// ──────────────────────────────────────────────────────────────
+
+window.showSettingsSection = function (name) {
+  const known = [...document.querySelectorAll('.settings-section')].map(s => s.dataset.section);
+  if (!known.includes(name)) name = 'overview';
+  document.querySelectorAll('.settings-nav-item').forEach(b =>
+    b.classList.toggle('active', b.dataset.section === name));
+  document.querySelectorAll('.settings-section').forEach(s =>
+    s.classList.toggle('active', s.dataset.section === name));
+  document.getElementById('settings-content')?.scrollTo(0, 0);
+};
+
+const PERMISSION_DESC = {
+  autonomous: 'The agent works without asking. Best when you trust the task.',
+  supervised: 'The agent asks before it edits files; commands run without asking.',
+  controlled: 'The agent asks before every file edit and every command.',
+};
+
+function initSettingsPage() {
+  document.querySelectorAll('.settings-nav-item').forEach(b =>
+    b.addEventListener('click', () => window.showSettingsSection(b.dataset.section)));
+  document.querySelectorAll('#tab-settings [data-goto]').forEach(el =>
+    el.addEventListener('click', (e) => { e.preventDefault(); window.showSettingsSection(el.dataset.goto); }));
+
+  // Permission mode: a web-UI preference, remembered across reloads.
+  const perm = document.getElementById('chat-permission-select');
+  const desc = document.getElementById('settings-permission-desc');
+  if (perm) {
+    try {
+      const saved = localStorage.getItem('ots.permissionMode');
+      if (saved && PERMISSION_DESC[saved]) perm.value = saved;
+    } catch { /* storage unavailable */ }
+    const sync = () => {
+      if (desc) desc.textContent = PERMISSION_DESC[perm.value] || '';
+      try { localStorage.setItem('ots.permissionMode', perm.value); } catch { /* ignore */ }
+    };
+    perm.addEventListener('change', sync);
+    sync();
+  }
+
+  // Once the user opens/closes the add-host form themselves, stop auto-opening it.
+  const rform = document.getElementById('remote-add-form');
+  rform?.querySelector('summary')?.addEventListener('click', () => { rform.dataset.touched = '1'; });
+
+  // Catalog search: filter rows, hide categories left empty.
+  document.getElementById('mcp-catalog-search')?.addEventListener('input', filterMcpCatalog);
+}
+
+function filterMcpCatalog() {
+  const q = (document.getElementById('mcp-catalog-search')?.value || '').trim().toLowerCase();
+  const host = document.getElementById('mcp-registry-list');
+  if (!host) return;
+  let current = null, shown = 0;
+  const flush = () => { if (current) current.style.display = shown ? '' : 'none'; };
+  [...host.children].forEach(el => {
+    if (el.classList.contains('mcp-cat')) { flush(); current = el; shown = 0; return; }
+    const hit = !q || el.textContent.toLowerCase().includes(q);
+    el.style.display = hit ? '' : 'none';
+    if (hit) shown++;
+  });
+  flush();
+  let none = host.querySelector('.mcp-empty-search');
+  const anyShown = [...host.querySelectorAll('.mcp-reg-row')].some(r => r.style.display !== 'none');
+  if (!anyShown && q) {
+    if (!none) { none = document.createElement('div'); none.className = 'mcp-empty mcp-empty-search'; host.appendChild(none); }
+    none.textContent = `No tools match “${q}”.`;
+  } else if (none) none.remove();
+}
+
+function setSettingsCount(id, n) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = n ? String(n) : '';
+}
 
 function _remoteFormValues() {
   return {
@@ -1373,6 +1513,7 @@ function _remoteFormValues() {
     user:          (document.getElementById('remote-user')?.value || '').trim(),
     port:          parseInt(document.getElementById('remote-port')?.value || '22', 10) || 22,
     identity_file: (document.getElementById('remote-identity')?.value || '').trim(),
+    setup:         (document.getElementById('remote-setup')?.value || '').trim(),
   };
 }
 
@@ -1422,9 +1563,12 @@ function initRemotesForm() {
       const data = await res.json();
       if (!data.ok) { _setRemoteStatus('✗ ' + (data.error || 'failed'), 'fail'); return; }
       _setRemoteStatus('✓ added', 'ok');
-      ['remote-id', 'remote-name', 'remote-host', 'remote-user', 'remote-identity']
+      ['remote-id', 'remote-name', 'remote-host', 'remote-user', 'remote-identity',
+       'remote-setup']
         .forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
       const portEl = document.getElementById('remote-port'); if (portEl) portEl.value = '22';
+      const addForm = document.getElementById('remote-add-form');
+      if (addForm) { addForm.open = false; addForm.dataset.touched = '1'; }
       await refreshRemotes();
       // Activate the freshly added remote.
       if (data.remote?.id) window.setRemoteMode('remote', data.remote.id);
@@ -1521,10 +1665,10 @@ function renderMcpRegistry() {
       else if (e.runtime_available) badge = `<span class="mcp-badge">${esc(e.runtime)}</span>`;
       else badge = `<span class="mcp-badge mcp-badge-warn">needs ${esc(e.runtime)}</span>`;
       const btn = e.installed
-        ? `<button class="btn-link" disabled>installed</button>`
+        ? `<span class="mcp-installed">✓ Installed</span>`
         : (e.runtime_available
-            ? `<button class="btn-link" data-mcp-install="${esc(e.id)}">install</button>`
-            : `<button class="btn-link" disabled title="${esc(e.runtime_hint)}">unavailable</button>`);
+            ? `<button class="btn-secondary btn-sm" data-mcp-install="${esc(e.id)}">Install</button>`
+            : `<button class="btn-secondary btn-sm" disabled title="${esc(e.runtime_hint)}">Unavailable</button>`);
       return `
         <div class="mcp-reg-row">
           <div class="mcp-reg-main">
@@ -1540,6 +1684,7 @@ function renderMcpRegistry() {
   host.querySelectorAll('button[data-mcp-install]').forEach(btn => {
     btn.addEventListener('click', () => mcpInstallFlow(btn.dataset.mcpInstall));
   });
+  filterMcpCatalog();   // keep an active search applied after a refresh
 }
 
 function mcpInstallFlow(id) {
@@ -1549,7 +1694,7 @@ function mcpInstallFlow(id) {
   for (const inp of entry.inputs) {
     let def = '';
     if (inp.default_wd) {
-      def = document.getElementById('settings-working-dir')?.value || '.';
+      def = (window.getWorkingDir && window.getWorkingDir()) || '.';
     }
     const label = inp.secret ? `${inp.prompt} (kept private)` : inp.prompt;
     const v = window.prompt(`${entry.name}: ${label}`, def);
@@ -1564,15 +1709,17 @@ function onMcpServers(msg) {
   if (!host) return;
   const servers = msg.servers || [];
   if (!servers.length) {
-    host.innerHTML = '<div class="mcp-empty">No MCP servers configured yet. Install one from the catalog below, or add a custom server.</div>';
+    host.innerHTML = '<div class="settings-empty">No tools installed yet. Install one from the catalog below, or add a custom server.</div>';
+    setSettingsCount('settings-count-tools', 0);
     return;
   }
+  setSettingsCount('settings-count-tools', servers.length);
   host.innerHTML = servers.map(s => {
     let dot;
     if (!s.enabled) dot = '<span class="mcp-dot mcp-dot-off"></span>disabled';
     else if (s.connected) dot = `<span class="mcp-dot mcp-dot-on"></span>connected · ${s.tool_count} tools`;
     else if (s.error) dot = `<span class="mcp-dot mcp-dot-err"></span>error`;
-    else dot = '<span class="mcp-dot"></span>not connected';
+    else dot = '<span class="mcp-dot" title="Starts automatically the first time the agent runs — or press Reconnect all to start it now."></span>not started yet';
     const toolList = (s.tools && s.tools.length)
       ? `<div class="mcp-tools" title="${esc(s.tools.join(', '))}">${esc(s.tools.slice(0, 8).join(', '))}${s.tools.length > 8 ? ` +${s.tools.length - 8}` : ''}</div>`
       : '';
@@ -1584,8 +1731,8 @@ function onMcpServers(msg) {
           <span class="mcp-transport">${esc(s.transport)}</span>
           <span class="mcp-status">${dot}</span>
           <div class="mcp-actions">
-            <button class="btn-link" data-mcp-act="${s.enabled ? 'disable' : 'enable'}" data-name="${esc(s.name)}">${s.enabled ? 'disable' : 'enable'}</button>
-            <button class="btn-link btn-link-danger" data-mcp-act="remove" data-name="${esc(s.name)}">remove</button>
+            <button class="btn-link" data-mcp-act="${s.enabled ? 'disable' : 'enable'}" data-name="${esc(s.name)}">${s.enabled ? 'Disable' : 'Enable'}</button>
+            <button class="btn-link btn-link-danger" data-mcp-act="remove" data-name="${esc(s.name)}">Remove</button>
           </div>
         </div>
         <div class="mcp-target">${esc(s.target)}</div>

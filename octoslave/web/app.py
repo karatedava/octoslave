@@ -15,7 +15,6 @@ import json
 import os
 import threading
 import uuid
-from collections import deque
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from queue import Empty, Queue
@@ -33,7 +32,7 @@ from .. import interrupt
 from ..display import resolve_permission, resolve_user_response
 from ..agent import (
     continue_agent, make_client, run_agent, list_prompt_profiles,
-    redact_image_payloads, save_session_memory,
+    redact_image_payloads, save_session_memory, display_history,
 )
 from ..council import (
     resolve_council_roles, run_council_agent, continue_council_agent, council_available,
@@ -80,6 +79,88 @@ class _NoCacheAssets(BaseHTTPMiddleware):
 
 app.add_middleware(_NoCacheAssets)
 
+
+# ---------------------------------------------------------------------------
+# Local-only request guard
+#
+# This server can run shell commands (an autonomous agent is one websocket
+# message away), and browsers do NOT apply the same-origin policy to WebSockets:
+# without a check, any web page open in the user's browser could connect to
+# ws://127.0.0.1:7860/ws and drive the agent. Likewise a DNS-rebinding page
+# (attacker.com re-pointed at 127.0.0.1) could read files via /api/files/view.
+#   * Origin — a browser request that carries one must come from this server
+#     (or another loopback origin, e.g. the Vite dev server) for the websocket
+#     and for any state-changing HTTP method. Non-browser clients send none.
+#   * Host — while bound to loopback (the default), the Host header must be a
+#     loopback name, which defeats DNS rebinding. SSH tunnels to localhost keep
+#     working; a reverse proxy can be allowed via OCTOSLAVE_ALLOWED_HOSTS.
+# ---------------------------------------------------------------------------
+
+_LOOPBACK_NAMES = {"127.0.0.1", "localhost", "::1"}
+
+
+def _extra_allowed_hosts() -> set[str]:
+    raw = os.environ.get("OCTOSLAVE_ALLOWED_HOSTS", "")
+    return {h.strip().lower() for h in raw.split(",") if h.strip()}
+
+
+def _split_host(hostport: str) -> str:
+    hostport = (hostport or "").strip().lower()
+    if hostport.startswith("["):                      # [::1]:7860
+        return hostport[1:hostport.find("]")] if "]" in hostport else hostport
+    return hostport.rsplit(":", 1)[0] if hostport.count(":") == 1 else hostport
+
+
+def _guard_reason(kind: str, method: str, headers: dict) -> str:
+    """Why this request must be refused, or "" to let it through."""
+    extra = _extra_allowed_hosts()
+    host_header = headers.get("host", "")
+    host = _split_host(host_header)
+    bind = os.environ.get("OCTOSLAVE_WEB_HOST", "127.0.0.1").strip().lower()
+    if bind in _LOOPBACK_NAMES and host and host not in _LOOPBACK_NAMES and host not in extra:
+        return (f"unexpected Host '{host_header}'. If you reach OctoSlave through a "
+                f"proxy, add that hostname to OCTOSLAVE_ALLOWED_HOSTS.")
+    origin = headers.get("origin")
+    needs_origin_check = kind == "websocket" or method not in ("GET", "HEAD", "OPTIONS")
+    if origin and needs_origin_check:
+        from urllib.parse import urlparse
+        try:
+            o = urlparse(origin)
+        except Exception:
+            return "malformed Origin"
+        ohost = (o.hostname or "").lower()
+        if not (o.netloc.lower() == host_header.lower() or ohost in _LOOPBACK_NAMES
+                or ohost in extra):
+            return f"cross-site request from {origin}"
+    return ""
+
+
+class _LocalOnlyGuard:
+    """Pure ASGI middleware — BaseHTTPMiddleware never sees websocket traffic."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            headers = {k.decode("latin-1").lower(): v.decode("latin-1")
+                       for k, v in scope.get("headers") or []}
+            reason = _guard_reason(scope["type"], scope.get("method", "GET"), headers)
+            if reason:
+                if scope["type"] == "websocket":
+                    await receive()                      # the websocket.connect event
+                    await send({"type": "websocket.close", "code": 1008, "reason": reason[:120]})
+                    return
+                body = f"Forbidden: {reason}".encode()
+                await send({"type": "http.response.start", "status": 403,
+                            "headers": [(b"content-type", b"text/plain; charset=utf-8")]})
+                await send({"type": "http.response.body", "body": body})
+                return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(_LocalOnlyGuard)
+
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -96,6 +177,11 @@ if LAB_STATIC_DIR.exists():
 _ALLOWED_EXT = {
     ".html", ".htm", ".md", ".txt", ".json", ".csv",
     ".png", ".jpg", ".jpeg", ".svg", ".gif", ".py", ".sh",
+    # Science workspace previews: reports, tables and the plain-text formats
+    # research data usually comes in.
+    ".pdf", ".webp", ".tsv", ".log", ".yaml", ".yml", ".toml", ".r", ".ipynb",
+    ".fasta", ".fa", ".faa", ".fna", ".fastq", ".pdb", ".cif", ".sdf", ".mol2",
+    ".xyz", ".gff", ".gtf", ".bed", ".vcf", ".tex", ".bib", ".rst",
 }
 
 # ---------------------------------------------------------------------------
@@ -140,14 +226,17 @@ def _mcp_snapshot() -> dict:
 # ---------------------------------------------------------------------------
 
 def _chat_title(messages: list) -> str:
-    for m in messages:
-        if m.get("role") == "user" and isinstance(m.get("content"), str) and m["content"]:
-            return m["content"][:80]
+    # The first thing the USER said — not a stop notice, image stub or any of
+    # the agent loop's own guidance messages.
+    for m in display_history(messages):
+        if m["role"] == "user" and m["content"].strip():
+            return m["content"].strip()[:80]
     return "Untitled"
 
 
 def _save_chat(messages: list, model: str = "", chat_id: str = "",
-               working_dir: str = "", remote_id: str | None = None) -> str:
+               working_dir: str = "", remote_id: str | None = None,
+               prompt_profile: str = "") -> str:
     CHATS_DIR.mkdir(parents=True, exist_ok=True)
     now = datetime.now().isoformat(timespec="seconds")
     if chat_id and _safe_chat_id(chat_id):
@@ -169,6 +258,8 @@ def _save_chat(messages: list, model: str = "", chat_id: str = "",
         # so it reconnects to the same directory instead of falling back to local.
         "working_dir": working_dir or ".",
         "remote_id": remote_id,
+        # The profile decides the tool surface; a reopened chat keeps it.
+        "prompt_profile": prompt_profile or "",
         "created_at": created_at,
         "updated_at": now,
         "messages": redact_image_payloads(messages),
@@ -178,6 +269,10 @@ def _save_chat(messages: list, model: str = "", chat_id: str = "",
 
 def _safe_chat_id(chat_id: str) -> bool:
     return chat_id.startswith("chat_") and "/" not in chat_id and ".." not in chat_id
+
+
+class _NotStarted(Exception):
+    """A Science turn that was claimed but could not start (reported already)."""
 
 
 def _science_history(messages: list) -> list[dict]:
@@ -578,6 +673,18 @@ def _healthy_model(model: str, cfg: dict) -> tuple[str, str]:
     return (alt, model) if alt else (model, "")
 
 
+@app.get("/api/status")
+async def api_status():
+    """What the shared app rail shows in its footer on every page: the active
+    backend and the default model."""
+    try:
+        cfg = load_config()
+        return {"backend": cfg.get("backend", "einfra"),
+                "model": cfg.get("default_model", "")}
+    except Exception:
+        return {"backend": "einfra", "model": ""}
+
+
 @app.get("/api/models")
 async def api_models():
     """Chat models available on the active backend — for the orchestrator/pool
@@ -665,7 +772,8 @@ async def view_file(file_path: str):
     path = Path(file_path)
     if not path.exists() or not path.is_file():
         return HTMLResponse("<p>File not found.</p>", status_code=404)
-    if path.suffix not in _ALLOWED_EXT:
+    suffix = path.suffix.lower()
+    if suffix not in _ALLOWED_EXT:
         return HTMLResponse("<p>File type not allowed.</p>", status_code=403)
     media = {
         ".html": "text/html", ".htm": "text/html",
@@ -677,8 +785,54 @@ async def view_file(file_path: str):
         ".gif": "image/gif",
         ".py": "text/plain; charset=utf-8",
         ".sh": "text/plain; charset=utf-8",
+        ".pdf": "application/pdf", ".webp": "image/webp",
     }
-    return FileResponse(str(path), media_type=media.get(path.suffix, "application/octet-stream"))
+    # Everything else on the allow-list is text: serve it as such so the browser
+    # shows it inline instead of downloading it.
+    return FileResponse(str(path), media_type=media.get(suffix, "text/plain; charset=utf-8"))
+
+
+# Names the Science file explorer never lists (tool caches, VCS, env dirs).
+_EXPLORER_HIDDEN = {"__pycache__", "node_modules", ".git", ".venv", "venv",
+                    ".ipynb_checkpoints", ".DS_Store", ".mypy_cache", ".pytest_cache"}
+
+
+@app.get("/api/science/files")
+async def science_files(working_dir: str, path: str = ""):
+    """List one directory of a Science session's working dir (explorer panel).
+
+    ``path`` is relative to ``working_dir``; anything resolving outside it is
+    refused, so the explorer can't be walked up into the rest of the disk.
+    """
+    root = Path(working_dir).expanduser().resolve()
+    target = (root / path).resolve() if path else root
+    if target != root and root not in target.parents:
+        return {"ok": False, "error": "outside the working directory"}
+    if not target.is_dir():
+        return {"ok": False, "error": "not a directory"}
+
+    def _ls() -> list[dict]:
+        out = []
+        for e in target.iterdir():
+            if e.name in _EXPLORER_HIDDEN or e.name.startswith("."):
+                continue
+            try:
+                st = e.stat()
+                is_dir = e.is_dir()
+            except OSError:
+                continue
+            out.append({"name": e.name, "rel": str(e.relative_to(root)),
+                        "path": str(e), "dir": is_dir,
+                        "size": 0 if is_dir else st.st_size, "mtime": st.st_mtime})
+        out.sort(key=lambda x: (not x["dir"], x["name"].lower()))
+        return out[:2000]
+
+    try:
+        entries = await asyncio.to_thread(_ls)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "path": str(target.relative_to(root)) if target != root else "",
+            "entries": entries}
 
 
 # ---------------------------------------------------------------------------
@@ -688,106 +842,20 @@ async def view_file(file_path: str):
 _EDITABLE_EXT = {".md", ".txt", ".csv", ".tsv", ".json", ".html", ".htm",
                  ".py", ".sh", ".yaml", ".yml", ".svg"}
 
-# Working dirs with an in-flight Science turn (process-wide). Lets the UI show a
-# "running" badge and guards against two connections driving the same session.
-_ACTIVE_SCIENCE: set[str] = set()
-
-# How many recent events a re-attaching viewer gets replayed. Enough to cover the
-# tool calls and streamed text of a long turn without holding a whole run in RAM.
-_HUB_BACKLOG = 600
-
-
-class _ScienceHub:
-    """Event fan-out for one running Science turn.
-
-    A turn's events used to go straight to the websocket connection that STARTED
-    it. Reloading the page therefore orphaned the run: the turn kept working, but
-    everything it emitted went to a socket nobody was reading, and the new page
-    could only sit on restored history with a locked composer.
-
-    The hub belongs to the SESSION instead, so any connection can attach — a
-    reload, a second tab, a browser reopened an hour later — and a late joiner
-    gets the recent backlog replayed before the live stream continues. Publishing
-    happens on the turn's worker thread, so each subscriber carries the event loop
-    it belongs to and is woken through ``call_soon_threadsafe``.
-    """
-
-    def __init__(self, key: str):
-        self.key = key
-        self.agent_ident: int | None = None   # thread id, so ANY viewer can Stop
-        self._subs: set[tuple] = set()        # {(loop, queue)}
-        self._backlog: "deque[dict]" = deque(maxlen=_HUB_BACKLOG)
-        self._lock = threading.Lock()
-        self._closed = False
-
-    def publish(self, event: dict) -> None:
-        with self._lock:
-            # The sentinel is a control signal for the drain loops, not content —
-            # replaying it to a later viewer would end its stream immediately.
-            if event.get("type") != "_sentinel":
-                self._backlog.append(event)
-            subs = list(self._subs)
-        for loop, q in subs:
-            try:
-                loop.call_soon_threadsafe(q.put_nowait, event)
-            except RuntimeError:      # that viewer's loop is gone
-                with self._lock:
-                    self._subs.discard((loop, q))
-
-    def attach(self, loop, q) -> list[dict]:
-        """Subscribe and return what has already happened this turn.
-
-        A turn that ALREADY finished hands back a trailing sentinel: the live
-        sentinel was published before this subscriber existed, and without it here
-        the caller's drain loop would wait for an event that can never come.
-        """
-        with self._lock:
-            self._subs.add((loop, q))
-            out = list(self._backlog)
-            if self._closed:
-                out.append({"type": "_sentinel"})
-            return out
-
-    def detach(self, loop, q) -> None:
-        with self._lock:
-            self._subs.discard((loop, q))
-
-    def close(self) -> None:
-        with self._lock:
-            self._closed = True
-        self.publish({"type": "_sentinel"})
-
-
-_SCIENCE_HUBS: dict[str, _ScienceHub] = {}
-_HUBS_LOCK = threading.Lock()
-
-
-def _open_hub(key: str) -> _ScienceHub:
-    hub = _ScienceHub(key)
-    with _HUBS_LOCK:
-        _SCIENCE_HUBS[key] = hub
-    return hub
-
-
-def _get_hub(key: str) -> "_ScienceHub | None":
-    with _HUBS_LOCK:
-        return _SCIENCE_HUBS.get(key)
-
-
-def _close_hub(key: str) -> None:
-    with _HUBS_LOCK:
-        hub = _SCIENCE_HUBS.pop(key, None)
-    if hub is not None:
-        hub.close()
+# Live state of each Science session (event fan-out, persisted timeline, whether
+# a turn is in flight) lives in octoslave.science.channel — shared by every
+# connection, so a reload, a second tab, or switching sessions never loses a run.
 
 
 @app.get("/api/science/sessions")
 async def science_sessions():
     """List past/current Science sessions (most recent first) for the history UI."""
     from ..science import index as _index
+    from ..science.channel import running_keys
+    running = running_keys()
     out = []
     for s in _index.list_sessions():
-        out.append({**s, "running": s.get("working_dir") in _ACTIVE_SCIENCE})
+        out.append({**s, "running": s.get("working_dir") in running})
     return {"sessions": out}
 
 
@@ -913,71 +981,307 @@ async def ws_endpoint(websocket: WebSocket):
         except asyncio.CancelledError:
             pass
 
-    async def stream_science(hub: "_ScienceHub") -> None:
-        """Forward one Science turn's events to THIS socket until the turn ends.
+    # ------------------------------------------------------------------
+    # Science: this connection's view onto one session's live channel.
+    #
+    # Viewing never blocks the receive loop — a background task forwards the
+    # channel's events — so while a turn runs the user can keep sending
+    # messages (steering), stop it, answer a question, or switch to another
+    # session. One view per connection; opening another session replaces it.
+    # ------------------------------------------------------------------
+    def sci_key(working_dir: str) -> str:
+        return str(Path(working_dir).expanduser().resolve())
 
-        Used by the connection that started the turn and by any that attach later
-        (a reload, a second tab). Each viewer gets its own queue, seeded with the
-        backlog, so re-attaching mid-run shows what has already happened instead
-        of a frozen page. Stop is routed through the hub's recorded thread id, so
-        it works from a viewer that did not start the run.
-        """
+    async def sci_unview() -> None:
+        view = state.pop("sci_view", None)
+        if not view:
+            return
+        ch, q, task = view
+        ch.unsubscribe(loop, q)
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    def sci_subscribe(ch) -> asyncio.Queue:
+        """Subscribe (without forwarding yet) — see sci_forward. Subscribing
+        before the timeline is read means nothing falls in the gap; the client
+        drops anything the log already covered by its ``seq``."""
         q: asyncio.Queue = asyncio.Queue()
-        for ev in hub.attach(loop, q):
+        for ev in ch.subscribe(loop, q):
             q.put_nowait(ev)
+        state["sci_view"] = (ch, q, None)
+        return q
 
-        async def _drain():
+    def sci_forward() -> None:
+        view = state.get("sci_view")
+        if not view or view[2] is not None:
+            return
+        ch, q, _ = view
+
+        async def _fwd():
             while True:
-                event = await q.get()
-                if event.get("type") == "_sentinel":
-                    return
+                ev = await q.get()
                 try:
-                    await websocket.send_json(event)
+                    await websocket.send_json({**ev, "sid": ch.key})
                 except Exception:
                     return
 
-        async def _recv():
-            while True:
-                try:
-                    raw = await websocket.receive_text()
-                except Exception:
-                    return          # this viewer's socket is gone
-                try:
-                    msg = json.loads(raw)
-                    mt = msg.get("type")
-                    if mt == "permission_response":
-                        resolve_permission(bool(msg.get("allow", False)))
-                    elif mt == "user_response":
-                        resolve_user_response(str(msg.get("answer", "")))
-                    elif mt in ("stop", "stop_chat"):
-                        ident = hub.agent_ident or state.get("agent_ident")
-                        if ident and interrupt.request_stop(ident):
-                            hub.publish({
-                                "type": "info",
-                                "text": "⏹ Stopping — killing the running command "
-                                        "and ending the turn.",
-                            })
-                except Exception:
-                    continue        # bad message — ignore it, keep watching
+        state["sci_view"] = (ch, q, asyncio.create_task(_fwd()))
 
-        drain_task = asyncio.create_task(_drain())
-        recv_task = asyncio.create_task(_recv())
+    async def sci_ensure_view(ch) -> None:
+        view = state.get("sci_view")
+        if view and view[0] is ch:
+            return
+        await sci_unview()
+        sci_subscribe(ch)
+        sci_forward()
+
+    def sci_legacy_events(sess) -> list[dict]:
+        """Timeline for a session recorded before feed.jsonl existed: its chat
+        text, then its outputs (their positions in the talk weren't recorded)."""
+        evs: list[dict] = []
+        for h in _science_history(sess.messages):
+            if h["role"] == "user":
+                evs.append({"type": "science_user", "text": h["text"]})
+            else:
+                evs.append({"type": "assistant_message", "text": h["text"]})
+        for a in sess.artifacts:
+            evs.append({"type": "science_artifact", "id": a.id, "rel": a.rel,
+                        "path": a.path, "caption": a.caption, "kind": a.kind,
+                        "provenance": a.provenance,
+                        "interim": getattr(a, "interim", False)})
+        return evs
+
+    async def sci_load(msg: dict) -> None:
+        from ..science.session import ScienceSession
+        from ..science.channel import get_channel
+        working_dir = msg.get("working_dir") or state["working_dir"]
+        state["working_dir"] = working_dir
+        key = sci_key(working_dir)
+        ch = get_channel(key)
+        # While a turn runs, the worker's session object is the truth (disk only
+        # catches up at the end of the turn).
+        sess = ch.session if (ch.running and ch.session is not None) \
+            else await asyncio.to_thread(ScienceSession.load, working_dir)
+        await sci_unview()
+        if sess is None and not ch.running:
+            await send({"type": "science_state", "exists": False,
+                        "working_dir": working_dir, "sid": key})
+            return
+        if sess is not None:
+            state["science_session"] = sess
+        sci_subscribe(ch)
+        events = (await asyncio.to_thread(ch.history) if ch.has_log()
+                  else sci_legacy_events(sess) if sess else [])
+        await send({"type": "science_state", "exists": True, "working_dir": key,
+                    "sid": key, "task": getattr(sess, "task", "") or "",
+                    "running": ch.running, "events": events,
+                    "snapshot": sess.snapshot() if sess else {}})
+        sci_forward()
+
+    async def sci_message(msg: dict, mtype: str) -> None:
+        """A message (or a comment on an output) for a Science session.
+
+        Idle session → it starts a turn. Running session → it is queued in the
+        turn's steering inbox and reaches the orchestrator at its next step
+        (and any running specialist as an FYI) — the user never has to wait.
+        """
+        from ..science.channel import get_channel
+        from .. import steer
+
+        working_dir = msg.get("working_dir") or state["working_dir"]
+        state["working_dir"] = working_dir
+        key = sci_key(working_dir)
+        ch = get_channel(key)
+        cid = msg.get("cid")
+        text = str((msg.get("text") if mtype == "science_comment"
+                    else msg.get("message")) or "").strip()
+        if not text:
+            return
+        await sci_ensure_view(ch)
+
+        commented: dict = {}
+
+        def as_refinement(sess):
+            """(artifact, prompt) for a comment on a presented output."""
+            art = sess.get_artifact(msg.get("artifact_id") or "") if sess else None
+            if art is None:
+                return None, text
+            if not commented:
+                sess.comment_artifact(art.id, text)
+                commented["done"] = True
+            return art, (
+                f"The user commented on the presented output `{art.rel}` "
+                f"(kind: {art.kind}): \"{text}\". Refine that specific output "
+                f"accordingly, then call present_output on the updated file so "
+                f"they see the new version.")
+
+        if ch.running:
+            # A turn is in flight: queue this in its steering inbox. There are
+            # two brief windows with no open inbox — a turn still starting (the
+            # session is claimed, its inbox not open yet) and one wrapping up
+            # (inbox already closed) — so wait for whichever resolves first: the
+            # inbox opening, or the turn ending (then this starts the next one).
+            for _ in range(600):
+                inbox = steer.get_inbox(key)
+                if inbox is not None and not inbox.closed:
+                    art, prompt = (as_refinement(ch.session) if mtype == "science_comment"
+                                   else (None, text))
+                    steer_id = inbox.post(text, prompt=prompt,
+                                          meta={"artifact_id": art.id if art else None})
+                    if steer_id:
+                        ch.publish({"type": "science_user", "text": text, "cid": cid,
+                                    "queued": True, "steer_id": steer_id,
+                                    "artifact_id": art.id if art else None})
+                        return
+                if not ch.running:
+                    break
+                await asyncio.sleep(0.05)
+            if ch.running:
+                await send({"type": "error", "sid": key, "cid": cid, "text":
+                            "The session is still finishing its last step — "
+                            "send that again in a moment."})
+                return
+
+        # Claim the session BEFORE the first await below. Another connection (a
+        # second tab) could otherwise pass the same "not running" check while
+        # this one loads the session, and both would start a turn on it. Released
+        # if anything below fails before the turn's thread takes over.
+        ch.running = True
+        started = False
         try:
-            # Whichever happens first: the turn ends (drain hits the sentinel) or
-            # this viewer disconnects (recv returns). Waiting only on the drain
-            # meant a viewer that closed mid-turn left its handler parked on an
-            # empty queue until the run happened to emit again.
-            await asyncio.wait({drain_task, recv_task},
-                               return_when=asyncio.FIRST_COMPLETED)
+            await _sci_start_turn(ch, key, msg, mtype, text, cid, working_dir,
+                                  as_refinement)
+            started = True
+        except _NotStarted:
+            pass                    # already told the user why
         finally:
-            hub.detach(loop, q)
-            for t in (drain_task, recv_task):
-                t.cancel()
-            for t in (drain_task, recv_task):
+            if not started:
+                ch.running = False
+
+    async def _sci_start_turn(ch, key, msg, mtype, text, cid, working_dir,
+                              as_refinement) -> None:
+        """Start a turn on a session already claimed by sci_message."""
+        from ..science.session import ScienceSession
+        from ..science.orchestrator import run_science_turn
+        from .. import steer
+
+        cfg = load_config()
+        if state.get("backend"):
+            cfg["backend"] = state["backend"]
+        _resolved = resolve_backend(cfg)
+        client = make_client(_resolved["api_key"], _resolved["base_url"])
+
+        sess = state.get("science_session")
+        if sess is None or sess.working_dir != key:
+            sess = await asyncio.to_thread(ScienceSession.load, working_dir)
+
+        # Model resolution, most specific first: what this message asked for →
+        # what this SESSION was started with → the socket's model → config's
+        # default. The session tier keeps a refine comment or a reload on the
+        # model the user picked instead of silently moving to default_model.
+        model = (msg.get("model") or getattr(sess, "model", "")
+                 or state.get("model") or cfg.get("default_model"))
+        # Pool of models the orchestrator may assign to spawned specialists.
+        specialist_models = [m for m in (msg.get("specialist_models") or [])
+                             if isinstance(m, str) and m.strip()]
+        if not specialist_models:
+            specialist_models = (list(getattr(sess, "specialist_models", []) or [])
+                                 or state.get("specialist_models") or [])
+        state["specialist_models"] = specialist_models
+        model, _swapped = _healthy_model(model, cfg)
+        if _swapped:
+            await send({"type": "info", "sid": key, "text": (
+                f"'{_swapped}' isn't available on this backend — running on "
+                f"{model} instead.")})
+        state["model"] = model
+
+        remote_id = msg.get("remote_id") if "remote_id" in msg else (
+            getattr(sess, "remote_id", None) or state.get("remote_id"))
+        state["remote_id"] = remote_id
+        remote = get_remote(None, remote_id) if remote_id else None
+
+        refine_id = None
+        if mtype == "science_comment":
+            if sess is None:
+                await send({"type": "error", "sid": key,
+                            "text": "No science session for this directory."})
+                raise _NotStarted
+            art, user_message = as_refinement(sess)
+            refine_id = art.id if art else None
+        else:
+            user_message = text
+            if sess is None:
+                sess = ScienceSession(task=text, working_dir=working_dir,
+                                      model=model or "")
+            elif not sess.task:
+                sess.task = text
+
+        # A session recorded before the timeline log existed: write its history
+        # into the log first, or the new log would hide everything before it.
+        if not ch.has_log() and sess.messages:
+            ch.seed(sci_legacy_events(sess))
+
+        sess.remote_id = remote_id
+        # Remember the models this session runs on, so a refine comment, a
+        # reload, or reopening it later all stay on the user's choice.
+        sess.model = model or sess.model
+        sess.specialist_models = specialist_models
+        state["science_session"] = sess
+        ch.session = sess
+        inbox = steer.open_inbox(key)
+        # Record in the history index up front, so the session is reopenable
+        # (and shows as running) even before its first turn saves.
+        try:
+            from ..science import index as _science_index
+            _science_index.record(sess.working_dir, sess.task or text)
+        except Exception:
+            pass
+        ch.publish({"type": "science_user", "text": text, "cid": cid,
+                    "artifact_id": refine_id})
+
+        def science_fn(um=user_message, sc=sess, cl=client, md=model, rmt=remote,
+                       rid=refine_id, pool=specialist_models, ib=inbox):
+            display.set_event_callback(ch.publish)
+            interrupt.register()
+            ch.agent_ident = threading.get_ident()
+            try:
+                run_science_turn(sc, um, cl, md, permission_mode="autonomous",
+                                 emit=ch.publish, remote=rmt,
+                                 refresh_artifact_id=rid, specialist_models=pool,
+                                 inbox=ib)
+            except interrupt.StopRequested:
+                # Record the stop in the session's own history, so the next turn
+                # knows the work was cut short by the user rather than finished.
                 try:
-                    await t
-                except (asyncio.CancelledError, Exception):
+                    sc.messages = _mark_stopped(sc.messages)
+                    sc.save()
+                except Exception:
                     pass
+                ch.publish({"type": "science_reply", "stopped": True, "text":
+                            "⏹ Stopped by you. Any running command was killed; the "
+                            "work so far is saved. Send a message to carry on."})
+            except Exception as exc:
+                ch.publish({"type": "error", "text": str(exc)})
+            finally:
+                dropped = ib.close()
+                if dropped:
+                    ch.publish({"type": "science_steer", "dropped": True,
+                                "ids": [it["id"] for it in dropped]})
+                steer.drop_inbox(key, ib)
+                interrupt.unregister()
+                ch.agent_ident = None
+                display.clear_event_callback()
+                # The authoritative end-of-turn, to EVERY viewer. Published while
+                # still marked running, so a message queued behind this turn that
+                # starts the next one can't be followed by a stale "done".
+                ch.publish({"type": "science_done"})
+                ch.running = False
+
+        threading.Thread(target=science_fn, daemon=True).start()
 
     async def send(event: dict) -> None:
         try:
@@ -1404,7 +1708,17 @@ async def ws_endpoint(websocket: WebSocket):
                     continue
 
                 new_conv = (mtype in ("chat", "chat_new")) or (not state["messages"])
-                state["model"] = model
+                if new_conv:
+                    # A new conversation starts clean. Leaving the previous one in
+                    # state meant a Stop during this one's planning phase was
+                    # recorded against the OLD history — and the next message
+                    # continued that instead of this.
+                    state["messages"] = []
+                    state["prompt_profile"] = prompt_profile
+                else:
+                    # A follow-up keeps the profile its conversation started with
+                    # (it decides the tool surface, e.g. cryouncle's CryoSPARC tools).
+                    prompt_profile = state.get("prompt_profile") or prompt_profile
                 state["working_dir"] = working_dir
                 # Remote execution target: explicit per-message id wins, else the
                 # session's current selection. None → local (default).
@@ -1419,6 +1733,21 @@ async def ws_endpoint(websocket: WebSocket):
                     cfg["backend"] = state["backend"]
                 _resolved = resolve_backend(cfg)
                 client = make_client(_resolved["api_key"], _resolved["base_url"])
+                # Same rule as the terminal: small local models get the compact
+                # `local` prompt, not the full base prompt written for big models.
+                if _resolved.get("backend") == "ollama" and prompt_profile == "base":
+                    prompt_profile = "local"
+                    state["prompt_profile"] = "local"
+                # A model the backend no longer serves (typically a stale default)
+                # fails deep in the run with an opaque 400 — swap it up front.
+                try:
+                    model, _swapped = await asyncio.to_thread(_healthy_model, model, cfg)
+                except Exception:
+                    _swapped = ""
+                if _swapped:
+                    await send({"type": "info", "text": (
+                        f"'{_swapped}' isn't available on this backend — using {model} instead.")})
+                state["model"] = model
 
                 # Agent mode — standard | improved | ultra, opt-in per message
                 # (web UI defaults to improved). Improved/Ultra run the council and
@@ -1465,6 +1794,8 @@ async def ws_endpoint(websocket: WebSocket):
                         "text": "Improved / Ultra need a cloud pool (e-INFRA / NIM); using the single local agent.",
                     })
 
+                turn: dict = {"stopped": False}
+
                 def chat_fn(txt=message_text, mdl=model, wd=working_dir, new=new_conv,
                            pp=prompt_profile, pm=permission_mode, roles=council_roles, ultra=use_ultra,
                            rmt=remote):
@@ -1480,11 +1811,13 @@ async def ws_endpoint(websocket: WebSocket):
                                                            remote=rmt)
                             else:
                                 result = continue_council_agent(state["messages"], txt, client,
-                                                                roles, wd, pm, ultra=ultra, remote=rmt)
+                                                                roles, wd, pm, ultra=ultra, remote=rmt,
+                                                                prompt_profile=pp)
                         elif new:
                             result = run_agent(txt, mdl, wd, client, pp, pm, remote=rmt)
                         else:
-                            result = continue_agent(state["messages"], txt, mdl, wd, client, pm, remote=rmt)
+                            result = continue_agent(state["messages"], txt, mdl, wd, client, pm,
+                                                    remote=rmt, prompt_profile=pp)
                         state["messages"] = result
                         # Persist a project-scoped task-outcome record so a later
                         # chat in the same working directory recalls it (the TUI
@@ -1507,12 +1840,16 @@ async def ws_endpoint(websocket: WebSocket):
                         # directly (orientation / planning), or mid-tool. Keep the
                         # history and note WHY it ends here, so the next turn
                         # continues instead of re-deriving the interrupted work.
-                        state["messages"] = _mark_stopped(state.get("messages") or [])
-                        loop.call_soon_threadsafe(
-                            event_q.put_nowait,
-                            {"type": "done", "iterations": 0, "stopped": True},
-                        )
+                        # A new conversation stopped before its first turn was
+                        # saved has no history of its own (no system prompt) —
+                        # start the next message fresh rather than "continuing" a
+                        # transcript that is only a stop notice.
+                        stopped = _mark_stopped(state.get("messages") or [])
+                        state["messages"] = stopped if any(
+                            m.get("role") == "system" for m in stopped) else []
+                        turn["stopped"] = True
                     except Exception as exc:
+                        turn["error"] = str(exc)
                         loop.call_soon_threadsafe(
                             event_q.put_nowait, {"type": "error", "text": str(exc)}
                         )
@@ -1520,6 +1857,11 @@ async def ws_endpoint(websocket: WebSocket):
                         interrupt.unregister()
                         state["agent_ident"] = None
                         display.clear_event_callback()
+                        # The ONE authoritative end-of-turn signal. `done` fires at
+                        # the end of every agent loop (council runs several per
+                        # turn) and `error` is also used for problems the agent
+                        # recovers from — neither means the turn is over.
+                        loop.call_soon_threadsafe(event_q.put_nowait, {"type": "turn_end", **turn})
                         loop.call_soon_threadsafe(event_q.put_nowait, {"type": "_sentinel"})
 
                 threading.Thread(target=chat_fn, daemon=True).start()
@@ -1611,6 +1953,7 @@ async def ws_endpoint(websocket: WebSocket):
                         )
                     finally:
                         display.clear_event_callback()
+                        loop.call_soon_threadsafe(event_q.put_nowait, {"type": "turn_end"})
                         loop.call_soon_threadsafe(event_q.put_nowait, {"type": "_sentinel"})
 
                 threading.Thread(target=parallel_fn, daemon=True).start()
@@ -1627,6 +1970,7 @@ async def ws_endpoint(websocket: WebSocket):
                         state["messages"], state.get("model", ""), existing_id,
                         working_dir=state.get("working_dir", "."),
                         remote_id=state.get("remote_id"),
+                        prompt_profile=state.get("prompt_profile") or "",
                     )
                     await send({"type": "chat_saved", "id": chat_id})
                 else:
@@ -1645,6 +1989,7 @@ async def ws_endpoint(websocket: WebSocket):
                     data = json.loads(f.read_text())
                     state["messages"] = data["messages"]
                     state["model"]    = data.get("model", state.get("model", ""))
+                    state["prompt_profile"] = data.get("prompt_profile") or None
 
                     # Restore the execution context this chat ran in: working
                     # directory and, if it was a remote (SSH) session, the same
@@ -1653,6 +1998,9 @@ async def ws_endpoint(websocket: WebSocket):
                     saved_wd = data.get("working_dir") or "."
                     saved_remote = data.get("remote_id")
                     effective_remote = saved_remote
+                    # `silent`: the client is re-syncing after a reconnect — its
+                    # screen is already right, so skip the notices.
+                    silent = bool(msg.get("silent"))
                     if saved_remote and get_remote(None, saved_remote) is None:
                         # The remote was removed since this chat was saved.
                         effective_remote = None
@@ -1666,7 +2014,7 @@ async def ws_endpoint(websocket: WebSocket):
                         })
                     state["working_dir"] = saved_wd
                     state["remote_id"] = effective_remote
-                    if effective_remote:
+                    if effective_remote and not silent:
                         remote = get_remote(None, effective_remote)
                         await send({
                             "type": "info",
@@ -1679,6 +2027,8 @@ async def ws_endpoint(websocket: WebSocket):
                     await send({"type": "chat_loaded",
                                 "id": chat_id,
                                 "messages": data["messages"],
+                                "display": display_history(data["messages"]),
+                                "silent": silent,
                                 "model": data.get("model", ""),
                                 "working_dir": saved_wd,
                                 "remote_id": effective_remote})
@@ -1801,214 +2151,25 @@ async def ws_endpoint(websocket: WebSocket):
 
             # ---- science (conversational research orchestrator) ----
             elif mtype == "science_load":
-                working_dir = msg.get("working_dir") or state["working_dir"]
-                state["working_dir"] = working_dir
-                from ..science.session import ScienceSession
-                # Same key science_message registers under — the client may send an
-                # unresolved path, and a hub lookup that misses would silently put
-                # us back to the old "frozen page" behaviour.
-                key = str(Path(working_dir).expanduser().resolve())
-                live = _get_hub(key) if key in _ACTIVE_SCIENCE else None
-                sess = ScienceSession.load(working_dir)
-                if sess is None and live is None:
-                    await send({"type": "science_state", "exists": False,
-                                "working_dir": working_dir})
-                else:
-                    # A session whose FIRST turn is still running has nothing on
-                    # disk yet (it saves at end of turn) — but there is a live run
-                    # to watch, so this is very much an existing session.
-                    if sess is not None:
-                        state["science_session"] = sess
-                    await send({"type": "science_state", "exists": True,
-                                "working_dir": working_dir,
-                                "task": sess.task if sess else "",
-                                "running": key in _ACTIVE_SCIENCE,
-                                "attached": live is not None,
-                                "history": _science_history(sess.messages) if sess else [],
-                                "snapshot": sess.snapshot() if sess else {}})
-                    # A turn is in flight for this session — attach to it. Without
-                    # this the page just sat on restored history while the run kept
-                    # going somewhere it could no longer be seen. The backlog is
-                    # replayed first, so re-attaching mid-run shows what was missed.
-                    if live is not None:
-                        await send({"type": "info",
-                                    "text": "▶ This session has a turn in progress — "
-                                            "reconnected to it."})
-                        state["running"] = True
-                        try:
-                            await stream_science(live)
-                        finally:
-                            state["running"] = False
-                        await send({"type": "science_done"})
+                await sci_load(msg)
 
             elif mtype in ("science_message", "science_comment"):
-                # The UI marks itself busy the moment it sends a turn, and only a
-                # "science_done" clears that. So EVERY path out of this branch —
-                # including the rejections below, which never start a turn — has
-                # to send one, or the tab stays stuck in a running state.
-                if state["running"]:
-                    await send({"type": "error", "text": "A task is already running."})
-                    await send({"type": "science_done"})
-                    continue
+                await sci_message(msg, mtype)
 
-                working_dir = msg.get("working_dir") or state["working_dir"]
-                state["working_dir"] = working_dir
+            elif mtype == "science_stop":
+                from ..science.channel import get_channel
+                ch = get_channel(sci_key(msg.get("working_dir") or state["working_dir"]))
+                if ch.agent_ident and interrupt.request_stop(ch.agent_ident):
+                    ch.publish({"type": "info", "text": "⏹ Stopping — killing the "
+                                "running command and ending the turn."})
 
-                cfg = load_config()
-                if state.get("backend"):
-                    cfg["backend"] = state["backend"]
-                _resolved = resolve_backend(cfg)
-                client = make_client(_resolved["api_key"], _resolved["base_url"])
-                from ..science.session import ScienceSession
-                from ..science.orchestrator import run_science_turn
-
-                sess = state.get("science_session")
-                want = str(Path(working_dir).expanduser().resolve())
-                if want in _ACTIVE_SCIENCE:
-                    await send({"type": "info",
-                                "text": "This session is still working — wait for the "
-                                        "current turn to finish before sending more."})
-                    await send({"type": "science_done"})
-                    continue
-                if sess is None or sess.working_dir != want:
-                    sess = ScienceSession.load(working_dir)
-
-                # Model resolution, most specific first: what this message asked
-                # for → what this SESSION was started with → the socket's model →
-                # config's default. The session tier matters: a refine comment and
-                # a reload both arrive without a model, and before this they fell
-                # through to default_model — silently moving the session onto a
-                # different (possibly dead) model than the one the user picked.
-                model = (msg.get("model") or getattr(sess, "model", "")
-                         or state.get("model") or cfg.get("default_model"))
-                # Pool of models the orchestrator may assign to spawned specialists.
-                specialist_models = [m for m in (msg.get("specialist_models") or [])
-                                     if isinstance(m, str) and m.strip()]
-                if not specialist_models:
-                    specialist_models = (list(getattr(sess, "specialist_models", []) or [])
-                                         or state.get("specialist_models") or [])
-                state["specialist_models"] = specialist_models
-
-                model, _swapped = _healthy_model(model, cfg)
-                if _swapped:
-                    await send({"type": "info", "text": (
-                        f"'{_swapped}' isn't available on this backend — running on "
-                        f"{model} instead.")})
-                state["model"] = model
-
-                remote_id = msg.get("remote_id") if "remote_id" in msg else state.get("remote_id")
-                state["remote_id"] = remote_id
-                remote = get_remote(None, remote_id) if remote_id else None
-
-                # Build the turn's user message (a comment refines a specific output).
-                refine_id = None
-                if mtype == "science_comment":
-                    if sess is None:
-                        await send({"type": "error", "text": "No science session for this directory."})
-                        await send({"type": "science_done"})
-                        continue
-                    comment = (msg.get("text") or "").strip()
-                    art = sess.get_artifact(msg.get("artifact_id", ""))
-                    if not comment:
-                        await send({"type": "science_done"})
-                        continue
-                    if art:
-                        refine_id = art.id
-                        sess.comment_artifact(art.id, comment)
-                        user_message = (
-                            f"The user commented on the presented output `{art.rel}` "
-                            f"(kind: {art.kind}): \"{comment}\". Refine that specific "
-                            f"output accordingly, then call present_output on the "
-                            f"updated file so they see the new version.")
-                    else:
-                        user_message = comment
-                    echo = comment
-                else:
-                    user_message = (msg.get("message") or "").strip()
-                    if not user_message:
-                        await send({"type": "science_done"})
-                        continue
-                    if sess is None:
-                        sess = ScienceSession(task=user_message,
-                                              working_dir=working_dir,
-                                              model=model or "")
-                    elif not sess.task:
-                        sess.task = user_message
-                    echo = user_message
-
-                sess.remote_id = remote_id
-                # Remember the models this session runs on, so a refine comment, a
-                # reload, or reopening it later all stay on the user's choice.
-                sess.model = model or sess.model
-                sess.specialist_models = specialist_models
-                state["science_session"] = sess
-                state["running"] = True
-                _ACTIVE_SCIENCE.add(want)
-                # Events go to the SESSION's hub, not to this socket, so a reload
-                # or a second tab can attach to the turn instead of losing it.
-                hub = _open_hub(want)
-                # Record in the history index up front, so the session is
-                # reopenable even mid-run (before the first turn saves).
-                try:
-                    from ..science import index as _science_index
-                    _science_index.record(sess.working_dir, sess.task or echo)
-                except Exception:
-                    pass
-                # Into the backlog too, so a viewer attaching later sees the
-                # message that started the turn.
-                hub.publish({"type": "science_user", "text": echo,
-                             "artifact_id": msg.get("artifact_id")})
-
-                def science_fn(um=user_message, sc=sess, cl=client, md=model,
-                               rmt=remote, wd_key=want, rid=refine_id,
-                               pool=specialist_models):
-                    display.set_event_callback(hub.publish)
-                    interrupt.register()
-                    state["agent_ident"] = threading.get_ident()
-                    # On the hub as well: a viewer that attached later must be able
-                    # to Stop the run it is watching.
-                    hub.agent_ident = threading.get_ident()
-                    try:
-                        run_science_turn(sc, um, cl, md,
-                                         permission_mode="autonomous",
-                                         emit=hub.publish, remote=rmt,
-                                         refresh_artifact_id=rid,
-                                         specialist_models=pool)
-                    except interrupt.StopRequested:
-                        # Record the stop in the session's own history, so the next
-                        # turn (and any later session) knows the work was cut short
-                        # by the user rather than finished or failed.
-                        try:
-                            sc.messages = _mark_stopped(sc.messages)
-                            sc.save()
-                        except Exception:
-                            pass
-                        hub.publish(
-                            {"type": "science_reply",
-                             "text": "⏹ Stopped by you. Any running command was killed; "
-                                     "the work so far is saved. Send a message to carry on.",
-                             "stopped": True})
-                    except Exception as exc:
-                        hub.publish({"type": "error", "text": str(exc)})
-                    finally:
-                        _ACTIVE_SCIENCE.discard(wd_key)
-                        interrupt.unregister()
-                        state["agent_ident"] = None
-                        display.clear_event_callback()
-                        # Ends the stream for EVERY attached viewer, not just the
-                        # one that started the turn.
-                        _close_hub(wd_key)
-
-                threading.Thread(target=science_fn, daemon=True).start()
-                try:
-                    await stream_science(hub)
-                finally:
-                    state["running"] = False
-                # Authoritative end-of-turn: the turn thread has finished (the
-                # sentinel drained). Recoverable mid-run errors (a model that
-                # stopped responding and got swapped for a fallback, a failed
-                # tool) must NOT be what puts the tab back to idle.
-                await send({"type": "science_done"})
+            # An agent's question / permission prompt answered while this
+            # connection is idle in the receive loop (a Science view never
+            # blocks it, unlike the chat stream).
+            elif mtype == "user_response":
+                resolve_user_response(str(msg.get("answer", "")))
+            elif mtype == "permission_response":
+                resolve_permission(bool(msg.get("allow", False)))
 
     except WebSocketDisconnect:
         pass
@@ -2017,3 +2178,7 @@ async def ws_endpoint(websocket: WebSocket):
             await websocket.send_json({"type": "error", "text": f"Server error: {exc}"})
         except Exception:
             pass
+    finally:
+        # Stop forwarding a Science session to a socket that is gone (the turn
+        # itself carries on; the next viewer picks it up from the channel).
+        await sci_unview()

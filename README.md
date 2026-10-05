@@ -158,13 +158,20 @@ sidebar, from lightest-touch to most autonomous:
 | Tab | What it is | Reach for it when… |
 |---|---|---|
 | 💬 **Chat** | A single agent you converse with — it plans, edits files, runs tools, one task at a time. Optional Improved / Ultra council for harder problems. | Everyday coding & analysis, quick questions, or iterating on one thing with tight, turn-by-turn control. |
-| 🧬 **Science** | A conversational **research orchestrator**. Chat-first, but it spins up specialists on demand, submits & polls HPC/cluster jobs, presents plots and tables **inline for comment-driven refinement**, curates messy data into **FAIR** datasets, and searches the literature. | Computational biology / data-heavy research where you want to stay in the loop and refine each output as it appears. |
+| 🧬 **Science** | A conversational **research orchestrator** in an IDE-style workspace. You **steer it live while it works**; it spins up specialists, submits & polls HPC/cluster jobs, shows plots and tables (even interim ones) **as they appear for comment-driven refinement**, curates messy data into **FAIR** datasets, and searches the literature. | Computational biology / data-heavy research where you want to stay in the loop and refine each output as it appears. |
 | 🧪 **Autonomous Research** | A **self-organizing team** run as a batch pipeline: a Director assembles up to 10 specialists, a Critic gates the plan, the team implements & reviews over rounds, then writes a self-contained HTML report. Runtime tool/agent "foundry". | You want to hand off a whole problem and let a team run it end-to-end (fully autonomous or with step-mode approval gates), then read the report. |
 
 All three share the same tools, models, and remote / MCP setup. Chat and
 Autonomous Research also have TUI/CLI entry points; Science is web-only.
 `http://127.0.0.1:7860/science` and `…/lab` open the Science and Autonomous
 Research tabs directly.
+
+> **Security.** The web UI can run commands, so it only accepts requests from
+> its own pages: a cross-site page can't reach its websocket, and while bound to
+> `127.0.0.1` (the default) requests must use a loopback hostname (this blocks
+> DNS-rebinding attacks). SSH tunnels to `localhost` work as-is. Behind a
+> reverse proxy or port forwarder with its own hostname, allow that name with
+> `OCTOSLAVE_ALLOWED_HOSTS=my-proxy.example.org` (comma-separated).
 
 ---
 
@@ -392,15 +399,25 @@ default. Full contract: [docs/RESEARCH.md](docs/RESEARCH.md).
 ### Science — a conversational research orchestrator
 
 Where the Lab runs a team as a batch pipeline, **Science** (web UI tab at `/science`) is
-**chat-first**: an orchestrator agent works *with* you turn by turn. It's built for computational
-biology and data-heavy research:
+**chat-first**: you talk with an orchestrator agent and it does the work, delegating to
+specialists. It's a small research IDE — sessions and a file explorer on the left, the
+conversation in the middle, a live workspace on the right — built for computational biology and
+data-heavy research:
 
+- **Steer it while it works** — the message box is never locked. Anything you send while agents
+  are running reaches the orchestrator at its very next step (and any running specialist as an
+  FYI), so you can redirect, add a constraint, or ask a question without stopping the run. Each
+  message shows whether it is queued, seen by a specialist, or picked up.
+- **See the work live** — a status line shows who is doing what right now; tool steps collapse
+  into compact groups you can expand; each specialist gets a live card with its current step,
+  its streaming notes, and its final report.
 - **Spins up specialists on demand** — like the Lab's Director, but interactively: it delegates a
   bounded sub-task to a focused agent (Structural Biologist, Data Wrangler, …) and folds the result
   back into the conversation.
-- **Presents outputs inline** — every plot, table, report, or dataset it produces appears as a card
-  in the chat. **Comment on it to refine** (the orchestrator regenerates that specific output), or
-  **edit** text/CSV/markdown outputs in place.
+- **Results appear as they exist** — every plot, table, report, or dataset (including *interim*
+  previews while a run continues, from the orchestrator or a specialist) opens in the workspace
+  and appears in the conversation. **Refine** one by commenting on it, or **edit** text/CSV/markdown
+  outputs in place. Any file in the explorer can be previewed too.
 - **Biology & chemistry tools** — the full domain toolbox (`bio_inspect`, `rdkit_describe`,
   UniProt / PubChem / ChEMBL / PDB / AlphaFold / GEO / ENA lookups, `pdf_ocr`); connect an NVIDIA
   BioNeMo model as an MCP server to call it as a tool.
@@ -415,8 +432,10 @@ biology and data-heavy research:
 ots web   →   http://127.0.0.1:7860/science
 ```
 
-State persists under `<working_dir>/science/` (`state.json`, `PROVENANCE.md`, job logs) so a
-session can be reopened and continued.
+State persists under `<working_dir>/science/` (`state.json`, the session timeline
+`feed.jsonl`, `PROVENANCE.md`, job logs), so a session reopens exactly as you left it — and a
+reload, a second tab, or switching sessions reattaches to a turn that is still running.
+Shortcuts: `⌘B` files, `⌘J` workspace, `/` focus the message box.
 
 ### Vault improve & batch
 

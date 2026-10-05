@@ -61,6 +61,11 @@ class Artifact:
     created_at: str = field(default_factory=_now)
     comments: list[dict] = field(default_factory=list)   # {text, at}
     provenance: str = ""          # short "how this was made" note
+    # An early look (a first-pass plot while the full run continues) rather than
+    # a finished result — shown with a "preview" badge until re-presented final.
+    interim: bool = False
+    # Who presented it: "" = the orchestrator, else the specialist's name.
+    by: str = ""
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
 
 
@@ -175,6 +180,8 @@ class ScienceSession:
                     a.caption = art.caption or a.caption
                     a.kind = art.kind or a.kind
                     a.provenance = art.provenance or a.provenance
+                    a.interim = art.interim
+                    a.by = art.by or a.by
                     a.created_at = _now()
                     self.touch()
                     self._save_locked()
@@ -217,11 +224,13 @@ class ScienceSession:
             "specialist_models": self.specialist_models,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
-            "messages": self.messages,
-            "specialists": [asdict(s) for s in self.specialists],
-            "jobs": [asdict(j) for j in self.jobs],
-            "artifacts": [asdict(a) for a in self.artifacts],
-            "provenance": self.provenance,
+            # Shallow copies: taken in one step, so another thread appending
+            # meanwhile cannot change what is being written.
+            "messages": list(self.messages),
+            "specialists": [asdict(s) for s in list(self.specialists)],
+            "jobs": [asdict(j) for j in list(self.jobs)],
+            "artifacts": [asdict(a) for a in list(self.artifacts)],
+            "provenance": list(self.provenance),
             "remote_id": self.remote_id,
         }
 
@@ -231,28 +240,109 @@ class ScienceSession:
 
     def _save_locked(self) -> None:
         self.science_dir.mkdir(parents=True, exist_ok=True)
+        # Specialists run on their own threads and save their records while the
+        # orchestrator is still extending its message history (which it does
+        # without this lock). The encoder can then meet a dict or list mid-change
+        # and raise; that is transient, so take a fresh snapshot and retry. If it
+        # keeps happening, skip this write — everything is still in memory and
+        # the next save catches up.
+        for _ in range(5):
+            try:
+                text = json.dumps(self.to_dict(), indent=2)
+                break
+            except RuntimeError:
+                time.sleep(0.02)
+        else:
+            return
         tmp = self.state_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(self.to_dict(), indent=2))
+        tmp.write_text(text)
         os.replace(tmp, self.state_path)
 
     def _write_provenance_md_locked(self) -> None:
+        """Rewrite PROVENANCE.md.
+
+        The point of this file is that someone opening it cold can tell what was
+        produced and how to regenerate it. So it leads with a table of every
+        output and whether its method is on record, names each entry by its file
+        rather than by a raw path, and says plainly which fields each entry holds.
+        Outputs with nothing recorded are listed too — a silent gap is the one
+        thing a provenance record must not have.
+        """
+        by_art: dict[str, dict] = {}
+        for e in self.provenance:
+            by_art[str(e.get("artifact", "")).strip()] = e
+
+        def _name(path: str) -> str:
+            path = (path or "").strip()
+            if not path:
+                return "(unnamed output)"
+            first = path.split(",")[0].split(" ")[0].rstrip("/")
+            base = first.rsplit("/", 1)[-1]
+            return base or first
+
         lines = [
-            "# Provenance & Reproducibility Ledger",
+            "# Provenance",
             "",
-            f"_Session started {self.created_at} — working dir `{self.working_dir}`._",
+            f"How every output in this session was produced — what it was made "
+            f"from, by which method, and when — so that it can be regenerated or "
+            f"checked without asking anyone.",
             "",
-            "FAIR record of every derived output: what was produced, from which",
-            "inputs, by which method. Regenerating any artifact should require only",
-            "the inputs and method named below.",
+            f"- **Session:** {self.task.splitlines()[0][:120] if self.task else '(untitled)'}",
+            f"- **Working directory:** `{self.working_dir}`",
+            f"- **Started:** {self.created_at}  ·  **Last updated:** {self.updated_at}",
+            "",
+            "Each entry below records:",
+            "",
+            "| field | meaning |",
+            "| --- | --- |",
+            "| **output** | the file this entry is about, and where it lives |",
+            "| **made** | when it was produced |",
+            "| **from** | the inputs it was derived from (data, structures, "
+            "accessions, earlier outputs) |",
+            "| **how** | the method: the steps, tools and parameters used |",
+            "| **notes** | what the result shows, and any caveat or limitation |",
             "",
         ]
-        for e in self.provenance:
-            lines.append(f"## {e.get('artifact', '(unnamed output)')}")
-            lines.append(f"- **when:** {e.get('at', '')}")
-            if e.get("method"):
-                lines.append(f"- **method:** {e['method']}")
-            if e.get("inputs"):
-                lines.append(f"- **inputs:** {e['inputs']}")
+
+        # Contents: every output the session surfaced, plus any entry recorded
+        # for something that was never presented.
+        rows: list[tuple[str, str, str, bool]] = []
+        seen: set[str] = set()
+        for a in self.artifacts:
+            key = a.rel or a.path
+            seen.add(key)
+            rec = by_art.get(key) or by_art.get(a.path) or by_art.get(a.rel)
+            rows.append((_name(key), key, a.kind, rec is not None))
+        for key in by_art:
+            if key and key not in seen and key not in {a.path for a in self.artifacts}:
+                rows.append((_name(key), key, "—", True))
+        if rows:
+            lines += ["## Outputs", "",
+                      "| output | kind | method recorded |", "| --- | --- | --- |"]
+            for name, key, kind, has in rows:
+                lines.append(f"| `{key}` | {kind} | {'yes' if has else '**not yet**'} |")
+            missing = [k for _, k, _, has in rows if not has]
+            lines.append("")
+            if missing:
+                lines.append(
+                    f"> {len(missing)} output(s) above have no method recorded yet, "
+                    f"so they cannot be reproduced from this file alone.")
+                lines.append("")
+
+        if not self.provenance:
+            lines += ["## Entries", "", "_Nothing recorded yet._", ""]
+            self.provenance_path.write_text("\n".join(lines))
+            return
+
+        lines += ["## Entries", ""]
+        for i, e in enumerate(self.provenance, 1):
+            art = str(e.get("artifact", "")).strip()
+            lines.append(f"### {i}. {_name(art)}")
+            lines.append("")
+            lines.append(f"- **output:** `{art or '(unnamed)'}`")
+            lines.append(f"- **made:** {e.get('at', '(unknown)')}")
+            lines.append(f"- **from:** {e.get('inputs') or '_not recorded_'}")
+            lines.append(f"- **how:** {e.get('method') or '_not recorded_'}")
             if e.get("notes"):
                 lines.append(f"- **notes:** {e['notes']}")
             lines.append("")
@@ -294,6 +384,7 @@ class ScienceSession:
             "jobs": [asdict(j) for j in self.jobs],
             "artifacts": [asdict(a) for a in self.artifacts],
             "provenance": self.provenance,
+            "remote_id": self.remote_id,
         }
 
 

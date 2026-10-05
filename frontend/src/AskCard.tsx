@@ -11,7 +11,8 @@ import { useEffect, useRef, useState } from "react";
 // `expires` is an absolute timestamp derived from the server's own timeout, so
 // the countdown reflects when the agent will actually give up rather than a
 // number the UI invented.
-export type Ask = { question: string; options: string[]; expires: number };
+// ``who`` names the agent asking when it is not the orchestrator itself.
+export type Ask = { question: string; options: string[]; expires: number; who?: string };
 
 export function askFromEvent(m: any): Ask {
   return {

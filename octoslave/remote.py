@@ -34,7 +34,8 @@ class RemoteConfig:
     """Normalized connection settings for one remote host."""
 
     def __init__(self, id: str, host: str, remote_dir: str, user: str | None = None,
-                 port: int = 22, name: str | None = None, identity_file: str | None = None):
+                 port: int = 22, name: str | None = None, identity_file: str | None = None,
+                 setup: str | None = None):
         self.id = id
         self.host = host
         self.remote_dir = remote_dir or "."
@@ -42,6 +43,9 @@ class RemoteConfig:
         self.port = int(port or 22)
         self.name = name or id or host
         self.identity_file = identity_file or ""
+        # Shell snippet run before every command on this host (credential
+        # renewal, a base module, PATH for a scheduler). See config.
+        self.setup = (setup or "").strip()
 
     @classmethod
     def from_dict(cls, d: dict) -> "RemoteConfig":
@@ -53,6 +57,7 @@ class RemoteConfig:
             port=d.get("port", 22),
             name=d.get("name", ""),
             identity_file=d.get("identity_file", ""),
+            setup=d.get("setup", "") or d.get("init", ""),
         )
 
     @property
@@ -66,7 +71,7 @@ class RemoteConfig:
 
     @property
     def _key(self) -> str:
-        return f"{self.target}|{self.port}|{self.identity_file}"
+        return f"{self.target}|{self.port}|{self.identity_file}|{self.setup}"
 
 
 # ---------------------------------------------------------------------------
@@ -165,15 +170,41 @@ class RemoteSession:
 
     # -- command execution -------------------------------------------------
 
+    def wrap(self, command: str, cwd: str | None) -> str:
+        """``command`` as it is actually sent to the host.
+
+        Three things are added, because leaving them to each caller is what makes
+        remote work fiddly:
+
+        * a fixed ``C`` locale. ssh forwards the local ``LANG``/``LC_*``, which a
+          remote host often does not have — every command then prints a locale
+          warning to stderr (noise that reads like a failure), and tool output
+          becomes locale-dependent. Both go away by pinning it.
+        * the host's ``setup`` snippet, if configured (credential renewal, a base
+          module). Its own output is discarded so it cannot corrupt the result.
+        * a ``cd`` that explains itself. ``cd x && cmd`` on a missing directory
+          gives a bare shell error and a non-zero exit that looks like the
+          command failed, so say plainly which directory was not there.
+        """
+        parts = ["export LC_ALL=C LANG=C"]
+        if self.cfg.setup:
+            parts.append(f"{{ {self.cfg.setup}; }} >/dev/null 2>&1 || true")
+        if cwd:
+            q = shlex.quote(cwd)
+            parts.append(
+                f"cd {q} 2>/dev/null || {{ echo \"octoslave: no such directory on "
+                f"{self.cfg.name}: {cwd}\" >&2; exit 125; }}")
+        parts.append(command)
+        return "; ".join(parts)
+
     def run(self, command: str, cwd: str | None, timeout: int = 300) -> tuple[str, str, int]:
         """Run ``command`` on the remote host inside ``cwd``.
 
-        Returns (stdout, stderr, returncode). A timeout yields rc 124.
+        Returns (stdout, stderr, returncode). A timeout yields rc 124, and a
+        missing ``cwd`` rc 125 with a message naming the directory.
         """
-        cd = f"cd {shlex.quote(cwd)} && " if cwd else ""
-        wrapped = cd + command
         try:
-            r = self._ssh(wrapped, timeout=timeout)
+            r = self._ssh(self.wrap(command, cwd), timeout=timeout)
         except subprocess.TimeoutExpired:
             return "", f"(remote command timed out after {timeout}s)", 124
         except FileNotFoundError:

@@ -8,7 +8,8 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/css/styles.css?v=20260828a">
+  <link rel="stylesheet" href="/static/css/styles.css?v=20260928a">
+  <link rel="stylesheet" href="/static/css/rail.css?v=20260928a">
 </head>
 <body>
 
@@ -110,11 +111,6 @@
       <div class="config-divider"></div>
       <select id="chat-profile-select" title="Prompt Profile">
         <option value="">Loading profiles…</option>
-      </select>
-      <select id="chat-permission-select" title="Permission Mode" style="display:none;">
-        <option value="autonomous">Autonomous</option>
-        <option value="controlled">Controlled</option>
-        <option value="supervised">Supervised</option>
       </select>
       <div class="config-divider"></div>
       <div class="mode-seg" id="mode-seg" role="radiogroup" data-mode="improved"
@@ -284,229 +280,291 @@
 
   <!-- ── TAB: SETTINGS ─────────────────────────────────────── -->
   <div class="tab-pane" id="tab-settings">
-    <div class="settings-card">
-      <div class="settings-card-header">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="12" cy="12" r="3"/>
-          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l-.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-        </svg>
-        <h2>Configuration</h2>
-      </div>
+    <div class="settings-layout">
 
-      <div class="settings-note">
-        Built-in backend keys (e-INFRA CZ, NVIDIA NIM) are read-only here —
-        edit <code>~/.octoslave/config.json</code> or use environment variables to change them.
-        To use any other OpenAI-compatible API, add it as a custom provider below.
-      </div>
+      <!-- Section menu -->
+      <nav class="settings-nav" aria-label="Settings sections">
+        <div class="settings-nav-title">Settings</div>
+        <button class="settings-nav-item active" data-section="overview">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+          <span>Overview</span>
+        </button>
+        <button class="settings-nav-item" data-section="providers">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
+          <span>Providers &amp; models</span>
+        </button>
+        <button class="settings-nav-item" data-section="remotes">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+          <span>Remote hosts</span>
+          <span class="settings-nav-count" id="settings-count-remotes"></span>
+        </button>
+        <button class="settings-nav-item" data-section="tools">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+          <span>Tools (MCP)</span>
+          <span class="settings-nav-count" id="settings-count-tools"></span>
+        </button>
+      </nav>
 
-      <div class="settings-field">
-        <label>Active Backend</label>
-        <input type="text" id="settings-backend" placeholder="—" readonly>
-      </div>
-      <div class="settings-field">
-        <label>e-INFRA CZ API Key</label>
-        <input type="password" id="settings-api-key" placeholder="not set" readonly>
-      </div>
-      <div class="settings-field">
-        <label>e-INFRA CZ Base URL</label>
-        <input type="text" id="settings-base-url" placeholder="—" readonly>
-      </div>
-      <div class="settings-field">
-        <label>NVIDIA NIM API Key</label>
-        <input type="password" id="settings-nim-api-key" placeholder="not set" readonly>
-      </div>
-      <div class="settings-field">
-        <label>Default Model</label>
-        <input type="text" id="settings-model" placeholder="—" readonly>
-      </div>
-      <div class="settings-field">
-        <label>Working Directory</label>
-        <input type="text" id="settings-working-dir" placeholder="—" readonly>
-      </div>
+      <div class="settings-content" id="settings-content">
 
-      <button class="btn-primary" id="settings-refresh-btn">Refresh Config</button>
-    </div>
-
-    <!-- ── Remote hosts (SSH) card ───────────────────────────── -->
-    <div class="settings-card settings-card-wide" id="remotes-card">
-      <div class="settings-card-header">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="2" y="3" width="20" height="14" rx="2"/>
-          <path d="M8 21h8M12 17v4"/>
-        </svg>
-        <h2>Remote hosts (SSH)</h2>
-      </div>
-
-      <div class="settings-note">
-        Run the agent's tools on a remote machine over SSH — bash and file
-        operations execute on the host you configure here. Uses your system
-        <code>ssh</code> (keys / <code>~/.ssh/config</code> / agent). Pick
-        <strong>Remote</strong> next to the working-directory selector to switch.
-      </div>
-
-      <div id="remotes-list" class="remotes-list"></div>
-
-      <div class="remotes-form">
-        <div class="settings-field-row">
-          <div class="settings-field"><label>Id</label><input type="text" id="remote-id" placeholder="gpu01"></div>
-          <div class="settings-field"><label>Name</label><input type="text" id="remote-name" placeholder="GPU box"></div>
-        </div>
-        <div class="settings-field-row">
-          <div class="settings-field"><label>Host</label><input type="text" id="remote-host" placeholder="gpu.example.org"></div>
-          <div class="settings-field"><label>User</label><input type="text" id="remote-user" placeholder="(ssh default)"></div>
-          <div class="settings-field settings-field-narrow"><label>Port</label><input type="number" id="remote-port" value="22"></div>
-        </div>
-        <div class="settings-field">
-          <label>Identity file (private key, optional)</label>
-          <input type="text" id="remote-identity" placeholder="~/.ssh/id_ed25519">
-        </div>
-        <div class="settings-note settings-note-sub">
-          After connecting, pick the working folder with the <strong>Browse…</strong>
-          button next to the working-directory selector — it navigates the remote host.
-        </div>
-        <div class="remotes-form-actions">
-          <button class="btn-secondary btn-sm" id="remote-test-btn">Test connection</button>
-          <button class="btn-primary btn-sm" id="remote-add-btn">Add remote</button>
-          <span class="remote-test-status" id="remote-test-status"></span>
-        </div>
-      </div>
-    </div>
-
-    <!-- ── Custom Providers card ─────────────────────────────── -->
-    <div class="settings-card settings-card-wide">
-      <div class="settings-card-header">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
-          <polyline points="3.27 6.96 12 12.01 20.73 6.96"/>
-          <line x1="12" y1="22.08" x2="12" y2="12"/>
-        </svg>
-        <h2>Custom Providers</h2>
-      </div>
-
-      <div class="settings-note">
-        Bring your own OpenAI-compatible endpoint (OpenAI, Together AI, Groq,
-        a self-hosted vLLM, etc.). Once added it appears in the
-        <strong>Provider</strong> dropdown alongside the built-in backends.
-      </div>
-
-      <div id="providers-list" class="providers-list"></div>
-
-      <details class="provider-add-form" id="provider-add-form">
-        <summary class="provider-add-summary">+ Add a provider</summary>
-        <div class="provider-add-body">
-          <div class="settings-field">
-            <label>ID <span class="provider-hint">(short slug, e.g. <code>openai</code>)</span></label>
-            <input type="text" id="prov-id" placeholder="openai" autocomplete="off">
-          </div>
-          <div class="settings-field">
-            <label>Display name</label>
-            <input type="text" id="prov-name" placeholder="OpenAI" autocomplete="off">
-          </div>
-          <div class="settings-field">
-            <label>Base URL <span class="provider-hint">(must end with <code>/v1</code>)</span></label>
-            <input type="text" id="prov-base-url" placeholder="https://api.openai.com/v1" autocomplete="off">
-          </div>
-          <div class="settings-field">
-            <label>API key <span class="provider-hint">(leave blank for unauthenticated endpoints)</span></label>
-            <input type="password" id="prov-api-key" placeholder="sk-..." autocomplete="off">
-          </div>
-          <div class="settings-field">
-            <label>Default model</label>
-            <input type="text" id="prov-default-model" placeholder="gpt-4o" autocomplete="off">
-          </div>
-          <div class="settings-field">
-            <label>Known models <span class="provider-hint">(comma-separated, optional — used if /v1/models is unavailable)</span></label>
-            <input type="text" id="prov-models" placeholder="gpt-4o, gpt-4o-mini" autocomplete="off">
-          </div>
-          <div class="settings-field">
-            <label>Context window <span class="provider-hint">(tokens, optional — only if the provider doesn't advertise one; blank = auto-detect)</span></label>
-            <input type="number" id="prov-context-window" placeholder="e.g. 131072" min="0" step="1024" autocomplete="off">
-          </div>
-          <div class="provider-form-actions">
-            <button class="btn-secondary btn-sm" id="prov-test-btn" type="button">Test connection</button>
-            <button class="btn-primary btn-sm" id="prov-save-btn" type="button">Save provider</button>
-            <span id="prov-form-status" class="provider-form-status"></span>
-          </div>
-        </div>
-      </details>
-    </div>
-
-    <!-- ── MCP servers card (wire in external tools) ─────────────── -->
-    <div class="settings-card settings-card-wide">
-      <div class="settings-card-header">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="2" y="3" width="20" height="14" rx="2"/>
-          <line x1="8" y1="21" x2="16" y2="21"/>
-          <line x1="12" y1="17" x2="12" y2="21"/>
-          <circle cx="8" cy="10" r="1.4"/><circle cx="16" cy="10" r="1.4"/>
-          <line x1="9.4" y1="10" x2="14.6" y2="10"/>
-        </svg>
-        <h2>MCP Tools</h2>
-        <button class="btn-secondary btn-sm" id="mcp-reconnect-btn" type="button" style="margin-left:auto;">Reconnect all</button>
-      </div>
-
-      <div class="settings-note">
-        Wire in external tools via <strong>Model Context Protocol</strong> servers — git, GitHub,
-        a browser, databases, live docs, and more. Installed tools become available to the agent
-        in chat and research, namespaced <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>.
-      </div>
-
-      <h3 class="settings-subhead">Your servers</h3>
-      <div id="mcp-servers-list" class="mcp-servers-list"></div>
-
-      <h3 class="settings-subhead">Catalog <span class="provider-hint">— recommended servers, one-click install</span></h3>
-      <div id="mcp-registry-list" class="mcp-registry-list"></div>
-
-      <details class="provider-add-form" id="mcp-add-form">
-        <summary class="provider-add-summary">+ Add a custom server</summary>
-        <div class="provider-add-body">
-          <div class="settings-field">
-            <label>Name <span class="provider-hint">(unique, e.g. <code>my-tool</code>)</span></label>
-            <input type="text" id="mcp-name" placeholder="my-tool" autocomplete="off">
-          </div>
-          <div class="settings-field">
-            <label>Transport</label>
-            <select id="mcp-transport">
-              <option value="stdio">stdio (local subprocess)</option>
-              <option value="http">http (remote URL)</option>
-            </select>
-          </div>
-          <div id="mcp-stdio-fields">
-            <div class="settings-field">
-              <label>Command <span class="provider-hint">(e.g. <code>npx</code> or <code>uvx</code>)</span></label>
-              <input type="text" id="mcp-command" placeholder="npx" autocomplete="off">
+        <!-- ── Overview ─────────────────────────────────────── -->
+        <section class="settings-section active" data-section="overview">
+          <header class="settings-section-head">
+            <div>
+              <h2>Overview</h2>
+              <p class="settings-desc">What OctoSlave is using right now, and the defaults for new chats.</p>
             </div>
-            <div class="settings-field">
-              <label>Arguments <span class="provider-hint">(space-separated)</span></label>
-              <input type="text" id="mcp-args" placeholder="-y @scope/some-mcp-server" autocomplete="off">
-            </div>
-            <div class="settings-field">
-              <label>Env <span class="provider-hint">(KEY=VALUE, comma-separated, optional)</span></label>
-              <input type="text" id="mcp-env" placeholder="API_KEY=xxx" autocomplete="off">
+            <button class="btn-secondary btn-sm" id="settings-refresh-btn" title="Re-read the configuration from disk">Reload</button>
+          </header>
+
+          <div class="settings-panel">
+            <div class="settings-panel-title">Connection</div>
+            <dl class="settings-kv">
+              <dt>Active provider</dt>
+              <dd><span id="settings-backend" class="kv-strong">—</span>
+                  <button class="btn-link" type="button" data-goto="providers">Change</button></dd>
+              <dt>Default model</dt>
+              <dd><span id="settings-model" class="kv-mono">—</span></dd>
+              <dt>e-INFRA CZ API key</dt>
+              <dd><span id="settings-api-key" class="kv-status" data-state="unset">Not set</span></dd>
+              <dt>e-INFRA CZ endpoint</dt>
+              <dd><span id="settings-base-url" class="kv-mono">—</span></dd>
+              <dt>NVIDIA NIM API key</dt>
+              <dd><span id="settings-nim-api-key" class="kv-status" data-state="unset">Not set</span></dd>
+              <dt>Working folder</dt>
+              <dd><span id="settings-working-dir" class="kv-mono">Not chosen yet</span></dd>
+            </dl>
+            <div class="settings-help">
+              API keys for the built-in providers are kept in
+              <code>~/.octoslave/config.json</code> and aren't editable here. Change them with
+              <code>ots config</code> in a terminal (or the <code>OCTOSLAVE_API_KEY</code>
+              environment variable), then press <b>Reload</b>. For any other
+              OpenAI-compatible API, add it under <a href="#" data-goto="providers">Providers &amp; models</a>.
             </div>
           </div>
-          <div id="mcp-http-fields" style="display:none;">
-            <div class="settings-field">
-              <label>URL</label>
-              <input type="text" id="mcp-url" placeholder="https://host/mcp" autocomplete="off">
-            </div>
-            <div class="settings-field">
-              <label>Headers <span class="provider-hint">(KEY=VALUE, comma-separated, optional)</span></label>
-              <input type="text" id="mcp-headers" placeholder="Authorization=Bearer xxx" autocomplete="off">
+
+          <div class="settings-panel">
+            <div class="settings-panel-title">Chat defaults</div>
+            <div class="settings-row">
+              <div class="settings-row-text">
+                <div class="settings-row-label">Permission mode</div>
+                <div class="settings-row-desc" id="settings-permission-desc">
+                  The agent works without asking. Best when you trust the task.
+                </div>
+              </div>
+              <select id="chat-permission-select" class="settings-select" title="Permission mode">
+                <option value="autonomous">Autonomous</option>
+                <option value="supervised">Supervised</option>
+                <option value="controlled">Controlled</option>
+              </select>
             </div>
           </div>
-          <div class="provider-form-actions">
-            <button class="btn-primary btn-sm" id="mcp-add-btn" type="button">Add server</button>
-            <span id="mcp-form-status" class="provider-form-status"></span>
+        </section>
+
+        <!-- ── Providers & models ───────────────────────────── -->
+        <section class="settings-section" data-section="providers">
+          <header class="settings-section-head">
+            <div>
+              <h2>Providers &amp; models</h2>
+              <p class="settings-desc">Where the models come from. Pick one with <b>Use</b>; it becomes the
+                Provider in the chat bar. Add any OpenAI-compatible endpoint (OpenAI, Groq, Together AI,
+                a self-hosted vLLM…) as a custom provider.</p>
+            </div>
+          </header>
+
+          <div id="providers-list" class="providers-list"></div>
+
+          <details class="settings-form" id="provider-add-form">
+            <summary><span class="settings-form-plus">+</span> Add a custom provider</summary>
+            <div class="settings-form-body">
+              <div class="settings-field-row">
+                <div class="settings-field">
+                  <label for="prov-name">Display name</label>
+                  <input type="text" id="prov-name" placeholder="OpenAI" autocomplete="off">
+                </div>
+                <div class="settings-field">
+                  <label for="prov-id">ID <span class="provider-hint">short slug, e.g. <code>openai</code></span></label>
+                  <input type="text" id="prov-id" placeholder="openai" autocomplete="off">
+                </div>
+              </div>
+              <div class="settings-field">
+                <label for="prov-base-url">Base URL <span class="provider-hint">ends with <code>/v1</code></span></label>
+                <input type="text" id="prov-base-url" placeholder="https://api.openai.com/v1" autocomplete="off">
+              </div>
+              <div class="settings-field">
+                <label for="prov-api-key">API key <span class="provider-hint">leave blank if the endpoint needs none</span></label>
+                <input type="password" id="prov-api-key" placeholder="sk-…" autocomplete="off">
+              </div>
+              <div class="settings-field-row">
+                <div class="settings-field">
+                  <label for="prov-default-model">Default model</label>
+                  <input type="text" id="prov-default-model" placeholder="gpt-4o" autocomplete="off">
+                </div>
+                <div class="settings-field">
+                  <label for="prov-context-window">Context window <span class="provider-hint">tokens, optional</span></label>
+                  <input type="number" id="prov-context-window" placeholder="auto-detect" min="0" step="1024" autocomplete="off">
+                </div>
+              </div>
+              <div class="settings-field">
+                <label for="prov-models">Known models <span class="provider-hint">optional, comma-separated. Used if the endpoint can't list its models</span></label>
+                <input type="text" id="prov-models" placeholder="gpt-4o, gpt-4o-mini" autocomplete="off">
+              </div>
+              <div class="provider-form-actions">
+                <button class="btn-primary btn-sm" id="prov-save-btn" type="button">Save provider</button>
+                <button class="btn-secondary btn-sm" id="prov-test-btn" type="button">Test connection</button>
+                <span id="prov-form-status" class="provider-form-status"></span>
+              </div>
+            </div>
+          </details>
+        </section>
+
+        <!-- ── Remote hosts ─────────────────────────────────── -->
+        <section class="settings-section" data-section="remotes" id="remotes-card">
+          <header class="settings-section-head">
+            <div>
+              <h2>Remote hosts</h2>
+              <p class="settings-desc">Run the agent's commands and file operations on another machine over
+                SSH. OctoSlave uses your system <code>ssh</code>, so your keys, <code>~/.ssh/config</code>
+                and agent all apply. Switch a chat to a host with the <b>Local / Remote</b> toggle next to
+                the working folder.</p>
+            </div>
+          </header>
+
+          <div id="remotes-list" class="remotes-list"></div>
+
+          <details class="settings-form" id="remote-add-form">
+            <summary><span class="settings-form-plus">+</span> Add a remote host</summary>
+            <div class="settings-form-body">
+              <div class="settings-field-row">
+                <div class="settings-field">
+                  <label for="remote-name">Name</label>
+                  <input type="text" id="remote-name" placeholder="GPU box">
+                </div>
+                <div class="settings-field">
+                  <label for="remote-id">ID <span class="provider-hint">short slug</span></label>
+                  <input type="text" id="remote-id" placeholder="gpu01">
+                </div>
+              </div>
+              <div class="settings-field-row">
+                <div class="settings-field">
+                  <label for="remote-host">Host</label>
+                  <input type="text" id="remote-host" placeholder="gpu.example.org">
+                </div>
+                <div class="settings-field">
+                  <label for="remote-user">User <span class="provider-hint">optional</span></label>
+                  <input type="text" id="remote-user" placeholder="ssh default">
+                </div>
+                <div class="settings-field settings-field-narrow">
+                  <label for="remote-port">Port</label>
+                  <input type="number" id="remote-port" value="22">
+                </div>
+              </div>
+              <div class="settings-field">
+                <label for="remote-identity">Private key <span class="provider-hint">optional; defaults to your ssh setup</span></label>
+                <input type="text" id="remote-identity" placeholder="~/.ssh/id_ed25519">
+              </div>
+              <div class="settings-field">
+                <label for="remote-setup">Run first on every command <span class="provider-hint">optional</span></label>
+                <input type="text" id="remote-setup" placeholder="kinit -R">
+                <p class="settings-help">
+                  Shell command run before each command on this host — renewing a ticket,
+                  loading a base module, setting a PATH. Saves the agent having to remember
+                  it, and its own output is discarded.
+                </p>
+              </div>
+              <div class="remotes-form-actions">
+                <button class="btn-primary btn-sm" id="remote-add-btn">Add host</button>
+                <button class="btn-secondary btn-sm" id="remote-test-btn">Test connection</button>
+                <span class="remote-test-status" id="remote-test-status"></span>
+              </div>
+              <div class="settings-help">
+                Once connected, choose the working folder with <b>Browse…</b> next to the working-folder
+                picker in Chat. It browses the remote machine.
+              </div>
+            </div>
+          </details>
+        </section>
+
+        <!-- ── Tools (MCP) ──────────────────────────────────── -->
+        <section class="settings-section" data-section="tools">
+          <header class="settings-section-head">
+            <div>
+              <h2>Tools (MCP)</h2>
+              <p class="settings-desc">Give the agent extra tools through <b>Model Context Protocol</b>
+                servers: git, GitHub, a browser, databases, live documentation and more. Installed tools
+                are available in Chat, Science and Autonomous Research.</p>
+            </div>
+          </header>
+
+          <div class="settings-subhead-row">
+            <h3 class="settings-subhead">Installed</h3>
+            <button class="btn-secondary btn-sm" id="mcp-reconnect-btn" type="button">Reconnect all</button>
           </div>
-        </div>
-      </details>
+          <div id="mcp-servers-list" class="mcp-servers-list"></div>
+
+          <div class="settings-subhead-row">
+            <h3 class="settings-subhead">Catalog</h3>
+            <input type="search" id="mcp-catalog-search" class="settings-search" placeholder="Search tools…" autocomplete="off">
+          </div>
+          <div id="mcp-registry-list" class="mcp-registry-list"></div>
+
+          <details class="settings-form" id="mcp-add-form">
+            <summary><span class="settings-form-plus">+</span> Add a custom server</summary>
+            <div class="settings-form-body">
+              <div class="settings-field-row">
+                <div class="settings-field">
+                  <label for="mcp-name">Name <span class="provider-hint">unique, e.g. <code>my-tool</code></span></label>
+                  <input type="text" id="mcp-name" placeholder="my-tool" autocomplete="off">
+                </div>
+                <div class="settings-field">
+                  <label for="mcp-transport">Runs as</label>
+                  <select id="mcp-transport">
+                    <option value="stdio">Local program (stdio)</option>
+                    <option value="http">Remote URL (http)</option>
+                  </select>
+                </div>
+              </div>
+              <div id="mcp-stdio-fields">
+                <div class="settings-field-row">
+                  <div class="settings-field settings-field-narrow2">
+                    <label for="mcp-command">Command</label>
+                    <input type="text" id="mcp-command" placeholder="npx" autocomplete="off">
+                  </div>
+                  <div class="settings-field">
+                    <label for="mcp-args">Arguments <span class="provider-hint">space-separated</span></label>
+                    <input type="text" id="mcp-args" placeholder="-y @scope/some-mcp-server" autocomplete="off">
+                  </div>
+                </div>
+                <div class="settings-field">
+                  <label for="mcp-env">Environment <span class="provider-hint">optional, KEY=VALUE, comma-separated</span></label>
+                  <input type="text" id="mcp-env" placeholder="API_KEY=xxx" autocomplete="off">
+                </div>
+              </div>
+              <div id="mcp-http-fields" style="display:none;">
+                <div class="settings-field">
+                  <label for="mcp-url">URL</label>
+                  <input type="text" id="mcp-url" placeholder="https://host/mcp" autocomplete="off">
+                </div>
+                <div class="settings-field">
+                  <label for="mcp-headers">Headers <span class="provider-hint">optional, KEY=VALUE, comma-separated</span></label>
+                  <input type="text" id="mcp-headers" placeholder="Authorization=Bearer xxx" autocomplete="off">
+                </div>
+              </div>
+              <div class="provider-form-actions">
+                <button class="btn-primary btn-sm" id="mcp-add-btn" type="button">Add server</button>
+                <span id="mcp-form-status" class="provider-form-status"></span>
+              </div>
+            </div>
+          </details>
+        </section>
+
+      </div>
     </div>
   </div>
 
 </main>
 
-<script type="module" src="/static/js/app.js?v=20260828a"></script>
+<script type="module" src="/static/js/app.js?v=20261002a"></script>
 
 </body>
 </html>

@@ -969,7 +969,8 @@ def load_config() -> dict:
         "role_models_ollama": {},
         "custom_providers": [],     # list of {id, name, base_url, api_key, default_model, models?}
         "mcp_servers": [],          # list of {name, enabled, command/args/env | url/headers}
-        "remotes": [],              # list of {id, name, host, user, port, remote_dir, identity_file}
+        # list of {id, name, host, user, port, remote_dir, identity_file, setup}
+        "remotes": [],
     }
     # Env vars override config file
     if os.environ.get("OCTOSLAVE_API_KEY"):
@@ -1274,6 +1275,10 @@ def _normalize_remote(r: dict) -> dict:
     # on connect. The working dir is then chosen by browsing the remote host.
     remote_dir = (r.get("remote_dir") or "").strip()
     identity_file = (r.get("identity_file") or "").strip()
+    # Optional shell snippet run before EVERY command on this host: renewing a
+    # credential, loading a base module, setting PATH for a scheduler. Without
+    # it an agent ends up prefixing each command by hand (and forgetting to).
+    setup = (r.get("setup") or r.get("init") or "").strip()
     try:
         port = int(r.get("port") or 22)
     except (ValueError, TypeError):
@@ -1286,6 +1291,7 @@ def _normalize_remote(r: dict) -> dict:
         "port": port,
         "remote_dir": remote_dir,
         "identity_file": identity_file,
+        "setup": setup,
     }
 
 
@@ -1359,14 +1365,27 @@ def remote_awareness_note(active: dict | None = None, cfg: dict | None = None,
                 mark = "  ← this session's default node" if r.get("id") == active_id else ""
                 lines.append(f"- {_label(r)}{mark}")
             lines.append(
-                "Workflow: write_cluster_file(path=…, content=…) to put scripts and "
-                "code ON the node → submit_cluster_job(remote_id=…, command=…) to run "
-                "the heavy step there → check_cluster_job to poll it → when it "
+                "To LOOK at a node — list a directory, see which modules or queues "
+                "exist, read a config or a log, prepare a directory — use "
+                "cluster_shell(command=…), which runs a short command and returns its "
+                "output straight away. That is the normal way to interact with a "
+                "node, and it is not a job."
+            )
+            lines.append(
+                "Workflow for a HEAVY step: write_cluster_file(path=…, content=…) to "
+                "put scripts and code ON the node → submit_cluster_job(remote_id=…, "
+                "command=…) to run it there → check_cluster_job to poll it → when it "
                 "finishes, fetch_cluster_file the LIGHTWEIGHT result (a plot, a "
                 "UMAP/embedding projection, a small summary table) back to the local "
                 "session, then present_output it so the user sees it. Big files, "
                 "models, and intermediates STAY on the node — fetch only what the user "
                 "should see. With no node configured, just do it locally."
+            )
+            lines.append(
+                "submit_cluster_job is ONLY for real computations — it is what fills "
+                "the user's Jobs panel, and a panel full of directory listings and "
+                "queue checks buries the runs that matter. Everything else goes to "
+                "cluster_shell."
             )
             lines.append(
                 "Never assemble files in the LOCAL /tmp and copy them over with your "

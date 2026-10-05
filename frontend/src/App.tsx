@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { LabSocket } from "./ws";
-import { Nav } from "./Nav";
+import { AppRail } from "./AppRail";
 import { AskCard, askFromEvent, type Ask } from "./AskCard";
 import { ModelPicker } from "./ModelPicker";
 import type { Agent, ActivityItem, Decision } from "./types";
@@ -383,10 +383,12 @@ export default function App() {
   const canType = status === "running" || followupMode;
 
   return (
+    <>
+    <AppRail current="lab" connected={connected} />
+    <div className="app-page">
     <div className="app">
       <header className="topbar">
-        <div className="brand">🧬 OctoSlave <span>Autonomous Research</span></div>
-        <Nav current="lab" />
+        <div className="page-title">Autonomous Research</div>
         <div className="phasebar">
           {PHASES.map(([key, label]) => (
             <div
@@ -530,6 +532,8 @@ export default function App() {
         </footer>
       )}
     </div>
+    </div>
+    </>
   );
 }
 

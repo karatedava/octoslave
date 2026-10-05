@@ -51,7 +51,7 @@ window.setWorkingDir = function (value) {
   document.getElementById('empty-dir')?.classList.toggle('needs-dir', !real);
   // Mirror into the read-only Settings display.
   const sett = document.getElementById('settings-working-dir');
-  if (sett) sett.value = real ? v : '.';
+  if (sett) sett.textContent = real ? v : 'Not chosen yet';
 };
 
 /**

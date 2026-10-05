@@ -1349,7 +1349,7 @@ def run_council_agent(
 
     messages: list[dict] = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": task},
+        {"role": "user", "content": task, "_user": True},
     ]
 
     plan_text = ""
@@ -1375,14 +1375,18 @@ def continue_council_agent(
     permission_mode: str | None = None,
     ultra: bool = False,
     remote: dict | None = None,
+    prompt_profile: str | None = None,
 ) -> list[dict]:
-    """Follow-up turn in council mode (no re-plan; Worker continues with gating)."""
+    """Follow-up turn in council mode (no re-plan; Worker continues with gating).
+
+    ``prompt_profile`` is the profile the conversation started with — it keeps
+    profile-scoped tools (e.g. CryoSPARC under cryouncle) available."""
     if permission_mode is None:
         permission_mode = load_config().get("permission_mode", "autonomous")
     configure_execution(remote)
     init_mcp(working_dir=working_dir)
-    configure_runtime(client, roles["worker"], "base")
-    messages.append({"role": "user", "content": follow_up})
+    configure_runtime(client, roles["worker"], prompt_profile or "base")
+    messages.append({"role": "user", "content": follow_up, "_user": True})
     try:
         return _council_loop(messages, roles, follow_up, "", working_dir, client, permission_mode, ultra=ultra)
     finally:

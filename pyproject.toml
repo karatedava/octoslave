@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "octoslave"
-version = "3.6.0"
+version = "3.7.0"
 description = "Autonomous AI research & coding assistant — terminal + web UI, multi-agent parallel mode, e-INFRA CZ / NVIDIA NIM / Ollama backends"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -34,7 +34,11 @@ classifiers = [
     "Topic :: Terminals",
 ]
 dependencies = [
-    "openai>=1.0.0",
+    # openai 3.x replaced httpx with httpx2 and is untested here: a fresh install
+    # resolved to it and failed at import (agent.py uses httpx directly). Cap it
+    # until the client is ported, and declare httpx rather than inherit it.
+    "openai>=1.0.0,<3",
+    "httpx>=0.23.0,<1",
     "rich>=13.0.0",
     "click>=8.0.0",
     "prompt_toolkit>=3.0.0",

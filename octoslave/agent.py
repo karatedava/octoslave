@@ -25,10 +25,12 @@ _STREAM_READ_TIMEOUT = httpx.Timeout(300.0, connect=30.0)
 from . import display
 from . import logger
 from . import interrupt
+from . import steer
 from .tools import (
     TOOL_DEFINITIONS,
     execute_tool,
     all_tool_definitions,
+    last_todos,
     valid_tool_names,
     set_tool_profile,
     set_vision_support,
@@ -203,6 +205,73 @@ def _looks_like_tool_attempt(content: str, valid_names) -> bool:
     return False
 
 
+# A short text-only reply whose last sentence OPENS with an announcement of work
+# ("Running it now:", "Let me write the report.") is a model that meant to call a
+# tool and stopped — not a finished answer. "let me know" is the common false
+# friend; a deferred action ("I'll relay it when it lands") is a real end.
+_ANNOUNCED_ACTION = re.compile(
+    r"^\W*(?:(?:ok(?:ay)?|now|next|so|alright|first|then|right)[,\s]+)*"
+    r"(let me(?! know)|let's|i'll|i will|i'm going to|i am going to|now i|"
+    r"time to|proceeding|starting (?:on|with)|running (?:it|this|the)|moving on)\b",
+    re.IGNORECASE,
+)
+_DEFERRED_ACTION = re.compile(r"\b(when|once|after|as soon as|if|wait|waiting|until)\b",
+                              re.IGNORECASE)
+_ANNOUNCEMENT_MAX_CHARS = 500
+
+
+def _unfinished_reply_reason(content: str, finish_reason: str, open_todos: list[str]) -> str:
+    """Why a text-only reply should NOT end the turn, or "" when it is a real end.
+
+    A text reply is normally the model's answer or its closing summary, and the
+    turn ends on it. Nudging it once more "to be sure" made the model restate its
+    summary as a second, thinner message (which then became the session's final
+    reply), so only clear signs of unfinished work earn another step:
+
+      * the reply was cut off by the token limit;
+      * it is a short announcement of an action it never took ("Running it now:");
+      * it ends while the todo list it kept in this turn still has open items;
+      * it has no visible text at all.
+
+    A reply that ends with a question is the model asking the user — a real end.
+    """
+    text = (content or "").strip()
+    if finish_reason == "length":
+        return "cut_off"
+    if not text:
+        # Nothing the user can read (some models answer in reasoning only).
+        return "empty"
+    if text.endswith("?"):
+        return ""
+    if len(text) <= _ANNOUNCEMENT_MAX_CHARS:
+        if text.endswith(":"):
+            return "announced"
+        last = re.split(r"(?<=[.!])\s+", text)[-1]
+        if _ANNOUNCED_ACTION.search(last) and not _DEFERRED_ACTION.search(last):
+            return "announced"
+    if open_todos:
+        return "open_todos"
+    return ""
+
+
+def _unfinished_reply_nudge(reason: str, open_todos: list[str]) -> str:
+    if reason == "cut_off":
+        return ("Your last message was cut off by the length limit. Continue from "
+                "where it stopped — do not start over.")
+    if reason == "empty":
+        return ("Your last reply had no visible text, so the user sees nothing. "
+                "Write your answer or summary for them now — or, if work remains, "
+                "continue it with a tool call.")
+    if reason == "announced":
+        return ("You said what you would do next but did not call a tool, so "
+                "nothing ran. Do it now with a tool call. If you meant to stop "
+                "here instead, say so in one line.")
+    items = "\n".join(f"- {t}" for t in open_todos[:8])
+    return ("Your todo list still has open items:\n" + items + "\n"
+            "Carry on with them now. If any are no longer needed, update the list "
+            "with todo_write to say so, then give your final answer.")
+
+
 # Sentinel returned by _resolve_max_iterations() when no cap is configured —
 # the loop's `while iteration < MAX_ITERATIONS` simply never trips.
 _NO_ITERATION_LIMIT = float("inf")
@@ -365,9 +434,11 @@ _COMPACT_SUMMARY_SYSTEM = (
     "what changes future decisions. Output plain text under these headings, "
     "omitting any that are empty:\n"
     "FACTS: concrete findings, values, file paths, and results learned.\n"
+    "WORKS: commands, settings, or approaches that succeeded (exactly as run).\n"
     "CHANGES: files created/edited and what changed.\n"
     "DECISIONS: choices made and why.\n"
-    "OPEN: unresolved threads, failures, or next steps.\n"
+    "DEAD ENDS: what was tried and failed, and why — so it is not retried.\n"
+    "OPEN: unresolved threads and next steps.\n"
     "Be specific (names, numbers, paths). No preamble, no restating the task."
 )
 
@@ -1575,6 +1646,59 @@ def _is_model_unavailable_error(err_str: str) -> bool:
     return any(n in s for n in _MODEL_UNAVAILABLE_NEEDLES)
 
 
+def wire_messages(messages: list[dict]) -> list[dict]:
+    """The history as the API should see it: keys starting with "_" are our own
+    bookkeeping (``_user`` marks a turn the human actually typed, ``_image`` an
+    attached picture) and are stripped here, at the wire. Strict OpenAI-compatible
+    servers validate message objects and may 400 on unknown fields."""
+    if not any(any(k.startswith("_") for k in m) for m in messages):
+        return messages
+    return [{k: v for k, v in m.items() if not k.startswith("_")}
+            if any(k.startswith("_") for k in m) else m for m in messages]
+
+
+# Legacy histories (saved before turns were marked with ``_user``) still hold the
+# loop's own guidance messages as plain user turns; these openings identify the
+# common ones so a reopened chat doesn't show them as things the user said.
+_SYNTHETIC_USER_OPENINGS = (
+    "[", "If the task is complete", "Your last message looked like", "Your previous response was cut off",
+    "Your last message was cut off", "You said what you would do", "Your todo list still",
+    "Your last reply had no visible text",
+    "You have encountered errors", "You have already read", "You keep ", "Image you asked to see",
+    "Self-check result", "Orientation budget", "Plan to execute", "Strategic guidance",
+    "You are claiming", "You have not executed", "You cannot declare", "The verifier",
+    "The independent verifier", "We are stopping", "Before you finish", "You have run the SAME",
+)
+
+
+def display_history(messages: list[dict]) -> list[dict]:
+    """What a person would recognise as the conversation: the turns they typed
+    and the agent's prose replies — no system prompt, tool traffic, or the loop's
+    internal nudges. Used to render a saved chat when it is reopened."""
+    marked = any(m.get("_user") for m in messages)
+    out: list[dict] = []
+    for i, m in enumerate(messages):
+        role, content = m.get("role"), m.get("content")
+        if role == "user":
+            if marked:
+                if m.get("_user"):
+                    out.append({"role": "user", "content": m.get("_display") or str(content or "")})
+                continue
+            if not isinstance(content, str) or not content.strip():
+                continue
+            first_user = not any(x.get("role") == "user" for x in messages[:i])
+            if not first_user and content.lstrip().startswith(_SYNTHETIC_USER_OPENINGS):
+                continue
+            out.append({"role": "user", "content": content})
+        elif role == "assistant" and isinstance(content, str) and content.strip():
+            out.append({"role": "assistant", "content": content})
+    return out
+
+
+_UNANSWERED_TOOL_CALL = ("(no result — this call was interrupted before it finished; "
+                         "check the actual state before relying on it)")
+
+
 def repair_messages(messages: list[dict]) -> tuple[list[dict], int]:
     """Make a message history acceptable to strict OpenAI-compatible servers.
 
@@ -1585,14 +1709,28 @@ def repair_messages(messages: list[dict]) -> tuple[list[dict], int]:
         the empty string, which every backend accepts alongside tool_calls;
       * tool results with empty content — given a placeholder, since a tool_call
         must be answered and an empty answer is rejected;
-      * orphaned tool results (no preceding tool_call with that id) — dropped.
+      * orphaned tool results (no preceding tool_call with that id) — dropped;
+      * tool calls that never got a result (the run was interrupted mid-round) —
+        answered with a placeholder, since every call must be answered before
+        the next message or strict servers 400 on the whole history.
     Applied before every request, so a bad turn never reaches the wire twice.
     """
     out: list[dict] = []
     changes = 0
     open_ids: set[str] = set()
+    pending: list[str] = []      # call ids of the latest assistant turn still unanswered
+
+    def _close_pending() -> None:
+        nonlocal changes
+        for tid in pending:
+            out.append({"role": "tool", "tool_call_id": tid, "content": _UNANSWERED_TOOL_CALL})
+            changes += 1
+        pending.clear()
+
     for m in messages:
         role = m.get("role")
+        if role != "tool" and pending:
+            _close_pending()
         if role == "assistant":
             tcs = m.get("tool_calls")
             content = m.get("content")
@@ -1603,6 +1741,7 @@ def repair_messages(messages: list[dict]) -> tuple[list[dict], int]:
                 for tc in tcs:
                     if tc.get("id"):
                         open_ids.add(tc["id"])
+                        pending.append(tc["id"])
             elif not (isinstance(content, list) and content) and not str(content or "").strip():
                 changes += 1
                 continue          # empty assistant turn — drop it
@@ -1614,7 +1753,12 @@ def repair_messages(messages: list[dict]) -> tuple[list[dict], int]:
             if not str(m.get("content") or "").strip():
                 m = {**m, "content": "(no output)"}
                 changes += 1
+            if tid in pending:
+                pending.remove(tid)
         out.append(m)
+    # A trailing unanswered round is left alone: the loop is about to execute it
+    # (or note_stopped trims it). Only a round followed by something else is
+    # definitely abandoned.
     return out, changes
 
 
@@ -1633,6 +1777,9 @@ def note_stopped(messages: list[dict]) -> list[dict]:
             and interrupt.STOP_NOTICE in str(msgs[-1].get("content", "")):
         return msgs
     msgs.append({"role": "user", "content": interrupt.STOP_NOTICE})
+    # Appending the notice closes a round that was only partly answered (stop
+    # landed between two tool calls) — repair again so it gets placeholders.
+    msgs, _ = repair_messages(msgs)
     return msgs
 
 
@@ -1879,19 +2026,54 @@ def _mechanical_summary(turns_to_compact: list[dict], removed: int) -> str:
     return "\n".join(lines)
 
 
+# Source material for an LLM-written compaction summary: the evicted turns
+# themselves, each piece clipped, within an overall budget. Richer than the
+# mechanical digest (which keeps ~3 lines per result — numbers in the middle of
+# an output are lost), yet bounded so the summary call stays cheap.
+_SUMMARY_SOURCE_CHARS = 40_000
+_SUMMARY_PIECE_CHARS = 2_000
+
+
+def _summary_source(turns: list[dict]) -> str:
+    def clip(text: str, n: int) -> str:
+        text = text.strip()
+        if len(text) <= n:
+            return text
+        head = n * 2 // 3
+        return text[:head] + "\n[…]\n" + text[-(n - head):]
+
+    parts: list[str] = []
+    for m in turns:
+        if m.get("role") == "assistant":
+            note = (m.get("content") or "").strip() if isinstance(m.get("content"), str) else ""
+            if note:
+                parts.append("AGENT: " + clip(note, _SUMMARY_PIECE_CHARS))
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function", {})
+                parts.append(f"CALL {fn.get('name')}: {clip(str(fn.get('arguments') or ''), 600)}")
+        elif m.get("role") == "tool":
+            body = m.get("content")
+            if isinstance(body, str) and body.strip():
+                parts.append("RESULT: " + clip(body, _SUMMARY_PIECE_CHARS))
+    text = "\n".join(parts)
+    if len(text) > _SUMMARY_SOURCE_CHARS:
+        text = clip(text, _SUMMARY_SOURCE_CHARS)
+    return text
+
+
 def _llm_summary(client: OpenAI, model: str, turns_to_compact: list[dict], removed: int) -> str:
     """Distill an evicted turn block into a dense structured hand-off note via a
-    tool-free completion. Feeds the model the mechanical digest as source
-    material (bounded, cheap) rather than the raw turns, so the prompt size is
-    predictable. Returns "" on empty output or any error so the caller falls
-    back to the mechanical summary."""
-    digest = _mechanical_summary(turns_to_compact, removed)
+    tool-free completion. Feeds the model the turns themselves, clipped to a
+    fixed budget (see _summary_source), so the prompt size is predictable while
+    the numbers and errors in the middle of outputs survive. Returns "" on empty
+    output or any error so the caller falls back to the mechanical summary."""
+    digest = _summary_source(turns_to_compact) or _mechanical_summary(turns_to_compact, removed)
     prompt = [
         {"role": "system", "content": _COMPACT_SUMMARY_SYSTEM},
         {"role": "user", "content": "Compress this earlier work:\n\n" + digest},
     ]
     try:
-        out = _simple_completion(client, model, prompt, max_tokens=500).strip()
+        out = _simple_completion(client, model, prompt, max_tokens=800).strip()
     except Exception:
         # Any failure (transport, or a user Stop surfacing as StopRequested) —
         # fall back to the mechanical summary. A pending stop is honoured by the
@@ -1927,6 +2109,7 @@ def _compact_and_trim(
     turns_to_compact: list[dict] = []
     remaining = list(rest)
     removed = 0
+    insert_at: int | None = None  # where the first compacted group used to start
 
     while removed < groups and remaining:
         start = next(
@@ -1939,6 +2122,8 @@ def _compact_and_trim(
         end = start + 1
         while end < len(remaining) and remaining[end].get("role") == "tool":
             end += 1
+        if insert_at is None:
+            insert_at = start
         turns_to_compact.extend(remaining[start:end])
         remaining = remaining[:start] + remaining[end:]
         removed += 1
@@ -1953,8 +2138,85 @@ def _compact_and_trim(
     if not summary_text:
         summary_text = _mechanical_summary(turns_to_compact, removed)
 
+    # The summary takes the place of the work it replaces, so the history stays
+    # in order: an earlier summary, the user turns between, then this one. Put
+    # at the front instead, each new summary would land BEFORE the older one
+    # and the model would read its own history backwards.
     summary_msg = {"role": "user", "content": summary_text}
-    return system + [summary_msg] + remaining
+    at = insert_at or 0
+    return system + remaining[:at] + [summary_msg] + remaining[at:]
+
+
+_CONVERSATION_COMPACT_SYSTEM = (
+    "You compress a working session between a user and an AI agent into a context "
+    "block the agent will continue from. Preserve, concretely: the user's goals and "
+    "every requirement or preference they stated; decisions made and why; files "
+    "created or changed (exact paths); commands/results that matter (numbers, "
+    "errors); what is done, what is in progress, and open questions. No filler, no "
+    "speculation, nothing that is not in the transcript. Markdown bullets, under "
+    "500 words."
+)
+
+
+def _conversation_digest(messages: list[dict], budget: int = 60_000) -> str:
+    """Plain-text transcript of a conversation for summarisation: user and
+    assistant text in full-ish, tool calls as one-liners, tool output as head
+    lines. Keeps the first user turn and the most recent material when over
+    ``budget`` characters."""
+    parts: list[str] = []
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content")
+        text = content if isinstance(content, str) else " ".join(
+            str(b.get("text", "")) for b in (content or []) if isinstance(b, dict))
+        if role == "user":
+            parts.append("USER: " + text.strip()[:3000])
+        elif role == "assistant":
+            if text.strip():
+                parts.append("ASSISTANT: " + text.strip()[:3000])
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function", {})
+                parts.append(f"  [tool] {fn.get('name')}({str(fn.get('arguments', ''))[:200]})")
+        elif role == "tool":
+            head = " | ".join(ln.strip() for ln in text.strip().splitlines()[:4] if ln.strip())
+            if head:
+                parts.append("    -> " + head[:400])
+    if not parts:
+        return ""
+    digest = "\n".join(parts)
+    if len(digest) > budget:
+        first = parts[0]
+        digest = first + "\n[... earlier middle of the session omitted ...]\n" + digest[-(budget - len(first)):]
+    return digest
+
+
+def compact_conversation(messages: list[dict], client: OpenAI, model: str) -> list[dict] | None:
+    """Replace a whole conversation with ``[system, summary, ack]``.
+
+    Used by the explicit /compact command. The summary comes from ONE tool-free
+    completion (running the agent loop for it lets the model wander off into tool
+    calls), and the result keeps a valid user/assistant order — a history of
+    system → assistant is rejected by some chat templates. Returns None when
+    there is nothing to compact or the model produced nothing."""
+    system = next((m for m in messages if m.get("role") == "system"), None)
+    body = [m for m in messages if m.get("role") != "system"]
+    digest = _conversation_digest(body)
+    if not digest:
+        return None
+    summary = _simple_completion(client, model, [
+        {"role": "system", "content": _CONVERSATION_COMPACT_SYSTEM},
+        {"role": "user", "content": "Compress this session:\n\n" + digest},
+    ], max_tokens=1200).strip()
+    if not summary:
+        return None
+    out = [system] if system else []
+    out += [
+        {"role": "user", "content": (
+            "[COMPACTED CONVERSATION — everything so far, summarised to save context]\n\n"
+            + summary)},
+        {"role": "assistant", "content": "Understood — I have the context above and will continue from there."},
+    ]
+    return out
 
 
 def _adaptive_budget_floor() -> int:
@@ -2069,7 +2331,7 @@ def _stream_simple(client: OpenAI, model: str, messages: list, max_tokens: int) 
     try:
         with client.chat.completions.create(
             model=model,
-            messages=messages,
+            messages=wire_messages(messages),
             stream=True,
             max_tokens=max_tokens,
             timeout=120.0,
@@ -2128,6 +2390,25 @@ def _simple_completion(client: OpenAI, model: str, messages: list, max_tokens: i
 # non-text inputs.
 _ORIENT_TOOLS = frozenset({"read_file", "list_dir", "glob", "grep", "bio_inspect",
                            "image_ocr", "pdf_ocr", "view_image"})
+
+# Tools that never change files, so repeating one with the same arguments
+# returns the same thing (see the redundant-read tracking in _agent_loop). Any
+# tool not listed here counts as a possible change.
+_READ_ONLY_TOOLS = _ORIENT_TOOLS | frozenset({
+    "web_search", "web_fetch", "todo_write", "ask_user", "remember", "forget",
+    "check_process", "check_specialists", "literature_search",
+})
+
+# Consecutive silent tool turns before the loop asks for a status line. In real
+# Science sessions most turns carried no text at all, leaving the researcher
+# watching tool calls scroll by with no idea whether the work was on track.
+_SILENT_TURN_LIMIT = 15
+_SILENCE_NOTE = (
+    "[Note from the harness — not from the user] You have taken "
+    f"{_SILENT_TURN_LIMIT} steps without writing anything the user can read. "
+    "In a sentence or two, tell them where things stand and what you are doing "
+    "next, then carry on in the same reply."
+)
 
 _ORIENT_PROMPT = (
     "Before you plan, ORIENT yourself in the working directory. Using ONLY "
@@ -2403,7 +2684,7 @@ def _stream_completion(client: OpenAI, model: str, messages: list, force_tool: b
 
     with client.chat.completions.create(
         model=model,
-        messages=messages,
+        messages=wire_messages(messages),
         tools=tools,
         tool_choice="required" if force_tool else "auto",
         stream=True,
@@ -2598,13 +2879,14 @@ def run_agent(
 
     messages: list[dict] = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": task},
+        {"role": "user", "content": task, "_user": True},
     ]
 
     # Upfront planning pass. Skipped for local models: the dedicated non-streaming
     # planning call adds a long blind stall (model load + up to 120s) and spends
     # ~900 tokens of an already-tiny context window on a plan small models follow
     # poorly. They plan inline in the main loop instead.
+    approach = ""
     if enable_plan and not is_local:
         # The agent judges its own approach up front, then only pays for the
         # preparation the task actually needs: ACT (do it now), LOOK (a quick
@@ -2628,8 +2910,13 @@ def run_agent(
     try:
         active_model = model  # may be swapped for a fallback on connection loss
 
-        # Main agent loop
-        messages, end_reason = _agent_loop(messages, active_model, working_dir, client, permission_mode)
+        # Main agent loop. Start with a tool call only when the work was just
+        # oriented/planned (acting is the next step) or the model is a small
+        # local one that needs the kick; a direct question gets a direct answer.
+        messages, end_reason = _agent_loop(
+            messages, active_model, working_dir, client, permission_mode,
+            force_first_tool=is_local or approach in ("look", "plan"),
+        )
 
         # Model became unreachable (retries exhausted on a dropping / unresponsive
         # connection). Swap to a reachable substitute — preferring the kimi, glm
@@ -2697,7 +2984,19 @@ def continue_agent(
     permission_mode: str = None,
     remote: dict | None = None,
     model_pool: list[str] | None = None,
+    prompt_profile: str | None = None,
+    user_typed: bool = True,
 ) -> list[dict]:
+    """Continue a conversation with ``follow_up``.
+
+    ``prompt_profile`` — the profile the conversation STARTED with. It decides
+    the tool surface (e.g. cryouncle exposes the CryoSPARC toolbox), so a
+    follow-up must keep it; without it we fall back to base/local and a
+    profile-scoped tool the model used a turn ago is suddenly unknown.
+
+    ``user_typed`` — False when ``follow_up`` is the harness talking (e.g. a
+    background specialist's report), so it is not shown back as something the
+    user said."""
     if permission_mode is None:
         cfg = load_config()
         permission_mode = cfg.get("permission_mode", "autonomous")
@@ -2708,12 +3007,23 @@ def continue_agent(
 
     # Re-apply backend-adaptive knobs (per-thread state may be stale/unset on a
     # fresh follow-up turn or a different thread).
-    prompt_profile = "local" if _is_ollama_client(client) else "base"
+    if _is_ollama_client(client):
+        prompt_profile = "local"
+    else:
+        prompt_profile = prompt_profile or "base"
     configure_runtime(client, model, prompt_profile)
 
-    messages.append({"role": "user", "content": follow_up})
+    turn = {"role": "user", "content": follow_up}
+    if user_typed:
+        turn["_user"] = True
+    messages.append(turn)
     try:
-        messages, end_reason = _agent_loop(messages, model, working_dir, client, permission_mode)
+        # No forced first tool call: a follow-up is as often a question or a
+        # remark as a new instruction. Small local models still get the kick.
+        messages, end_reason = _agent_loop(
+            messages, model, working_dir, client, permission_mode,
+            force_first_tool=_is_ollama_client(client),
+        )
         # Same connection-loss fallback as run_agent: if the model stopped
         # responding, finish the follow-up on a reachable substitute.
         if end_reason == "connection_lost":
@@ -2945,23 +3255,32 @@ def _agent_loop(
     client: OpenAI,
     permission_mode: str = "autonomous",
     preferred_model: str = "",
+    force_first_tool: bool = False,
 ) -> list[dict]:
     """``preferred_model`` — the model this run is *meant* to use, when ``model``
     is only a substitute swapped in after a failure. The loop re-tests it
     periodically and moves back as soon as it is serving again, so an outage
-    costs a few turns on a weaker model rather than the rest of the session."""
+    costs a few turns on a weaker model rather than the rest of the session.
+
+    ``force_first_tool`` — require a tool call on the first step. Only for a
+    fresh task that was just planned, or a small local model that otherwise
+    replies with chit-chat; a follow-up is often a question whose right answer is
+    plain text, and forcing a tool there makes the model act when it should talk."""
     from collections import Counter
     restorer = ModelRestorer(preferred_model) if preferred_model and preferred_model != model else None
     iteration = 0
     _retry_state = {"rate": 0, "timeout": 0, "conn": 0}  # persisted across _robust_stream calls
     _end_reason = "completed"  # how the loop terminated (for accurate session_end log)
-    _tool_call_counts: Counter = Counter()  # (name, args_json) → call count
+    _tool_call_counts: Counter = Counter()  # (name, args_json, epoch) → call count
+    _mutation_epoch = 0  # bumped by anything that may change files: re-reads after it are fresh
     _no_tool_nudges = 0  # consecutive text-only responses (resets on tool use)
     _text_only_total = 0  # total text-only responses across the whole run
     _botched_attempts = 0  # consecutive unparseable text-format tool-call attempts
     _redundant_calls = 0  # total tool calls whose (name, args) had been seen before
     _stuck_recoveries = 0  # times we've reset + nudged out of a redundant-call spin
     _consecutive_error_turns = 0  # turns in a row where at least one tool failed
+    _todos: list[dict] | None = None  # the todo list as last written in THIS loop
+    _silent_turns = 0  # consecutive tool turns with no word to the user
 
     while iteration < MAX_ITERATIONS:
         iteration += 1
@@ -2988,11 +3307,11 @@ def _agent_loop(
             display.print_interrupted(iteration - 1)
             logger.log_session_end(iteration, reason="interrupted")
             return note_stopped(messages), "interrupted"
-        # Force a tool call only on the very first turn — kick-starts models that
-        # would otherwise reply with chit-chat. After that, leave tool_choice="auto"
-        # so a model that has finished can naturally return a text-only "done"
-        # response instead of being pushed into redundant verification calls.
-        _force = iteration == 1
+        # Force a tool call only on the first turn, and only when the caller asks
+        # (see force_first_tool). After that, tool_choice="auto" so a model that
+        # has finished can return a text-only answer instead of being pushed into
+        # redundant verification calls.
+        _force = force_first_tool and iteration == 1
         response, _signal, messages = _robust_stream(
             client, model, messages, _force, _retry_state, iteration
         )
@@ -3074,34 +3393,38 @@ def _agent_loop(
                     ),
                 })
                 continue
-            # Genuine text-only reply: a real "done" or chit-chat.
+            # Genuine text-only reply: an answer, a closing summary — or a model
+            # that announced an action and stopped before taking it.
             _botched_attempts = 0
+            _silent_turns = 0
+            # The user sent something while this turn was running (web Science):
+            # answer it instead of ending the turn under their message.
+            if steer.deliver(messages):
+                _no_tool_nudges = 0
+                _text_only_total = 0
+                continue
             _no_tool_nudges += 1
             _text_only_total += 1
-            # If the model has declared "done" multiple times across the run
-            # (text-only response 3+ times in total, even if interleaved with
-            # redundant tool calls), accept that the task is finished and stop.
-            if _text_only_total >= 3 or _no_tool_nudges >= 2:
+            open_todos = [t["content"] for t in (_todos or [])
+                          if t.get("status") != "completed"]
+            why = _unfinished_reply_reason(content, finish_reason, open_todos)
+            # A plain answer or summary ends the turn right here. Asking the model
+            # to confirm only got the summary restated as a second, thinner reply.
+            # Unfinished-looking replies get one push; a second text-only reply
+            # in a row (or a third overall) is accepted as the model's call.
+            if not why or _text_only_total >= 3 or _no_tool_nudges >= 2:
                 display.print_done(iteration)
                 break
-            # First text-only of a streak: invite the model to either continue
-            # with a tool or end the turn cleanly. Phrased so a genuinely-finished
-            # model can legitimately reply with another text-only message and
-            # trigger the consecutive-text-only break above on the next turn.
-            messages.append({
-                "role": "user",
-                "content": (
-                    "If the task is complete and the deliverable is in place, you may end "
-                    "here — do not re-read or re-validate files you have already produced. "
-                    "If real work remains, call a tool now (write_file, edit_file, bash, …) "
-                    "to make progress."
-                ),
-            })
+            logger.log_info("Text-only reply looks unfinished — nudging.",
+                            reason=why, iteration=iteration)
+            messages.append({"role": "user",
+                             "content": _unfinished_reply_nudge(why, open_todos)})
             continue
 
         # Model used tools — reset *consecutive* text-only counter, but the global
         # _text_only_total still counts so we can detect alternating loops.
         _no_tool_nudges = 0
+        _silent_turns = 0 if (content or "").strip() else _silent_turns + 1
 
         # Execute tool calls
         display.print_separator()
@@ -3130,10 +3453,11 @@ def _agent_loop(
             display.tool_activity_start(name, args, permission_mode)
             try:
                 result, success = execute_tool(name, args, working_dir, permission_mode)
-            except interrupt.StopRequested:
-                # Stop landed mid-tool (the running command was already killed).
-                # Return the history CLEANLY rather than propagating, so the turn's
-                # work is kept and the next message continues from here.
+            except KeyboardInterrupt:
+                # Stop landed mid-tool: the web Stop (StopRequested) or Ctrl+C in
+                # the terminal — the running command was already killed. Return
+                # the history CLEANLY rather than propagating, so the turn's work
+                # is kept and the next message continues from here.
                 display.tool_activity_end()
                 display.print_interrupted(iteration)
                 logger.log_session_end(iteration, reason="interrupted")
@@ -3143,6 +3467,8 @@ def _agent_loop(
 
             if not success:
                 _turn_had_error = True
+            elif name == "todo_write":
+                _todos = last_todos()
 
             # Cap result size BEFORE it enters the message history
             result = _cap_result(result, name)
@@ -3161,7 +3487,10 @@ def _agent_loop(
 
             # Track repeated tool calls. For named read tools and read-like
             # bash commands (cat / head / tail / ls / wc / file / stat), a
-            # repeat with the same args is treated as redundant verification.
+            # repeat with the same args is treated as redundant verification —
+            # unless something that can change files ran in between, which makes
+            # the same read return something new (checking an edit, listing the
+            # outputs a command just wrote).
             tracked = name in ("read_file", "list_dir", "glob", "grep")
             if name == "bash":
                 cmd = (args.get("command") or "").strip()
@@ -3169,8 +3498,10 @@ def _agent_loop(
                 first_word = first_word.rsplit("/", 1)[-1]  # /usr/bin/cat → cat
                 if first_word in {"cat", "head", "tail", "ls", "wc", "file", "stat", "less", "more"}:
                     tracked = True
+            if not tracked and name not in _READ_ONLY_TOOLS:
+                _mutation_epoch += 1
             if tracked:
-                key = (name, raw_args)
+                key = (name, raw_args, _mutation_epoch)
                 prior = _tool_call_counts[key]
                 _tool_call_counts[key] += 1
                 if prior >= 1:
@@ -3183,6 +3514,19 @@ def _agent_loop(
         # a user message wedged between two tool results breaks the contiguity
         # strict OpenAI-compatible servers require.
         drain_image_attachments(messages)
+        # Same rule for live user messages (web Science steering): they join the
+        # conversation here, after the round's tool results, and the model sees
+        # them on its very next step. New input also resets the "done" counters.
+        if steer.deliver(messages):
+            _no_tool_nudges = 0
+            _text_only_total = 0
+
+        # A long run of tool calls with no word to the user: whoever is watching
+        # sees activity but cannot tell whether it is going anywhere. Ask for a
+        # line of status, which rides along with the next step at no extra cost.
+        if _silent_turns >= _SILENT_TURN_LIMIT:
+            _silent_turns = 0
+            messages.append({"role": "user", "content": _SILENCE_NOTE})
 
         # Track consecutive error turns and inject a recovery nudge when stuck.
         if _turn_had_error:

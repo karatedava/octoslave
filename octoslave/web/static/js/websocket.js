@@ -37,6 +37,8 @@ export const wsState = {
   retries: 0,
   retryTimer: null,
   onMessage: null,  // preserved across reconnects
+  onOpen: null,     // preserved too — a reconnect must re-sync like the first open
+  onClose: null,
 };
 
 /**
@@ -62,8 +64,10 @@ export function connectWebSocket(onOpen, onClose, onMessage) {
     try { wsState.ws.close(); } catch(_) {}
   }
 
-  // Preserve onMessage handler across reconnects
+  // Preserve the handlers across reconnects (scheduleReconnect passes nulls).
   if (onMessage) wsState.onMessage = onMessage;
+  if (onOpen) wsState.onOpen = onOpen;
+  if (onClose) wsState.onClose = onClose;
 
   const ws = new WebSocket(WS_URL);
   wsState.ws = ws;
@@ -72,13 +76,13 @@ export function connectWebSocket(onOpen, onClose, onMessage) {
     wsState.ready  = true;
     wsState.retries  = 0;
     setConnected(true);
-    if (onOpen) onOpen();
+    if (wsState.onOpen) wsState.onOpen();
   };
 
   ws.onclose = () => {
     wsState.ready = false;
     setConnected(false);
-    scheduleReconnect(onClose);
+    scheduleReconnect(wsState.onClose);
   };
 
   ws.onerror = () => {
@@ -224,11 +228,19 @@ export function applyConfig(data) {
   // Working dir → canonical appState; reflects into the hero picker + Settings.
   if (typeof window.setWorkingDir === 'function') window.setWorkingDir(dir);
 
-  document.getElementById('settings-api-key').value     = data?.has_api_key ? '••••••••' : '';
-  document.getElementById('settings-nim-api-key').value = data?.has_nim_key  ? '••••••••' : '';
-  document.getElementById('settings-base-url').value    = url;
-  document.getElementById('settings-model').value       = model;
-  document.getElementById('settings-backend').value     = backend;
+  // Settings → Overview: read-only facts shown as text and status badges.
+  const setText = (id, t) => { const el = document.getElementById(id); if (el) el.textContent = t; };
+  const setKey = (id, has) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.dataset.state = has ? 'set' : 'unset';
+    el.textContent = has ? 'Configured' : 'Not set';
+  };
+  setKey('settings-api-key', !!data?.has_api_key);
+  setKey('settings-nim-api-key', !!data?.has_nim_key);
+  setText('settings-base-url', url || '—');
+  setText('settings-model', model || '—');
+  setText('settings-backend', getProviderName(backend) || backend || '—');
 
   applyBackend(backend);
 

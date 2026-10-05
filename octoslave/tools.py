@@ -295,7 +295,7 @@ TOOL_DEFINITIONS = [
                 "using tesseract OCR. Use for screenshots, scanned documents, photos of "
                 "text, figures with embedded labels, plots with axis ticks, etc. "
                 "For PDFs use pdf_ocr instead. "
-                "Requires pytesseract + the `tesseract` binary "
+                "Requires the `tesseract` binary "
                 "(macOS: `brew install tesseract`, Debian: `apt install tesseract-ocr`)."
             ),
             "parameters": {
@@ -327,13 +327,18 @@ TOOL_DEFINITIONS = [
                 "need the shape AND the precise tick values. "
                 "The image arrives as a separate message right after this tool's reply. "
                 "Requires a vision-capable model — if the active model has no image "
-                "input the call fails and says so; it never silently drops the image."
+                "input the call fails and says so; it never silently drops the image. "
+                "An .html file is opened in a headless browser and you get a "
+                "screenshot of what a person sees, plus the page's console errors and "
+                "any images that fail to load — use it on every HTML report or page "
+                "you build before you present it."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Path to the image file (PNG/JPG/TIFF/BMP/GIF/WEBP), absolute or relative to the working dir. Large images are downscaled automatically."},
+                    "path": {"type": "string", "description": "Path to the image file (PNG/JPG/TIFF/BMP/GIF/WEBP) or HTML page, absolute or relative to the working dir. Large images are downscaled automatically. For a page, append #element-id to look at a section further down."},
                     "note": {"type": "string", "description": "Optional: what you are looking for (e.g. 'does the red curve plateau?'). Attached alongside the image to keep your own intent in view."},
+                    "viewport": {"type": "string", "description": "HTML pages only: browser window as WIDTHxHEIGHT (default 1280x1600)."},
                 },
                 "required": ["path"],
             },
@@ -795,7 +800,12 @@ def _format_bash_output(stdout: str, stderr: str, returncode: int) -> str:
     elif returncode != 0:
         output += f"\n(exit code {returncode})"
     if len(output) > 8000:
-        output = output[:2000] + "\n\n... [output truncated] ...\n\n" + output[-5000:]
+        # Tail-heavy: errors, exit status and final results come last.
+        cut = len(output) - 7000
+        output = (output[:2000]
+                  + f"\n\n... [{cut:,} characters of output omitted — to see them, "
+                    f"redirect the command to a file and grep or page through it] ...\n\n"
+                  + output[-5000:])
     return output
 
 
@@ -859,6 +869,45 @@ def _remote_write_file(sess, path, content, working_dir) -> tuple[str, bool]:
     return f"Written {lines} lines to {path}", True
 
 
+_LINE_NO_PREFIX = re.compile(r"^\s*\d+\t")
+
+
+def _edit_miss_hint(content: str, old: str) -> str:
+    """Why ``old`` was not found in ``content``, and what is there instead.
+
+    A failed edit with no explanation is the commonest way an agent burns turns:
+    it re-reads the file and guesses again. The usual causes are mechanical — the
+    line-number prefixes read_file adds were copied along, or the indentation or
+    a word differs — so point at the closest match and show its exact text."""
+    old_lines = old.splitlines()
+    nonblank = [ln for ln in old_lines if ln.strip()]
+    if nonblank and all(_LINE_NO_PREFIX.match(ln) for ln in nonblank):
+        return ("old_string still carries the line-number prefixes read_file adds "
+                "(like '12<TAB>'). Remove them and pass the file text only.")
+    first = nonblank[0].strip() if nonblank else ""
+    if not first:
+        return ""
+    lines = content.splitlines()
+    hits = [i for i, ln in enumerate(lines) if ln.strip() == first]
+    if not hits and len(first) >= 12:
+        key = first[:40]
+        hits = [i for i, ln in enumerate(lines) if key in ln]
+    if not hits:
+        return ("Not even its first line is in the file — the file may have changed "
+                "since you read it. Re-read the region you want to edit and copy it "
+                "exactly.")
+    i = hits[0]
+    shown = "\n".join(f"{j + 1}\t{lines[j]}"
+                       for j in range(i, min(len(lines), i + len(old_lines) + 1)))
+    if len(shown) > 1500:
+        shown = shown[:1500] + "\n…"
+    also = (f" (its first line also appears at line{'s' if len(hits) > 2 else ''} "
+            f"{', '.join(str(h + 1) for h in hits[1:4])})" if len(hits) > 1 else "")
+    return (f"The closest match starts at line {i + 1}{also}; the text there differs "
+            f"(often indentation, whitespace, or a changed word). Current text:\n"
+            f"{shown}\nCopy it exactly, without the line-number prefixes.")
+
+
 def _remote_edit_file(sess, path, old_string, new_string, working_dir, replace_all=False) -> tuple[str, bool]:
     rp = _remote_resolve(path, working_dir)
     if not sess.is_file(rp):
@@ -873,7 +922,8 @@ def _remote_edit_file(sess, path, old_string, new_string, working_dir, replace_a
         return f"Could not read remote file {path}: {e}", False
     count = content.count(old_string)
     if count == 0:
-        return f"String not found in {path}:\n{old_string[:200]}", False
+        return (f"String not found in {path}:\n{old_string[:200]}\n\n"
+                f"{_edit_miss_hint(content, old_string)}"), False
     if count > 1 and not replace_all:
         return (f"old_string appears {count} times in {path} — make it more specific to "
                 f"ensure uniqueness, or pass replace_all=true to replace every occurrence.", False)
@@ -917,7 +967,8 @@ def _remote_apply_patch(sess, path, edits, working_dir) -> tuple[str, bool]:
         count = content.count(old)
         if count == 0:
             return (f"Edit #{i}: string not found:\n{old[:200]}\n"
-                    f"(applied {applied}/{len(edits)} so far — file left UNCHANGED)", False)
+                    f"(applied {applied}/{len(edits)} so far — file left UNCHANGED)\n\n"
+                    f"{_edit_miss_hint(content, old)}", False)
         if count > 1 and not replace_all:
             return (f"Edit #{i}: old_string appears {count} times — make it unique or set "
                     f"replace_all=true for this edit. (file left UNCHANGED)", False)
@@ -1438,6 +1489,24 @@ _LARGE_TEXT_BYTES = 5 * 1024 * 1024  # 5 MB
 _LARGE_TEXT_PREVIEW_LINES = 50
 
 
+def _read_text_eol(path: Path) -> tuple[str, str]:
+    """Read a text file as UTF-8 with LF line endings, returning (text, eol).
+
+    Always UTF-8 (the platform default is cp1252 on Windows, which garbles or
+    rejects anything non-ASCII), and the file's own line ending is remembered so
+    an edit can write it back unchanged — otherwise editing one line of a CRLF
+    file silently rewrites every line ending in it."""
+    raw = path.read_bytes().decode("utf-8", errors="replace")
+    eol = "\r\n" if "\r\n" in raw else "\n"
+    return (raw.replace("\r\n", "\n") if eol == "\r\n" else raw), eol
+
+
+def _write_text_eol(path: Path, text: str, eol: str = "\n") -> None:
+    if eol != "\n":
+        text = text.replace("\r\n", "\n").replace("\n", eol)
+    path.write_bytes(text.encode("utf-8"))
+
+
 def _read_file(path: str, working_dir: str, offset: int = None, limit: int = None) -> tuple[str, bool]:
     _sess = _remote()
     if _sess is not None:
@@ -1477,7 +1546,7 @@ def _read_file(path: str, working_dir: str, offset: int = None, limit: int = Non
     if offset is None and limit is None and resolved.stat().st_size > _LARGE_TEXT_BYTES:
         size = resolved.stat().st_size
         preview_lines: list[str] = []
-        with open(resolved, "r", errors="replace") as fh:
+        with open(resolved, "r", encoding="utf-8", errors="replace") as fh:
             for i, line in enumerate(fh):
                 if i >= _LARGE_TEXT_PREVIEW_LINES:
                     break
@@ -1495,7 +1564,7 @@ def _read_file(path: str, working_dir: str, offset: int = None, limit: int = Non
         )
 
     try:
-        lines = resolved.read_text(errors="replace").splitlines()
+        lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError as e:
         return str(e), False
 
@@ -1523,7 +1592,7 @@ def _write_file(path: str, content: str, working_dir: str) -> tuple[str, bool]:
             False,
         )
     resolved.parent.mkdir(parents=True, exist_ok=True)
-    resolved.write_text(content)
+    resolved.write_text(content, encoding="utf-8")
     lines = content.count("\n") + 1
     return f"Written {lines} lines to {path}", True
 
@@ -1550,11 +1619,12 @@ def _edit_file(
     if _is_binary(resolved):
         return f"Cannot edit binary file: {resolved.name}", False
 
-    content = resolved.read_text(errors="replace")
+    content, eol = _read_text_eol(resolved)
     count = content.count(old_string)
 
     if count == 0:
-        return f"String not found in {path}:\n{old_string[:200]}", False
+        return (f"String not found in {path}:\n{old_string[:200]}\n\n"
+                f"{_edit_miss_hint(content, old_string)}"), False
     if count > 1 and not replace_all:
         return (
             f"old_string appears {count} times in {path} — "
@@ -1563,7 +1633,7 @@ def _edit_file(
         )
 
     new_content = content.replace(old_string, new_string)
-    resolved.write_text(new_content)
+    _write_text_eol(resolved, new_content, eol)
     if replace_all and count > 1:
         return f"Edited {path} ({count} occurrences replaced)", True
     return f"Edited {path}", True
@@ -1681,7 +1751,7 @@ def _apply_patch(path: str, edits=None, working_dir: str = "", **extra) -> tuple
     if _is_binary(resolved):
         return f"Cannot edit binary file: {resolved.name}", False
 
-    content = resolved.read_text(errors="replace")
+    content, eol = _read_text_eol(resolved)
     applied = 0
     notes: list[str] = []
     for i, e in enumerate(edits, 1):
@@ -1698,7 +1768,8 @@ def _apply_patch(path: str, edits=None, working_dir: str = "", **extra) -> tuple
         if count == 0:
             return (
                 f"Edit #{i}: string not found:\n{old[:200]}\n"
-                f"(applied {applied}/{len(edits)} so far — file left UNCHANGED)",
+                f"(applied {applied}/{len(edits)} so far — file left UNCHANGED)\n\n"
+                f"{_edit_miss_hint(content, old)}",
                 False,
             )
         if count > 1 and not replace_all:
@@ -1712,7 +1783,7 @@ def _apply_patch(path: str, edits=None, working_dir: str = "", **extra) -> tuple
         if replace_all and count > 1:
             notes.append(f"#{i}×{count}")
 
-    resolved.write_text(content)
+    _write_text_eol(resolved, content, eol)
     suffix = f" ({', '.join(notes)} replace_all)" if notes else ""
     return f"Applied {applied} edit(s) to {path}{suffix}", True
 
@@ -1802,6 +1873,11 @@ def get_todos(working_dir: str) -> list[dict]:
     return list(_TODO_STORE.get(working_dir, []))
 
 
+def last_todos() -> list[dict]:
+    """The task list most recently written by todo_write on THIS thread."""
+    return list(getattr(_EXEC, "last_todos", None) or [])
+
+
 def _todo_write(todos=None, working_dir: str = "", **extra) -> tuple[str, bool]:
     norm = _coerce_todos(todos)
     # Fallbacks when `todos` yielded nothing: an alt container key, or a single
@@ -1819,6 +1895,9 @@ def _todo_write(todos=None, working_dir: str = "", **extra) -> tuple[str, bool]:
         return "todo_write received no valid tasks (each needs `content` and `status`).", False
 
     _TODO_STORE[working_dir] = norm
+    # Per thread as well: the agent loop checks the list IT wrote before accepting
+    # a "done", and the store key can be a remapped remote path.
+    _EXEC.last_todos = norm
     try:
         from . import display
         display.print_todos(norm)
@@ -1882,7 +1961,7 @@ def _run_background(command: str, working_dir: str, cwd: str = None) -> tuple[st
     run_dir = cwd or working_dir
     try:
         log_fd, log_path = tempfile.mkstemp(prefix="ots_bg_", suffix=".log")
-        log_file = os.fdopen(log_fd, "w")
+        log_file = os.fdopen(log_fd, "w", encoding="utf-8")
     except OSError as e:
         return f"Could not allocate a log file: {e}", False
 
@@ -1930,7 +2009,7 @@ def _read_bg_log(info: dict, tail_lines: int) -> str:
     except Exception:
         pass
     try:
-        with open(info["log"], errors="replace") as fh:
+        with open(info["log"], encoding="utf-8", errors="replace") as fh:
             lines = fh.read().splitlines()
     except OSError:
         return "(could not read output)"
@@ -2142,6 +2221,70 @@ _BLOCKING_CMD_PATTERNS = (
 )
 
 
+# A hand-rolled ssh/scp/rsync to a host that is ALREADY configured as a compute
+# node. Agents reach for this constantly — it is the familiar way to touch a
+# cluster — but it bypasses everything the cluster tools provide: the multiplexed
+# connection, the host's setup snippet (credential renewal, base modules), the
+# recorded job with its status and log, and the Jobs panel the user watches. The
+# result is slower, flakier, and invisible. So it is refused with the tool to use
+# instead. An ssh to any OTHER host is none of our business and passes through.
+# Anchored at a command position (start, or after a shell separator, allowing
+# leading VAR=value assignments) so a mere mention of ssh in an echo or a comment
+# is not mistaken for a call.
+_SSH_CALL = re.compile(
+    r"(?:^|[\n;&|(]|&&|\|\|)\s*"
+    r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"
+    r"(?:ssh|scp|rsync|sftp)\s", re.I)
+
+
+def _remote_host_in(command: str) -> dict | None:
+    """The configured remote this command appears to reach, or None."""
+    command = command or ""
+    if not _SSH_CALL.search(command):
+        return None
+    try:
+        from .config import get_remotes, load_config
+        remotes = get_remotes(load_config())
+    except Exception:
+        return None
+    for r in remotes:
+        host = (r.get("host") or "").strip()
+        if not host:
+            continue
+        # The host, its first label, or the id/name the user gave it — any of
+        # these can be what an ssh_config alias is called.
+        names = {host, host.split(".")[0],
+                 (r.get("id") or "").strip(), (r.get("name") or "").strip()}
+        for token in (n for n in names if len(n) >= 2):
+            if re.search(rf"(?:^|[\s@]){re.escape(token)}(?:$|[\s:/'\"])", command):
+                return r
+    return None
+
+
+def _remote_tool_redirect(command: str) -> str | None:
+    """The message refusing a hand-rolled ssh, or None to let it through."""
+    r = _remote_host_in(command)
+    if r is None:
+        return None
+    name = r.get("name") or r.get("id") or r.get("host")
+    return (
+        f"Refused: '{name}' ({r.get('host')}) is a configured compute node, so do "
+        f"not reach it with your own ssh/scp/rsync.\n\n"
+        f"Use these instead — they hold one multiplexed connection, apply this "
+        f"host's setup (credential renewal, base modules), and record what runs so "
+        f"the user can see it:\n"
+        f"  - cluster_shell(command=…) — run a short command there and read the "
+        f"output (listing, modules, queues, logs, making directories).\n"
+        f"  - write_cluster_file(path=…, content=…) — put a script or config on it.\n"
+        f"  - submit_cluster_job(name=…, command=…) — start a long computation, "
+        f"then check_cluster_job to poll it.\n"
+        f"  - fetch_cluster_file(path=…) — bring a small result back to show.\n\n"
+        f"Your own ssh also loses the connection reuse, so each call pays a fresh "
+        f"handshake; that is why it feels slow and drops. If you need something "
+        f"these four cannot express, say so rather than working around them."
+    )
+
+
 def _looks_blocking(command: str) -> bool:
     import re
     if "OTS_FOREGROUND=1" in command:
@@ -2172,13 +2315,20 @@ def _run_interruptible(command: str, working_dir: str, timeout: int,
     from . import interrupt
     proc = subprocess.Popen(
         command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, cwd=working_dir, env=env, start_new_session=True,
+        text=True, encoding="utf-8", errors="replace",
+        cwd=working_dir, env=env, start_new_session=True,
     )
     deadline = _time.monotonic() + timeout
     while True:
         try:
             stdout, stderr = proc.communicate(timeout=0.25)
             return _Completed(stdout, stderr, proc.returncode)
+        except KeyboardInterrupt:
+            # Ctrl+C in the terminal. The command runs in its own session (so a
+            # web Stop can kill its whole tree), which also means the terminal's
+            # SIGINT never reaches it — kill it here or it keeps running orphaned.
+            _terminate_proc(proc)
+            raise
         except subprocess.TimeoutExpired:
             if interrupt.should_stop():
                 _terminate_proc(proc)
@@ -2214,6 +2364,11 @@ def _bash(command: str, working_dir: str, timeout: int = 300) -> tuple[str, bool
     _sess = _remote()
     if _sess is not None:
         return _remote_bash(_sess, command, working_dir, timeout)
+    # Local bash: an ssh to a configured compute node means the agent is working
+    # around the cluster tools (see _remote_tool_redirect).
+    _redirect = _remote_tool_redirect(command)
+    if _redirect is not None:
+        return _redirect, False
     # Unset VIRTUAL_ENV so uv doesn't emit a mismatch warning when the conda/system
     # venv doesn't match the project's .venv.
     env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
@@ -2227,21 +2382,7 @@ def _bash(command: str, working_dir: str, timeout: int = 300) -> tuple[str, bool
             return ("Command was KILLED because the user stopped the session. "
                     "It did not finish, so its effects may be partial — check the "
                     "actual state before assuming anything about it.", False)
-        stdout = result.stdout or ""
-        stderr = result.stderr or ""
-        # Label streams when both have content so the model can tell them apart.
-        # Most successful commands write only to stdout — keep that path lean.
-        if stdout and stderr:
-            output = f"--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
-        else:
-            output = stdout or stderr
-        if not output:
-            output = f"(exit code {result.returncode})"
-        elif result.returncode != 0:
-            output += f"\n(exit code {result.returncode})"
-        # Truncate very long outputs — keep tail-heavy since errors appear at the end
-        if len(output) > 8000:
-            output = output[:2000] + "\n\n... [output truncated] ...\n\n" + output[-5000:]
+        output = _format_bash_output(result.stdout, result.stderr, result.returncode)
         return output, result.returncode == 0
     except subprocess.TimeoutExpired:
         return (
@@ -2531,6 +2672,53 @@ def _compress_log(
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".gif", ".webp"}
 
 
+_TESSERACT_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin")
+
+
+def _find_tesseract() -> str | None:
+    """The tesseract binary. Also looks in the usual install dirs: an app started
+    from the Dock/Finder often has a PATH without Homebrew on it."""
+    found = shutil.which("tesseract")
+    if found:
+        return found
+    for d in _TESSERACT_DIRS:
+        cand = os.path.join(d, "tesseract")
+        if os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def _tesseract(img, lang: str, psm: int) -> tuple[str, str]:
+    """OCR a PIL image. Returns (text, error). Uses pytesseract when installed,
+    otherwise the tesseract command directly — pytesseract is only a wrapper
+    around it, and the packaged app does not bundle it."""
+    binary = _find_tesseract()
+    if binary is None:
+        return "", ("tesseract is not installed. Install it: macOS "
+                    "`brew install tesseract`, Debian `apt install tesseract-ocr`.")
+    try:
+        import pytesseract  # type: ignore
+        pytesseract.pytesseract.tesseract_cmd = binary
+        return pytesseract.image_to_string(img, lang=lang, config=f"--psm {psm}"), ""
+    except ImportError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        return "", f"OCR error: {e}"
+    tmp = tempfile.mkdtemp(prefix="ots_ocr_")
+    try:
+        src = os.path.join(tmp, "in.png")
+        img.save(src)
+        proc = subprocess.run([binary, src, "stdout", "-l", lang, "--psm", str(psm)],
+                              capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            return "", f"OCR error: {(proc.stderr or '').strip()[:400]}"
+        return proc.stdout, ""
+    except subprocess.TimeoutExpired:
+        return "", "OCR timed out after 120s."
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _image_ocr(
     path: str,
     working_dir: str,
@@ -2542,10 +2730,6 @@ def _image_ocr(
         from PIL import Image
     except ImportError:
         return "Pillow is not installed. Run: pip install pillow", False
-    try:
-        import pytesseract  # type: ignore
-    except ImportError:
-        return "pytesseract is not installed. Run: pip install pytesseract", False
 
     resolved = _resolve(path, working_dir)
     if not resolved.exists():
@@ -2571,17 +2755,9 @@ def _image_ocr(
         img = img.convert("L")
         img = img.point(lambda x: 0 if x < 140 else 255, "1")
 
-    config = f"--psm {int(psm)}"
-    try:
-        text = pytesseract.image_to_string(img, lang=lang, config=config)
-    except pytesseract.TesseractNotFoundError:
-        return (
-            "tesseract binary not found on PATH. Install: "
-            "macOS `brew install tesseract`, Debian `apt install tesseract-ocr`.",
-            False,
-        )
-    except Exception as e:
-        return f"OCR error: {e}", False
+    text, err = _tesseract(img, lang, int(psm))
+    if err:
+        return err, False
 
     header = f"OCR: {resolved.name} ({width}x{height}, lang={lang}, psm={psm})\n\n"
     if not text.strip():
@@ -2639,6 +2815,33 @@ def take_image_attachments() -> list[dict]:
         return []
     _EXEC.image_attachments = []
     return pending
+
+
+# Files the agent has actually LOOKED at, and when: {abs_path: epoch}. Written
+# whenever pixels are genuinely handed to the model, so another layer can tell a
+# figure or page that was inspected from one that was only written (Science uses
+# it to catch a report nobody has looked at since it last changed). Process-wide
+# and lock-guarded, not thread-local: a specialist's look counts for the session,
+# and paths are absolute so projects never collide. Bounded, since a long session
+# views the same few files repeatedly.
+_VIEWED: dict[str, float] = {}
+_VIEWED_LOCK = threading.Lock()
+_VIEWED_MAX = 512
+
+
+def _note_viewed(path) -> None:
+    key = os.path.abspath(str(path))
+    with _VIEWED_LOCK:
+        _VIEWED[key] = _time.time()
+        if len(_VIEWED) > _VIEWED_MAX:
+            for stale in sorted(_VIEWED, key=_VIEWED.get)[:len(_VIEWED) - _VIEWED_MAX]:
+                _VIEWED.pop(stale, None)
+
+
+def viewed_at(path) -> float | None:
+    """When ``path`` was last actually shown to a model, or None."""
+    with _VIEWED_LOCK:
+        return _VIEWED.get(os.path.abspath(str(path)))
 
 
 def _queue_image_attachment(entry: dict) -> None:
@@ -2716,6 +2919,7 @@ def _view_image_raw(resolved: Path, display_path: str, note: str) -> tuple[str, 
         "b64": base64.b64encode(blob).decode("ascii"),
         "note": (note or "").strip(),
     })
+    _note_viewed(resolved)
     return (
         f"Attached {Path(display_path).name} — {len(blob) // 1024} KB. The image "
         f"itself follows in the next message; read it there.",
@@ -2723,36 +2927,225 @@ def _view_image_raw(resolved: Path, display_path: str, note: str) -> tuple[str, 
     )
 
 
+# ---- HTML pages: render them the way a person opening the file would see them --
+#
+# An agent that builds an HTML report otherwise ships it unseen: broken images,
+# a viewer library that never loaded, a panel stuck in a corner — all invisible
+# in the source, all obvious in a browser. view_image on an .html file renders it
+# with headless Chrome/Chromium and shows the screenshot, plus whatever the page
+# logged to the browser console.
+
+_HTML_EXTS = {".html", ".htm"}
+_HTML_VIEWPORT = (1280, 1600)
+_HTML_RENDER_TIMEOUT = 60
+_BROWSER_APPS = (
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+)
+_BROWSER_CMDS = ("google-chrome", "google-chrome-stable", "chromium",
+                 "chromium-browser", "chrome", "microsoft-edge", "msedge")
+_CONSOLE_LINE = re.compile(r':CONSOLE(?::\d+)?\]\s*"(.*)",\s*source:\s*(\S+)\s*\((\d+)\)')
+_IMG_SRC = re.compile(r"<img\b[^>]*?\bsrc\s*=\s*([\"'])(.*?)\1", re.IGNORECASE | re.DOTALL)
+
+
+def _find_browser() -> str | None:
+    override = os.environ.get("OCTOSLAVE_BROWSER")
+    if override and os.path.exists(override):
+        return override
+    for app in _BROWSER_APPS:
+        if os.path.exists(app):
+            return app
+    for cmd in _BROWSER_CMDS:
+        found = shutil.which(cmd)
+        if found:
+            return found
+    return None
+
+
+def _parse_viewport(viewport) -> tuple[int, int]:
+    m = re.match(r"^\s*(\d{3,4})\s*[x×,]\s*(\d{3,5})\s*$", str(viewport or ""))
+    if not m:
+        return _HTML_VIEWPORT
+    return max(320, min(2560, int(m.group(1)))), max(240, min(8000, int(m.group(2))))
+
+
+def _broken_image_sources(html: str, page: Path) -> list[str]:
+    """<img> sources that cannot load: empty, an unfilled template placeholder,
+    or a local file that does not exist. The browser draws these as a broken
+    icon without logging anything, so they are checked here."""
+    bad = []
+    for _, src in _IMG_SRC.findall(html):
+        s = src.strip()
+        if s.startswith(("data:", "http://", "https://", "//", "blob:")):
+            continue
+        if not s or "{" in s or "}" in s:
+            bad.append(s or "(empty)")
+            continue
+        local = s.split("#")[0].split("?")[0]
+        if local.startswith("file://"):
+            local = local[7:]
+        target = Path(local) if os.path.isabs(local) else page.parent / local
+        if not target.exists():
+            bad.append(s)
+    return bad[:8]
+
+
+def _render_html(page: Path, fragment: str, width: int, height: int,
+                 out_png: Path) -> tuple[bool, str, list[str]]:
+    """Screenshot ``page`` into ``out_png``. Returns (ok, error, console_lines).
+
+    Headless Chrome on macOS writes the screenshot and then may not exit, so we
+    wait for the file rather than for the process, then end the browser."""
+    browser = _find_browser()
+    if browser is None:
+        return False, ("No Chrome/Chromium/Edge browser was found to render the "
+                       "page. Install one (or set OCTOSLAVE_BROWSER to its "
+                       "executable), or check the page another way."), []
+    profile = out_png.parent / "profile"
+    url = page.resolve().as_uri() + (f"#{fragment}" if fragment else "")
+    cmd = [browser, "--headless=new", "--hide-scrollbars", "--no-first-run",
+           "--no-default-browser-check", "--disable-extensions",
+           # Software WebGL, so 3D molecule/structure viewers draw too.
+           "--use-angle=swiftshader", "--enable-unsafe-swiftshader",
+           f"--window-size={width},{height}", "--virtual-time-budget=8000",
+           "--enable-logging=stderr", "--v=0", f"--user-data-dir={profile}",
+           f"--screenshot={out_png}", url]
+    log_path = out_png.parent / "browser.log"
+    with open(log_path, "wb") as log:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=log,
+                                start_new_session=True)
+    import time as _time
+    deadline = _time.monotonic() + _HTML_RENDER_TIMEOUT
+    last_size = -1
+    try:
+        while _time.monotonic() < deadline:
+            if out_png.exists():
+                size = out_png.stat().st_size
+                if size > 0 and size == last_size:
+                    break                  # written and no longer growing
+                last_size = size
+            elif proc.poll() is not None:
+                break                      # browser exited without a screenshot
+            _time.sleep(0.25)
+    finally:
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    console: list[str] = []
+    try:
+        for line in log_path.read_text(errors="replace").splitlines():
+            m = _CONSOLE_LINE.search(line)
+            if m:
+                entry = f"{m.group(1)} (line {m.group(3)})"
+                if entry not in console:
+                    console.append(entry)
+    except OSError:
+        pass
+    if not out_png.exists() or out_png.stat().st_size == 0:
+        return False, f"The browser did not produce a screenshot of {page.name}.", console
+    return True, "", console[:12]
+
+
+def _view_html(resolved: Path, fragment: str, display_path: str, working_dir: str,
+               note: str, viewport) -> tuple[str, bool]:
+    width, height = _parse_viewport(viewport)
+    tmp = Path(tempfile.mkdtemp(prefix="ots_html_"))
+    try:
+        shot = tmp / "page.png"
+        ok, err, console = _render_html(resolved, fragment, width, height, shot)
+        if not ok:
+            return err, False
+        try:
+            broken = _broken_image_sources(resolved.read_text(errors="replace"), resolved)
+        except OSError:
+            broken = []
+        where = f"#{fragment}" if fragment else "the top of the page"
+        report = [f"Rendered {display_path} in a headless browser at {width}x{height}, "
+                  f"scrolled to {where} — this is what a person opening it sees there."]
+        if console:
+            report.append("Browser console:\n" + "\n".join(f"  - {c}" for c in console))
+        if broken:
+            report.append("Images that cannot load (shown as broken icons):\n"
+                          + "\n".join(f"  - {b}" for b in broken))
+        if not console and not broken:
+            report.append("No console errors and no broken image sources.")
+        report.append("To see further down, view the page again with #some-element-id "
+                      "appended to the path, or a taller viewport.")
+        img_msg, img_ok = _view_image(str(shot), working_dir, note=note,
+                                      label=display_path + (f"#{fragment}" if fragment else ""))
+        if not img_ok:
+            # The model cannot see images: the console/broken-image findings
+            # are still worth having, but the layout has NOT been checked, so
+            # this does not count as having looked at the page.
+            return "\n\n".join(report[:-1] + [img_msg]), False
+        _note_viewed(resolved)
+        return "\n\n".join(report + [img_msg]), True
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+_NO_VISION = (
+    "This model cannot accept image input, so the picture itself was NOT shown to "
+    "you — do not describe its shapes, colours or trends as if you had seen them. "
+    "(If this model really does see images, set `model_vision` in config.json.)"
+)
+
+
+def _view_image_as_text(path: str, working_dir: str) -> tuple[str, bool]:
+    """view_image for a model without image input: read what text the image
+    holds with OCR, so the call still yields something usable."""
+    text, ok = _image_ocr(path, working_dir)
+    if not ok:
+        return (f"{_NO_VISION}\nReading its text with OCR failed too: {text}\n"
+                f"Inspect the data the image was made from instead."), False
+    return (f"{_NO_VISION}\nInstead, here is the text read from it with OCR "
+            f"(labels, numbers, captions — not the visual content):\n\n{text}\n\n"
+            f"For anything that depends on the shape of the picture, look at the "
+            f"data it was made from."), True
+
+
 def _view_image(
     path: str,
     working_dir: str,
     note: str = "",
     label: str = "",
+    viewport: str = "",
 ) -> tuple[str, bool]:
     """Show an image to the model itself (plots, structures, gels, micrographs).
+    An .html page is rendered in a headless browser and shown as a screenshot.
 
     Returns a text ack; the pixels are queued for the agent loop to attach."""
+    fragment = ""
+    if "#" in path:
+        base, _, frag = path.partition("#")
+        if Path(base).suffix.lower() in _HTML_EXTS:
+            path, fragment = base, frag
     supported = vision_supported()
-    if supported is False:
-        return (
-            "This model cannot accept image input, so the picture was NOT shown "
-            "to you — do not describe it as if you had seen it. Use image_ocr to "
-            "read any text/labels in it, inspect the underlying data file, or "
-            "switch to a vision-capable model. (Override the detection with "
-            "`model_vision` in config.json if this model really does see images.)",
-            False,
-        )
+    # A page is still worth rendering without vision: its console errors and
+    # broken images are reported as text.
+    if supported is False and Path(path).suffix.lower() not in _HTML_EXTS:
+        return _view_image_as_text(path, working_dir)
 
     resolved = _resolve(path, working_dir)
     if not resolved.exists():
         return f"File not found: {path}", False
     if not resolved.is_file():
         return f"Not a file: {path}", False
+    if resolved.suffix.lower() in _HTML_EXTS:
+        return _view_html(resolved, fragment, label or path, working_dir, note, viewport)
     if resolved.suffix.lower() not in _IMAGE_EXTS:
         return (
             f"Unsupported image format: {resolved.suffix!r}. "
-            f"Supported: {sorted(_IMAGE_EXTS)}. For PDFs, render a page to PNG "
-            f"first (or use pdf_ocr for text).",
+            f"Supported: {sorted(_IMAGE_EXTS)} and .html pages (rendered in a "
+            f"browser). For PDFs, render a page to PNG first (or use pdf_ocr for text).",
             False,
         )
 
@@ -2791,6 +3184,7 @@ def _view_image(
         "b64": base64.b64encode(blob).decode("ascii"),
         "note": (note or "").strip(),
     })
+    _note_viewed(resolved)
 
     sent = f"{img.width}x{img.height}" if scale < 1 else f"{width}x{height}"
     scaled = f" (downscaled from {width}x{height})" if scale < 1 else ""

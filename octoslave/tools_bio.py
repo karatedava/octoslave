@@ -235,8 +235,8 @@ BIO_TOOL_DEFINITIONS = [
                 "legends, rasterised data tables) that pypdf's text extractor "
                 "cannot see. Use this AFTER read_file on a PDF if the answer "
                 "you need is in a figure (e.g. 'value in Figure 1C'). Requires "
-                "PyMuPDF (`pip install pymupdf`) for rendering and pytesseract "
-                "+ the `tesseract` binary for OCR. Without tesseract the tool "
+                "PyMuPDF (`pip install pymupdf`) for rendering and the "
+                "`tesseract` binary for OCR. Without tesseract the tool "
                 "still extracts page images for inspection."
             ),
             "parameters": {
@@ -1287,12 +1287,10 @@ def _pdf_ocr(path: str, working_dir: str, pages: str = "all", dpi: int = 200,
     except ImportError:
         return ("PyMuPDF is not installed. Run: pip install pymupdf "
                 "(needed to render PDF pages to images).", False)
-    try:
-        import pytesseract  # type: ignore
-        _has_tess = True
-    except ImportError:
-        pytesseract = None
-        _has_tess = False
+    # OCR through the shared helper: pytesseract when present, else the
+    # tesseract command itself (the packaged app does not bundle pytesseract).
+    from .tools import _find_tesseract, _tesseract
+    _has_tess = _find_tesseract() is not None
     try:
         from PIL import Image
     except ImportError:
@@ -1332,7 +1330,10 @@ def _pdf_ocr(path: str, working_dir: str, pages: str = "all", dpi: int = 200,
     matrix = fitz.Matrix(zoom, zoom)
 
     page_results: list[dict] = []
-    tess_warning: str | None = None
+    tess_warning: str | None = None if _has_tess else (
+        "tesseract is not installed, so no text was extracted. Install it: "
+        "macOS `brew install tesseract`, Debian `apt install tesseract-ocr`. "
+        "Page images are still saved if output_dir was provided.")
 
     for p_idx in page_indices:
         page = doc.load_page(p_idx)
@@ -1349,14 +1350,9 @@ def _pdf_ocr(path: str, working_dir: str, pages: str = "all", dpi: int = 200,
         if _has_tess:
             try:
                 img = Image.open(io.BytesIO(png_bytes))
-                ocr_text = pytesseract.image_to_string(img, lang=lang)
-            except pytesseract.TesseractNotFoundError:
-                _has_tess = False
-                tess_warning = (
-                    "tesseract binary not found on PATH. Install: "
-                    "macOS `brew install tesseract`, Debian `apt install tesseract-ocr`. "
-                    "Page images still saved if output_dir was provided."
-                )
+                ocr_text, err = _tesseract(img, lang, 3)
+                if err:
+                    ocr_text = f"[OCR error on page {p_idx+1}: {err}]"
             except Exception as e:
                 ocr_text = f"[OCR error on page {p_idx+1}: {e}]"
 

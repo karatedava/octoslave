@@ -72,7 +72,9 @@ hidden = [
     # octoslave Science (web research orchestrator) — imported lazily
     "octoslave.science", "octoslave.science.session",
     "octoslave.science.orchestrator", "octoslave.science.tools",
-    "octoslave.science.context",
+    "octoslave.science.context", "octoslave.science.channel", "octoslave.steer",
+    "octoslave.science.index", "octoslave.science.specialists",
+    "octoslave.science.workspace",
     # macOS launcher
     "octoslave.mac_launcher",
     # FastAPI / Starlette
@@ -96,6 +98,10 @@ hidden = [
     # email / http stdlib extras required by httpx/openai
     "email.mime.multipart", "email.mime.text", "email.mime.base",
     "http.server",
+    # image_ocr / pdf_ocr / view_image without vision. Pure-Python wrapper;
+    # the tesseract binary stays external (the tools fall back to calling it
+    # directly if this is missing).
+    "pytesseract",
 ]
 
 a = Analysis(
@@ -107,7 +113,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["rdkit", "anndata", "scipy", "pytesseract"],
+    excludes=["rdkit", "anndata", "scipy"],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
