@@ -26,7 +26,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Optional
 
 
 def _short(text: str, limit: int) -> str:
@@ -53,6 +53,9 @@ class Run:
     thread: Optional[threading.Thread] = None
     ident: Optional[int] = None      # its thread id, set once it starts (for cancel)
     ended: Optional[float] = None
+    # Files it proposed showing the researcher. A specialist does not present
+    # anything itself: the orchestrator checks these and decides.
+    proposed: list = field(default_factory=list)
 
     @property
     def elapsed(self) -> float:
@@ -77,6 +80,9 @@ class Pool:
         self._runs: dict[str, Run] = {}
         self._news = threading.Event()   # set whenever a specialist reports back
         self._cancelled = False
+        # Files each working specialist has written, so two running in parallel
+        # cannot silently overwrite each other's (see claim()).
+        self._claims: dict[str, str] = {}
 
     # -- dispatch ---------------------------------------------------------
     def start(self, run: Run, target, args: tuple) -> None:
@@ -110,8 +116,33 @@ class Pool:
                 r.ident = threading.get_ident()
             return not self._cancelled
 
+    def claim(self, path: str, sid: str) -> Optional[Run]:
+        """Record that specialist ``sid`` writes ``path``. Returns the OTHER
+        specialist already writing it while still working (a conflict), or
+        None. A claim lasts until its owner finishes: handing a finished
+        specialist's file on to another one is normal and allowed."""
+        with self._lock:
+            owner = self._claims.get(path)
+            if owner and owner != sid:
+                other = self._runs.get(owner)
+                if other is not None and other.status == "working":
+                    return other
+            self._claims[path] = sid
+            return None
+
+    def propose(self, sid: str, item: dict) -> bool:
+        """Record an output specialist ``sid`` suggests showing (one per path)."""
+        with self._lock:
+            r = self._runs.get(sid)
+            if r is None:
+                return False
+            r.proposed = [p for p in r.proposed if p.get("rel") != item.get("rel")] + [item]
+            return True
+
     def finish(self, sid: str, status: str, summary: str, ok: bool = True) -> None:
         with self._lock:
+            for p in [p for p, o in self._claims.items() if o == sid]:
+                del self._claims[p]
             r = self._runs.get(sid)
             if r is None or r.status != "working":
                 return
@@ -201,8 +232,10 @@ class Pool:
 _REPORT_GUIDANCE = (
     "(Verify what it claims against the files it says it produced before you "
     "relay any of it, then tell the researcher in the chat what came back and "
-    "what you are doing with it. If specialists are still working, carry on "
-    "with what you can do meanwhile rather than waiting in silence.)"
+    "what you are doing with it. Present only the proposed files that are real "
+    "findings or deliverables — skip anything that is working material. If "
+    "specialists are still working, carry on with what you can do meanwhile "
+    "rather than waiting in silence.)"
 )
 
 
@@ -212,9 +245,17 @@ def format_reports(runs: list[Run], pool: "Pool") -> str:
     for r in runs:
         took = f" after {r.elapsed / 60:.0f} min" if r.elapsed >= 60 else ""
         head = f"**{r.name}** ({r.role}) {r.status}{took}"
+        proposed = ""
+        if r.proposed:
+            proposed = ("\n\n**Proposed for the researcher** (not shown to them — "
+                        "your call):\n" + "\n".join(
+                            f"- `{p['rel']}` — {p.get('caption') or '(no caption)'}"
+                            + (" (interim)" if p.get("interim") else "")
+                            for p in r.proposed))
         parts.append(f"{head}.\nIts id is `{r.id}` — use continue_specialist to "
                      f"take its work further rather than spawning another agent "
-                     f"for the same area.\n\n{r.summary or '(no summary returned)'}")
+                     f"for the same area.\n\n{r.summary or '(no summary returned)'}"
+                     f"{proposed}")
     body = "\n\n---\n\n".join(parts)
     still = pool.running()
     tail = ""
@@ -249,6 +290,8 @@ class SoloWatch:
         self._lock = threading.Lock()
         self._streak = 0
         self._warned_at = 0
+        self._warnings = 0
+        self._by_tool: dict[str, int] = {}
 
     def note_tool(self, name: str) -> None:
         """One tool call BY THE ORCHESTRATOR (never a specialist's)."""
@@ -256,30 +299,45 @@ class SoloWatch:
             if name in ("spawn_specialist", "continue_specialist"):
                 self._streak = 0
                 self._warned_at = 0
+                self._warnings = 0
+                self._by_tool = {}
             else:
                 self._streak += 1
+                self._by_tool[name] = self._by_tool.get(name, 0) + 1
 
     def nudge(self) -> str:
         """A reminder to delegate, or "" when none is due.
 
-        Once per ``limit`` calls at most: a reminder on every call past the
-        threshold would be nagging, and an orchestrator that has just decided the
-        work is genuinely indivisible should be left to get on with it.
+        The first comes after ``limit`` calls; each one that goes unheeded
+        brings the next sooner (down to half the limit). A single
+        reminder was easy to answer with "this is indivisible" and then ignore
+        for hundreds of calls — the streak kept growing with nobody dispatched.
         """
         with self._lock:
-            if self._streak < self.limit \
-                    or self._streak < self._warned_at + self.limit:
+            gap = max(self.limit // 2, self.limit // (1 + self._warnings))
+            if self._streak < self.limit or self._streak < self._warned_at + gap:
                 return ""
             n, self._warned_at = self._streak, self._streak
+            self._warnings += 1
+            top = sorted(self._by_tool.items(), key=lambda kv: -kv[1])[:3]
+            again = self._warnings > 1
+        mix = ", ".join(f"{k} ×{v}" for k, v in top)
+        node = any(k.startswith("cluster_") or k in ("write_cluster_file",
+                   "fetch_cluster_file", "submit_cluster_job") for k, _ in top)
         return (
             f"[Note to you, the orchestrator — not from the researcher]\n\n"
             f"You have made {n} tool calls in a row yourself without dispatching "
-            f"anyone. That is the pattern this role exists to avoid: your context "
+            f"anyone ({mix})"
+            + (" — and this is not the first reminder" if again else "")
+            + ". That is the pattern this role exists to avoid: your context "
             f"fills with detail, the researcher waits on a single thread of work, "
             f"and the specialists you could have had running in parallel are idle.\n"
             f"Look at what is left and split off whatever is a bounded piece with a "
-            f"clear deliverable — then dispatch those together and supervise. If "
-            f"the remaining work genuinely cannot be handed over (it is one "
+            f"clear deliverable — then dispatch those together and supervise."
+            + (" Work on the compute node delegates well: a specialist given the "
+               "cluster tools can build, run and inspect it while you supervise."
+               if node else "")
+            + " If the remaining work genuinely cannot be handed over (it is one "
             f"indivisible thread, or it depends on what the researcher just told "
             f"you), carry on and say so in one line so they know it is deliberate."
         )

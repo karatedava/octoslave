@@ -8,6 +8,7 @@ Signature contract (same as the Lab foundry): ``run(args, working_dir) ->
 from __future__ import annotations
 
 import json
+import re
 import posixpath
 import shlex
 import subprocess
@@ -254,17 +255,25 @@ def _prior_work(session, exclude_id: str = "") -> str:
 
 
 _SPECIALIST_BRIEF = ("You are a specialist reporting to a research orchestrator. "
-                     "Stay strictly within your goal. A researcher is watching "
-                     "live: when a figure or table they would want to see exists — "
-                     "even a first pass while your work continues — show it with "
-                     "present_output (interim=true for an early look), and note "
-                     "its exact path in your final summary.")
+                     "Stay strictly within your goal. When you produce a real "
+                     "finding the researcher should see — a figure, a result "
+                     "table, a report, on real data — propose it with "
+                     "present_output (interim=true for a first pass); the "
+                     "orchestrator decides what reaches the researcher. Never "
+                     "propose working material: scripts, install or how-to "
+                     "notes, job files, logs, tests or checks on synthetic data, "
+                     "placeholders. Note the exact path of every result in your "
+                     "final summary.")
 
 # Tools every specialist gets on top of its grant: surfacing its own results,
 # recording how they were made, and LOOKING at a figure or page before reporting
 # it. The other science tools (dispatching agents, cluster jobs) stay with the
 # orchestrator — no recursion, one place that owns compute.
 SPECIALIST_SHARED_TOOLS = ("present_output", "record_provenance", "view_image")
+
+# Science tools a specialist may be GIVEN when the orchestrator asks for them:
+# self-contained lookups with no session side effects and no way to recurse.
+SPECIALIST_GRANTABLE = ("literature_search",)
 
 
 def _run_specialist(ctx, rec, spec, task: str, working_dir: str, *,
@@ -458,7 +467,7 @@ def _run_specialist_blocking(ctx, rec, spec, task: str, working_dir: str, *,
     return ((f"{note}\n" if note else "")
             + f"Specialist '{rec.name}' ({rec.role}) {verb}. Its id is `{rec.id}` — "
             f"use continue_specialist to give it more work rather than spawning "
-            f"another agent for the same area.\n\n{summary}", True)
+            f"another agent for the same area.\n\n{summary}{_take_proposals(rec.id)}", True)
 
 
 def _resolve_specialist_model(ctx, requested) -> tuple[str, str]:
@@ -512,7 +521,17 @@ def _run_spawn_specialist(args: dict, working_dir: str) -> tuple[str, bool]:
 
     valid = _tools.valid_tool_names()
     # Never hand a spawned specialist the meta science tools (no recursion).
-    granted = [t for t in req_tools if t in valid and t not in SCIENCE_TOOL_NAMES]
+    granted = [t for t in req_tools if t in valid
+               and (t not in SCIENCE_TOOL_NAMES or t in SPECIALIST_GRANTABLE)]
+    # Say what was not granted: a specialist told to do a literature sweep
+    # without the tool for it otherwise improvises, and nobody knows why.
+    withheld = [t for t in req_tools if t not in granted]
+    if withheld:
+        note_tools = (f"Not granted (unknown, or orchestrator-only): "
+                      f"{', '.join(withheld)}. Do that part yourself, or give the "
+                      f"specialist its result.")
+    else:
+        note_tools = ""
     if not granted:
         granted = ["read_file", "write_file", "edit_file", "bash",
                    "glob", "grep", "list_dir"]
@@ -543,7 +562,8 @@ def _run_spawn_specialist(args: dict, working_dir: str) -> tuple[str, bool]:
                      icon=icon, status="working")
     ctx.session.add_specialist(rec)
     runner = _run_specialist_blocking if _truthy(args.get("wait")) else _run_specialist
-    return runner(ctx, rec, spec, task or goal, working_dir, note=model_note)
+    note = "\n".join(n for n in (model_note, note_tools) if n)
+    return runner(ctx, rec, spec, task or goal, working_dir, note=note)
 
 
 def _run_continue_specialist(args: dict, working_dir: str) -> tuple[str, bool]:
@@ -707,6 +727,33 @@ def _run_cluster_shell(args: dict, working_dir: str) -> tuple[str, bool]:
 # Cluster / background jobs
 # ---------------------------------------------------------------------------
 
+def _specialist_write_guard(name: str, args: dict, working_dir: str):
+    """Refuse a specialist's write to a file another specialist — still at work
+    in parallel — has written this turn. They share one working directory, and
+    without this the second silently replaced the first's results."""
+    ctx = _ctx.current()
+    sid = _ctx.speaker().get("agent_id")
+    pool = getattr(ctx, "pool", None) if ctx is not None else None
+    if not sid or pool is None:
+        return None                     # the orchestrator, or not a Science run
+    raw = str(args.get("path") or args.get("file_path") or "").strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = Path(working_dir) / p
+    other = pool.claim(str(p.resolve()), sid)
+    if other is None:
+        return None
+    return (f"Not written: '{raw}' belongs to specialist '{other.name}', which is "
+            f"working on it in parallel right now. Write your result to a file of "
+            f"your own (e.g. alongside it, with your own name in it), and say in "
+            f"your report how it relates — the orchestrator will merge them.")
+
+
+_tools.set_write_guard(_specialist_write_guard)
+
+
 def _remote_for(remote_id: str):
     from ..config import get_remote
     return get_remote(None, remote_id) if remote_id else None
@@ -718,11 +765,30 @@ def _remote_workspace(remote: dict, session) -> str:
     fetched back for local rendering). ``<remote_dir or $HOME>/octoslave/<name>``,
     created on first use."""
     from ..remote import RemoteSession
+    key = remote.get("id") or remote.get("name") or remote.get("host") or "?"
+    known = getattr(session, "remote_workspaces", None)
+    if isinstance(known, dict) and known.get(key):
+        return known[key]
     sess = RemoteSession.get(remote)
     base = (remote.get("remote_dir") or "").strip() or sess.home()
     name = posixpath.basename((session.working_dir or "session").rstrip("/")) or "session"
-    ws = posixpath.normpath(posixpath.join(base, "octoslave", name))
+    legacy = posixpath.normpath(posixpath.join(base, "octoslave", name))
+    # Named after the folder alone, two local projects both called "analysis"
+    # shared one workspace (and overwrote each other's jobs and results). New
+    # sessions add a tag from the full local path; a session that already has
+    # work in the old place keeps it there.
+    import hashlib
+    tag = hashlib.sha1((session.working_dir or "").encode()).hexdigest()[:6]
+    ws = posixpath.normpath(posixpath.join(base, "octoslave", f"{name}-{tag}"))
+    if getattr(session, "messages", None) and sess.is_dir(legacy):
+        ws = legacy
     sess.mkdirs(ws)
+    if isinstance(known, dict):
+        known[key] = ws
+        try:
+            session.save()
+        except Exception:  # noqa: BLE001
+            pass
     return ws
 
 
@@ -754,8 +820,10 @@ which whereis type command man info help env printenv export set module ml
 df free lscpu lsblk nproc vmstat lsmod ulimit getconf nvidia-smi rocm-smi
 sinfo squeue sacct scontrol sstat qstat qhost pbsnodes
 mkdir rmdir touch chmod chgrp chown ln
-grep egrep fgrep sort uniq cut tr jq column awk sed
+grep egrep fgrep cut tr jq column
 """.split())
+# Not sort / uniq / awk / sed: over a large file each is a computation in its
+# own right, and refusing one as "only looking" sent real work to cluster_shell.
 
 # A trailing `--version` / `--help` makes even a heavy binary a probe.
 _PROBE_FLAGS = ("--help", "-h", "--version", "-V", "--list", "-l")
@@ -794,7 +862,10 @@ def _looks_like_a_probe(command: str) -> bool:
         base = posixpath.basename(head)
         if base in _PROBE_COMMANDS:
             continue
-        if any(f in seg for f in _PROBE_FLAGS):
+        # `tool --version`, `script.py --help` — the flag must END a short
+        # command. Anywhere in it, `-l`/`-h` are ordinary options of real work
+        # (`bash -l run.sh`, `sim.py -h 0.5`).
+        if seg[-1] in _PROBE_FLAGS and (len(seg) <= 2 or seg[-1].startswith("--")):
             continue
         return False                      # something real in the chain
     return saw
@@ -865,6 +936,7 @@ def _run_submit_job(args: dict, working_dir: str) -> tuple[str, bool]:
                 f"The node said:\n{_clip_job_output(out, 2000) or '(nothing)'}\n\n"
                 f"Fix that before retrying — nothing is running.", False)
     job.status = "running"
+    job.last_checked = _now_stamp()
     ctx.session.add_job(job)
     _emit_job(job)
     return (f"Submitted job '{name}' on {label} "
@@ -883,20 +955,40 @@ def _submit_remote(remote: dict, command: str, cwd: str, scheduler: str,
         return handle, (out + err).strip()
     if scheduler == "pbs":
         out, err, code = sess.run(f"qsub {command}", cwd, timeout=180)
-        return out.strip().split()[0] if out.strip() else "", (out + err).strip()
+        return _parse_pbs_id(out), (out + err).strip()
     # shell: launch detached, capture PID, tee to a log file
     log = f"science_{jid}.log"
     # shlex.quote, not json.dumps: JSON escapes are not shell escapes, so a
     # newline arrived as a literal "\n" (fusing the lines of a multi-line
     # command into one) and non-ASCII text as "\uXXXX".
     qcwd = shlex.quote(cwd)
-    wrapped = (f"mkdir -p {qcwd} && cd {qcwd} && "
-               f"nohup sh -c {shlex.quote(command)} > {log} 2>&1 & echo $!")
+    rc = f"science_{jid}.rc"
+    wrapped = (f"mkdir -p {qcwd} && cd {qcwd} && rm -f {rc} && "
+               f"nohup sh -c {shlex.quote(_with_exit_code(command, rc))} "
+               f"> {log} 2>&1 & echo $!")
     # Launching is quick, but the host's setup snippet and the login shell run
     # first; 60s was not always enough, and a submit that times out looks like a
     # job that never started.
     out, err, code = sess.run(wrapped, cwd, timeout=180)
     return _parse_pid(out), (out + err).strip()
+
+
+def _with_exit_code(command: str, rc_path: str) -> str:
+    """The command, followed by a record of the status it exited with.
+
+    Polling a detached shell job can only see whether its process is still
+    there, so a job that crashed in its first second looked exactly like one
+    that finished its work: both reported "done". Leaving the exit status
+    behind in a file is what lets the poll tell success from failure.
+
+    The command runs in a subshell: plenty of real submissions end in an
+    explicit ``exit``, which would otherwise take the whole wrapper with it and
+    leave no status behind at all.
+    """
+    return (f"(\n{command}\n)\n"
+            f"__octo_rc=$?\n"
+            f"echo $__octo_rc > {shlex.quote(rc_path)}\n"
+            f"exit $__octo_rc\n")
 
 
 def _parse_pid(text: str) -> str:
@@ -919,22 +1011,48 @@ def _submit_local(command: str, cwd: str, scheduler: str, jid: str,
     logdir = ctx.session.science_dir / "jobs"
     logdir.mkdir(parents=True, exist_ok=True)
     logf = logdir / f"{jid}.log"
-    if scheduler == "slurm":
-        r = subprocess.run(["sbatch", command], cwd=cwd, capture_output=True,
-                           text=True, timeout=120)
-        return _parse_slurm_id(r.stdout), (r.stdout + r.stderr).strip()
+    if scheduler in ("slurm", "pbs"):
+        # Through the shell, like the remote path: the command is a script plus
+        # its arguments, which a one-element argv would pass as a single name.
+        submit = "sbatch" if scheduler == "slurm" else "qsub"
+        r = subprocess.run(f"{submit} {command}", cwd=cwd, shell=True,
+                           capture_output=True, text=True, timeout=120)
+        parse = _parse_slurm_id if scheduler == "slurm" else _parse_pbs_id
+        return parse(r.stdout), (r.stdout + r.stderr).strip()
     # shell background
+    rcf = logdir / f"{jid}.rc"
+    rcf.unlink(missing_ok=True)
     fh = open(logf, "w")
-    proc = subprocess.Popen(command, cwd=cwd, shell=True, stdout=fh,
-                            stderr=subprocess.STDOUT)
+    # Its own session, so a Ctrl-C or restart of the server does not take a
+    # long computation down with it.
+    proc = subprocess.Popen(_with_exit_code(command, str(rcf)), cwd=cwd,
+                            shell=True, stdout=fh, stderr=subprocess.STDOUT,
+                            start_new_session=True)
     return str(proc.pid), f"started (pid {proc.pid}), log: {logf}"
 
 
 def _parse_slurm_id(text: str) -> str:
-    # "Submitted batch job 12345"
-    for tok in (text or "").split():
-        if tok.isdigit():
-            return tok
+    """The id from sbatch's "Submitted batch job 12345" (or --parsable's
+    "12345;cluster"). A login banner may print numbers first, so look for
+    sbatch's own line before falling back to a bare id on a line by itself."""
+    import re
+    m = re.search(r"Submitted batch job (\d+)", text or "")
+    if m:
+        return m.group(1)
+    for line in (text or "").splitlines():
+        m = re.fullmatch(r"\s*(\d+)(;\S+)?\s*", line)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _parse_pbs_id(text: str) -> str:
+    """qsub prints the job id ("1234567.pbs-m1.example") on a line of its own."""
+    import re
+    for line in reversed((text or "").splitlines()):
+        m = re.fullmatch(r"\s*(\d+(\[\d*\])?(\.[\w.-]+)?)\s*", line)
+        if m:
+            return m.group(1)
     return ""
 
 
@@ -972,83 +1090,274 @@ def _run_check_job(args: dict, working_dir: str) -> tuple[str, bool]:
     except (TypeError, ValueError):
         lines = 120
     remote = _remote_for(job.remote_id or "")
+    sci_dir = ctx.session.science_dir
     try:
-        status, out = _poll_job(job, remote, ctx, lines=lines)
+        status, out = _poll_job(job, remote, sci_dir, lines=lines)
     except Exception as exc:  # noqa: BLE001
-        status, out = "unknown", str(exc)
+        # Not reaching the node says nothing about the job: keep its last known
+        # status (and its old check time, so the panel shows it as unconfirmed).
+        since = f" (last confirmed {job.last_checked})" if job.last_checked else ""
+        return (f"Could not reach {job.remote_label} to check job '{job.name}' "
+                f"({job.id}): {exc}\nIts status is NOT known right now — the "
+                f"last reading was '{job.status}'{since}. Do not treat it as "
+                f"finished; try again later or check the connection.", False)
 
     job.status = status
+    job.last_checked = _now_stamp()
     if out:
         job.output = _clip_job_output(out, 4000)
     # persist by re-adding through the session lock path
     for j in ctx.session.jobs:
         if j.id == job.id:
             j.status, j.output = job.status, job.output
+            j.last_checked = job.last_checked
     ctx.session.save()
     _emit_job(job)
     return (f"Job '{job.name}' ({job.id}) on {job.remote_label}: {status}. "
-            f"Log: {_job_log_path(job, remote, ctx)}\n"
+            f"Log: {_job_log_path(job, remote, sci_dir)}\n"
             f"{_clip_job_output(out) if out else ''}", True)
 
 
-def _job_log_path(job: Job, remote, ctx) -> str:
+def _now_stamp() -> str:
+    from datetime import datetime
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _job_log_path(job: Job, remote, science_dir) -> str:
     """Where this job's output is being written (on the node, or locally)."""
-    if job.scheduler == "slurm":
+    if job.scheduler in ("slurm", "pbs"):
         return f"(scheduler output under {job.cwd})"
     if remote:
         return posixpath.join(job.cwd or ".", f"science_{job.id}.log")
-    return str(ctx.session.science_dir / "jobs" / f"{job.id}.log")
+    return str(Path(science_dir) / "jobs" / f"{job.id}.log")
 
 
-def _poll_job(job: Job, remote, ctx, lines: int = 120) -> tuple[str, str]:
-    if job.scheduler == "slurm":
-        cmd = (f"sacct -j {job.handle} --format=State,Elapsed,ExitCode "
-               f"--noheader --parsable2 2>/dev/null | head -1 || "
-               f"squeue -j {job.handle} -h -o %T")
-        out = _run_anywhere(cmd, job.cwd, remote)
-        s = out.strip().lower()
-        if not s:
-            return "done", out
-        if "running" in s or "pending" in s:
-            return "running", out
-        if "completed" in s:
-            return "done", out
-        if "fail" in s or "cancel" in s or "timeout" in s:
-            return "failed", out
-        return "unknown", out
-    # shell: is the pid alive? tail the log. A finished-but-unreaped LOCAL child
-    # lingers as a zombie (state 'Z'), which `kill -0` still reports as alive — so
-    # the job would appear to run forever. Check the process STATE instead and
-    # treat an empty state (gone) or a zombie as done. Works for remote too (a
-    # done nohup'd job is reaped by init → empty state).
-    log = (f"science_{job.id}.log" if remote else
-           str(ctx.session.science_dir / "jobs" / f"{job.id}.log"))
+_LIVE_JOB_STATUS = ("submitted", "running")
+
+
+def reconcile_jobs(session, *, emit=None, lines: int = 40) -> list[Job]:
+    """Re-ask the node about every job this session still believes is live.
+
+    A job's status is otherwise only refreshed when the model happens to call
+    check_cluster_job. A job nobody polled therefore keeps whatever it was given
+    at submit time — so the Jobs panel shows "running" for work that finished
+    days ago, which is the single most misleading thing the panel can do.
+
+    Returns the jobs whose status actually changed. A job we cannot reach is
+    left as it was, with its old check time — the panel then shows that reading
+    as unconfirmed — and is asked about again on the next pass. Only evidence
+    from the node changes a status.
+    """
+    changed: list[Job] = []
+    live = [j for j in list(session.jobs) if j.status in _LIVE_JOB_STATUS]
+    if not live:
+        return changed
+    sci_dir = session.science_dir
+    for job in live:
+        before = job.status
+        try:
+            remote = _remote_for(job.remote_id or "")
+            status, out = _poll_job(job, remote, sci_dir, lines=lines)
+        except Exception:  # noqa: BLE001
+            # Unreachable: leave the job as it was. Its check time stays old,
+            # so the panel marks the reading unconfirmed, and the next pass
+            # asks again — it must not drop out of the re-check for good.
+            continue
+        job.status = status
+        job.last_checked = _now_stamp()
+        if out:
+            job.output = _clip_job_output(out, 2000)
+        if status != before:
+            changed.append(job)
+        if emit is not None:
+            try:
+                emit({"type": "science_job", "id": job.id, "name": job.name,
+                      "status": job.status, "remote": job.remote_label,
+                      "scheduler": job.scheduler, "handle": job.handle,
+                      "last_checked": job.last_checked,
+                      "output": job.output[-1500:], "reconciled": True})
+            except Exception:  # noqa: BLE001
+                pass
+    try:
+        session.save()
+    except Exception:  # noqa: BLE001
+        pass
+    return changed
+
+
+class _Unreachable(Exception):
+    """The node could not be asked about a job (ssh failure, timeout, a missing
+    job directory). Says nothing about the job itself — callers keep its last
+    known status instead of inventing one."""
+
+
+# Marks the start of the probe's own output. Login banners, module notices and
+# ssh warnings can surround it; anything before the marker is ignored, and a
+# reply without it means the probe never ran.
+_PROBE = "__OCTO_PROBE__"
+
+_SLURM_LIVE = {"PENDING", "RUNNING", "CONFIGURING", "COMPLETING", "REQUEUED",
+               "REQUEUE_HOLD", "REQUEUE_FED", "RESIZING", "SUSPENDED", "STOPPED",
+               "SIGNALING", "STAGE_OUT", "RESV_DEL_HOLD"}
+_SLURM_FAILED = {"FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY",
+                 "PREEMPTED", "DEADLINE", "BOOT_FAIL", "REVOKED", "SPECIAL_EXIT"}
+# PBS job_state letters: queued, running, held, waiting, transit, exiting,
+# begun (array), suspended, moved. F (PBS Pro) / X (finished subjob) = ended.
+_PBS_LIVE = set("QRHWTEBSMU")
+
+_NO_EXIT_STATUS = (
+    "The process is gone but left no exit status, so whether it succeeded is "
+    "NOT known: it was killed (signal, node reboot, a server restart), never "
+    "started properly, or was submitted before exit statuses were recorded. "
+    "Check its log and its expected outputs before using any result.")
+
+
+def _probe_job(cmd: str, cwd: str, remote) -> dict[str, str]:
+    """Run a probe that prints ``KEY=value`` lines after :data:`_PROBE` and
+    then (after ``__OCTO_LOG__``) any log text. Raises :class:`_Unreachable`
+    when the reply does not contain the marker."""
+    full = f"echo {_PROBE}; {cmd}"
+    if remote:
+        from ..remote import RemoteSession
+        out, err, rc = RemoteSession.get(remote).run(full, cwd, timeout=60)
+    else:
+        try:
+            r = subprocess.run(full, cwd=cwd or None, shell=True,
+                               capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise _Unreachable(str(exc)) from exc
+        out, err, rc = r.stdout, r.stderr, r.returncode
+    if _PROBE not in out:
+        why = (err or out or "").strip() or f"no reply (exit {rc})"
+        raise _Unreachable(why[-600:])
+    body = out.split(_PROBE, 1)[1]
+    head, _, log = body.partition("__OCTO_LOG__")
+    fields: dict[str, str] = {"_log": log.lstrip("\n")}
+    for line in head.splitlines():
+        k, sep, v = line.strip().partition("=")
+        if sep and k.startswith("__OCTO_"):
+            fields[k[len("__OCTO_"):]] = v.strip()
+    return fields
+
+
+def _poll_job(job: Job, remote, science_dir, lines: int = 120) -> tuple[str, str]:
+    """(status, output) for ``job``, from one round trip to where it runs.
+
+    Every status is backed by evidence: "done" needs an exit status of 0 (or
+    the scheduler's COMPLETED), "failed" a non-zero one or a failure state.
+    What cannot be told apart is "unknown", with the reason — never "done".
+    Raises :class:`_Unreachable` when the node could not be asked at all.
+    """
     if not job.handle:
         # Nothing was ever launched (the submit failed). `ps -p ` with no pid
         # matches nothing, which would read as "finished" — say what is true.
         return "failed", (job.output or "the submit returned no process id")
-    alive_cmd = (f"S=$(ps -o stat= -p {job.handle} 2>/dev/null | tr -d ' '); "
-                 f"case \"$S\" in ''|Z*) echo GONE;; *) echo ALIVE;; esac")
-    alive = _run_anywhere(alive_cmd, job.cwd, remote).strip()
-    tail = _run_anywhere(f"tail -n {lines} {shlex.quote(log)} 2>/dev/null", job.cwd, remote)
-    status = "running" if "ALIVE" in alive else "done"
-    return status, tail
+    h = shlex.quote(job.handle)
+    if job.scheduler == "slurm":
+        return _poll_slurm(job, h, remote, lines)
+    if job.scheduler == "pbs":
+        return _poll_pbs(job, h, remote, lines)
+    # shell: is the pid alive? A finished-but-unreaped LOCAL child lingers as a
+    # zombie (state 'Z'), which `kill -0` still reports as alive — so check the
+    # process STATE and treat an empty state (gone) or a zombie as ended.
+    log = (f"science_{job.id}.log" if remote else
+           str(Path(science_dir) / "jobs" / f"{job.id}.log"))
+    rc_path = (f"science_{job.id}.rc" if remote else
+               str(Path(science_dir) / "jobs" / f"{job.id}.rc"))
+    f = _probe_job(
+        f"S=$(ps -o stat= -p {h} 2>/dev/null | tr -d ' '); "
+        f"case \"$S\" in ''|Z*) echo __OCTO_STATE=GONE;; *) echo __OCTO_STATE=ALIVE;; esac; "
+        f"[ -f {shlex.quote(rc_path)} ] && echo __OCTO_RC=$(cat {shlex.quote(rc_path)}); "
+        f"echo __OCTO_LOG__; tail -n {int(lines)} {shlex.quote(log)} 2>/dev/null",
+        job.cwd, remote)
+    tail = f["_log"]
+    if f.get("STATE") == "ALIVE":
+        return "running", tail
+    # Gone. The exit status the wrapper left behind says whether that means
+    # finished or crashed — without it, every dead process would read as success.
+    code = f.get("RC", "")
+    if code == "0":
+        return "done", tail
+    if code.lstrip("-").isdigit():
+        return "failed", f"exited with status {code}\n{tail}"
+    return "unknown", f"{_NO_EXIT_STATUS}\n{tail}"
 
 
-def _run_anywhere(cmd: str, cwd: str, remote) -> str:
-    if remote:
-        from ..remote import RemoteSession
-        out, err, _ = RemoteSession.get(remote).run(cmd, cwd, timeout=60)
-        return out + err
-    r = subprocess.run(cmd, cwd=cwd or None, shell=True, capture_output=True,
-                       text=True, timeout=60)
-    return r.stdout + r.stderr
+def _log_tail_cmd(path_expr: str, lines: int) -> str:
+    return (f"echo __OCTO_LOG__; P={path_expr}; "
+            f"[ -n \"$P\" ] && [ -f \"$P\" ] && tail -n {int(lines)} \"$P\"")
+
+
+def _poll_slurm(job: Job, h: str, remote, lines: int) -> tuple[str, str]:
+    # squeue first: it knows a job the moment it is queued, while sacct can
+    # lag behind or be switched off — and `sacct | head || squeue` never fell
+    # back, because a pipeline's status is head's. sacct then gives the final
+    # state and exit code of a job that has left the queue.
+    f = _probe_job(
+        f"echo __OCTO_Q=$(squeue -j {h} -h -o %T 2>/dev/null | head -1); "
+        f"echo __OCTO_A=$(sacct -j {h} -X -n -P -o State,ExitCode 2>/dev/null | head -1); "
+        + _log_tail_cmd(
+            f"$(scontrol show job {h} 2>/dev/null | tr ' ' '\\n' | sed -n 's/^StdOut=//p'); "
+            f"[ -z \"$P\" ] && P=slurm-{job.handle}.out", lines),
+        job.cwd, remote)
+    tail = f["_log"]
+    queued = f.get("Q", "").upper()
+    acct = f.get("A", "")
+    # sacct says e.g. "CANCELLED by 1234|0:15": the state is the first word.
+    acct_state = (acct.split("|")[0].split() or [""])[0].upper()
+    state = queued or acct_state
+    info = f"scheduler state: {acct or queued}\n{tail}".rstrip()
+    if not state:
+        return "unknown", ("The scheduler has no record of this job (it finished "
+                           "on a cluster without accounting, was purged, or the "
+                           "id is wrong). Check its output files before using "
+                           f"any result.\n{tail}").rstrip()
+    if state in _SLURM_LIVE:
+        return "running", info
+    if state == "COMPLETED":
+        code = acct.split("|")[1] if "|" in acct else "0:0"
+        return ("done" if code.split(":")[0] in ("0", "") else "failed"), info
+    if state in _SLURM_FAILED:
+        return "failed", info
+    return "unknown", info
+
+
+def _poll_pbs(job: Job, h: str, remote, lines: int) -> tuple[str, str]:
+    # PBS Pro / OpenPBS keep finished jobs visible with -x; Torque has no -x and
+    # forgets a job shortly after it ends.
+    f = _probe_job(
+        f"Q=$(qstat -xf {h} 2>/dev/null || qstat -f {h} 2>/dev/null); "
+        f"echo __OCTO_S=$(printf '%s\\n' \"$Q\" | sed -n 's/^ *job_state = //p' | head -1); "
+        f"echo __OCTO_X=$(printf '%s\\n' \"$Q\" | sed -n 's/^ *Exit_status = //p' | head -1); "
+        + _log_tail_cmd(
+            # qstat -f wraps long values onto tab-indented continuation lines.
+            "$(printf '%s\\n' \"$Q\" | awk '/^ *Output_Path = /{p=$0; "
+            "sub(/^ *Output_Path = [^:]*:/, \"\", p); if ((getline n) > 0 && n ~ /^\\t/) "
+            "{ sub(/^\\t/, \"\", n); p = p n }; print p; exit }')", lines),
+        job.cwd, remote)
+    tail = f["_log"]
+    state, code = f.get("S", "").upper()[:1], f.get("X", "")
+    info = f"job_state={state or '?'} Exit_status={code or '?'}\n{tail}".rstrip()
+    if not state:
+        return "unknown", ("The scheduler has no record of this job (Torque "
+                           "forgets finished jobs, or the id is wrong). Check its "
+                           f"output files before using any result.\n{tail}").rstrip()
+    if state in ("F", "X"):
+        if code == "0":
+            return "done", info
+        if code.lstrip("-").isdigit():
+            return "failed", info
+        return "unknown", info
+    if state in _PBS_LIVE:
+        return "running", info
+    return "unknown", info
 
 
 def _emit_job(job: Job) -> None:
     _emit_compute({"type": "science_job", "id": job.id, "name": job.name,
                    "status": job.status, "remote": job.remote_label,
                    "scheduler": job.scheduler, "handle": job.handle,
+                   "last_checked": job.last_checked,
                    "output": job.output[-1500:]})
 
 
@@ -1118,8 +1427,24 @@ def _run_fetch_cluster_file(args: dict, working_dir: str) -> tuple[str, bool]:
     if not sess.is_file(remote_path):
         return (f"fetch_cluster_file: no such file on "
                 f"{remote.get('name', remote_id)}: {remote_path}", False)
-    dest_name = str(args.get("dest", "")).strip() or posixpath.basename(remote_path)
+    ws = _remote_workspace(remote, ctx.session)
+    explicit = str(args.get("dest", "")).strip()
+    if explicit:
+        dest_name = explicit
+    else:
+        # Keep the node's layout: run1/fig.png and run2/fig.png are different
+        # results, and flattening both to fig.png made the second overwrite the
+        # first (and the first's output card show the second's figure).
+        rel = posixpath.relpath(remote_path, ws)
+        dest_name = (rel if not rel.startswith("..")
+                     else posixpath.join("fetched", posixpath.basename(remote_path)))
     local_dest = Path(ctx.session.working_dir) / dest_name
+    if not explicit and local_dest.exists():
+        stem, suf, n = local_dest.stem, local_dest.suffix, 2
+        while (cand := local_dest.with_name(f"{stem}-{n}{suf}")).exists():
+            n += 1
+        local_dest = cand
+        dest_name = str(Path(dest_name).with_name(cand.name))
     try:
         local_dest.parent.mkdir(parents=True, exist_ok=True)
         sess.pull(remote_path, dest=str(local_dest))
@@ -1134,6 +1459,63 @@ def _run_fetch_cluster_file(args: dict, working_dir: str) -> tuple[str, bool]:
 # Present output (inline artifact card) + provenance + curated dataset
 # ---------------------------------------------------------------------------
 
+# What the researcher's workspace is NOT for: the material agents use to get a
+# result, as opposed to the result. Shown to them, it buries the findings.
+_WORKING_SUFFIXES = frozenset(
+    ".py .sh .bash .zsh .slurm .pbs .sbatch .qsub .js .ts .r .pl .rb .jl .yaml .yml "
+    ".toml .cfg .ini .conf .env .lock .log .out .err .pyc .pkl .tmp .bak .swp".split())
+_WORKING_DIRS = frozenset(
+    "scratch tmp temp test tests testing debug sandbox fixture fixtures smoke "
+    "__pycache__ .cache logs log jobs scripts bin env venv .venv node_modules".split())
+# Deliberately not "test", "probe", "temp", "setup": a t-test table, a
+# test-set score, microarray probes and a temperature curve are all results.
+_WORKING_NAME = re.compile(
+    r"(?<![a-z])(howto|how_to|readme|install|installer|smoke|debug|scratch|tmp|"
+    r"skeleton|placeholder|handoff|dryrun|dry_run|sanity|fixture|mock|dummy|"
+    r"run_commands|commands|manifest|config)(?![a-z])")
+_WORKING_CAPTION = re.compile(
+    r"\b(smoke[- ]test|synthetic (data|inputs?|complex(es)?|fixtures?|examples?)|"
+    r"on synthetic|placeholders?|skeleton|dry[- ]run|sanity[- ]check|mock (data|run)|"
+    r"dummy (data|run)|test (run|fixture|render)|install(ation)? (notes|script|"
+    r"commands)|how[- ]?to|handoff|scratch)\b", re.I)
+
+
+def _working_material(p: Path, rel: str, caption: str) -> str:
+    """Why ``p`` looks like working material rather than a result ("" if not)."""
+    parts = [x.lower() for x in Path(rel).parts[:-1]]
+    if parts[:1] == ["science"]:
+        return "it is part of the session's own record (science/)"
+    if p.suffix.lower() in _WORKING_SUFFIXES:
+        return f"a {p.suffix} file is code, configuration or a log"
+    hit = next((d for d in parts if d in _WORKING_DIRS), None)
+    if hit:
+        return f"it lives in a '{hit}/' directory"
+    m = _WORKING_NAME.search(p.stem.lower())
+    if m:
+        return f"its name marks it as working material ('{m.group(1)}')"
+    m = _WORKING_CAPTION.search(caption or "")
+    if m:
+        return f"its caption describes working material ('{m.group(0)}')"
+    return ""
+
+
+# Proposals from a specialist run inline (spawn_specialist wait=true), which has
+# no background-pool record to carry them; handed over with its result.
+_PROPOSALS: dict[str, list[dict]] = {}
+_PROPOSALS_LOCK = threading.Lock()
+
+
+def _take_proposals(sid: str) -> str:
+    with _PROPOSALS_LOCK:
+        items = _PROPOSALS.pop(sid, [])
+    if not items:
+        return ""
+    return ("\n\n**Proposed for the researcher** (not shown to them — your call; "
+            "present only real findings or deliverables):\n"
+            + "\n".join(f"- `{x['rel']}` — {x.get('caption') or '(no caption)'}"
+                         + (" (interim)" if x.get("interim") else "") for x in items))
+
+
 def _run_present_output(args: dict, working_dir: str) -> tuple[str, bool]:
     ctx = _ctx.current()
     if ctx is None:
@@ -1146,9 +1528,45 @@ def _run_present_output(args: dict, working_dir: str) -> tuple[str, bool]:
         p = Path(working_dir) / raw
     if not p.exists():
         return f"present_output: no such file '{raw}'.", False
+    rel = _relpath(p, working_dir)
+    caption = str(args.get("caption", "")).strip()
+    requested = _truthy(args.get("requested"))
+    resolved = str(p.resolve())
+    on_screen = any(a.path == resolved for a in ctx.session.artifacts)
+    # Updating a card the researcher already has is always fine; anything new
+    # has to be a result, not the scaffolding around one.
+    if not on_screen and not requested:
+        if resolved in (getattr(ctx.session, "hidden_outputs", None) or []):
+            return (f"Not presented: the researcher removed '{rel}' from their "
+                    f"workspace. Do not show it again unless they ask for it "
+                    f"(then requested=true).", False)
+        why = _working_material(p, rel, caption)
+        if why:
+            return (f"Not presented: '{rel}' looks like working material — {why}.\n"
+                    f"The researcher's workspace is for findings: figures, result "
+                    f"tables, reports, curated datasets and the deliverables they "
+                    f"asked for. Scripts, install or how-to notes, job files, "
+                    f"logs, tests and checks on synthetic data, and placeholders "
+                    f"stay out of it — use them, mention them in your reply if the "
+                    f"researcher should know they exist, and present the result "
+                    f"they produce instead. If the researcher explicitly asked to "
+                    f"see this very file, call present_output again with "
+                    f"requested=true.", False)
+    sid = _ctx.speaker().get("agent_id")
+    if sid and not on_screen:
+        # A specialist proposes; the orchestrator, which verifies its report,
+        # decides what the researcher sees.
+        item = {"rel": rel, "caption": caption, "interim": _truthy(args.get("interim"))}
+        pool = getattr(ctx, "pool", None)
+        if pool is None or not pool.propose(sid, item):
+            with _PROPOSALS_LOCK:       # a specialist run inline (wait=true)
+                kept = [x for x in _PROPOSALS.get(sid, []) if x["rel"] != rel]
+                _PROPOSALS[sid] = kept + [item]
+        return (f"Proposed '{rel}' to the orchestrator — it goes with your report, "
+                f"and the orchestrator decides whether the researcher sees it. "
+                f"Mention it in your final summary too.", True)
     kind = str(args.get("kind", "")).strip() or _infer_kind(p)
-    art = Artifact(path=str(p.resolve()), rel=_relpath(p, working_dir),
-                   caption=str(args.get("caption", "")).strip(), kind=kind,
+    art = Artifact(path=resolved, rel=rel, caption=caption, kind=kind,
                    provenance=str(args.get("provenance", "")).strip(),
                    interim=_truthy(args.get("interim")),
                    # Set when a specialist presents its own result (see _speaker);
@@ -1203,10 +1621,27 @@ def _run_record_provenance(args: dict, working_dir: str) -> tuple[str, bool]:
     }
     if not entry["artifact"]:
         return "record_provenance needs an `artifact` name/path.", False
+    entry["artifact"] = _ledger_key(entry["artifact"], working_dir)
     ctx.session.add_provenance(entry)
     _ctx.emit({"type": "science_provenance", "entry": entry})
     return (f"Recorded provenance for '{entry['artifact']}' in "
             f"science/PROVENANCE.md (FAIR ledger).", True)
+
+
+def _ledger_key(artifact: str, working_dir: str) -> str:
+    """One spelling per output in the provenance ledger: "./results/fig.png",
+    "results/fig.png" and its absolute path are the same file, and recorded
+    under different keys one of them would read as never recorded."""
+    a = artifact.strip()
+    if "/" not in a and "\\" not in a:
+        return a                       # a name, not a path
+    p = Path(a).expanduser()
+    if p.is_absolute():
+        try:
+            return p.resolve().relative_to(Path(working_dir).resolve()).as_posix()
+        except ValueError:
+            return str(p)
+    return posixpath.normpath(a.replace("\\", "/"))
 
 
 def _run_curate_dataset(args: dict, working_dir: str) -> tuple[str, bool]:
@@ -1231,24 +1666,42 @@ def _run_curate_dataset(args: dict, working_dir: str) -> tuple[str, bool]:
             fields = json.loads(fields)
         except Exception:
             fields = [f.strip() for f in fields.split(",") if f.strip()]
-    resources = [{
-        "name": name,
+    if not fields:
+        fields = _infer_fields(p)
+    resource = {
+        "name": name.lower().replace(" ", "-"),
+        "title": name,
         "path": p.name,
         "format": p.suffix.lstrip("."),
+        "description": str(args.get("description", "")).strip(),
+        "sources": args.get("sources") or [],
         "schema": {"fields": [
             ({"name": f} if isinstance(f, str) else f) for f in fields
         ]} if fields else {},
-    }]
-    pkg = {
-        "name": name.lower().replace(" ", "-"),
-        "title": str(args.get("title", "")).strip() or name,
-        "description": str(args.get("description", "")).strip(),
-        "sources": args.get("sources") or [],
-        "licenses": args.get("licenses") or [{"name": "CC-BY-4.0"}],
-        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "resources": resources,
     }
+    # A licence is the data owner's decision: record one only when given.
+    # Defaulting to CC-BY-4.0 stated terms nobody had chosen.
+    lic = args.get("license") or args.get("licenses")
+    if isinstance(lic, str):
+        lic = [{"name": lic}]
     dp = p.parent / "datapackage.json"
+    # One package per directory, one resource per file: curating a second file
+    # beside the first adds to the package instead of replacing it.
+    try:
+        pkg = json.loads(dp.read_text()) if dp.exists() else {}
+    except Exception:  # noqa: BLE001
+        pkg = {}
+    if not isinstance(pkg, dict):
+        pkg = {}
+    others = [r for r in (pkg.get("resources") or [])
+              if isinstance(r, dict) and r.get("path") != p.name]
+    pkg.setdefault("name", (p.parent.name or name).lower().replace(" ", "-"))
+    pkg["title"] = str(args.get("title", "")).strip() or pkg.get("title") or name
+    pkg.setdefault("created", time.strftime("%Y-%m-%dT%H:%M:%S"))
+    pkg["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    if lic:
+        pkg["licenses"] = lic
+    pkg["resources"] = others + [resource]
     dp.write_text(json.dumps(pkg, indent=2))
 
     art = Artifact(path=str(p.resolve()), rel=_relpath(p, working_dir),
@@ -1256,15 +1709,57 @@ def _run_curate_dataset(args: dict, working_dir: str) -> tuple[str, bool]:
                    provenance=str(args.get("description", "")).strip())
     art = ctx.session.add_artifact(art)
     ctx.session.add_provenance({
-        "artifact": name, "method": "curated into FAIR datapackage",
+        "artifact": art.rel, "method": "curated into FAIR datapackage",
         "inputs": str(args.get("sources") or raw),
         "notes": f"datapackage.json written to {dp}",
     })
     _ctx.emit({"type": "science_artifact", "id": art.id, "rel": art.rel,
                "path": art.path, "caption": art.caption, "kind": art.kind,
                "provenance": art.provenance})
+    missing = [] if lic or pkg.get("licenses") else [
+        "no licence recorded — ask the researcher which applies, then curate "
+        "again with license=…"]
+    if not fields:
+        missing.append("no column schema — pass fields=[{name, type, description}]")
     return (f"Curated '{name}' as a FAIR dataset (datapackage.json at {dp}) and "
-            f"surfaced it (id={art.id}).", True)
+            f"surfaced it (id={art.id})."
+            + ("".join(f"\nStill missing: {m}." for m in missing)), True)
+
+
+def _infer_fields(p: Path) -> list:
+    """Column names (and a rough type) from a delimited file's first rows, so a
+    dataset is never packaged without any schema at all."""
+    if p.suffix.lower() not in (".csv", ".tsv", ".txt"):
+        return []
+    import csv
+    try:
+        with p.open(newline="", encoding="utf-8", errors="replace") as fh:
+            sample = fh.read(65536)
+        delim = "\t" if p.suffix.lower() == ".tsv" or sample.count("\t") > sample.count(",") else ","
+        rows = list(csv.reader(sample.splitlines()[:51], delimiter=delim))
+    except Exception:  # noqa: BLE001
+        return []
+    if not rows or not rows[0]:
+        return []
+
+    def kind(vals: list[str]) -> str:
+        vals = [v for v in vals if v.strip() not in ("", "NA", "nan", "NaN", "null")]
+        if not vals:
+            return "any"
+        try:
+            [int(v) for v in vals]
+            return "integer"
+        except ValueError:
+            pass
+        try:
+            [float(v) for v in vals]
+            return "number"
+        except ValueError:
+            return "string"
+
+    cols = list(zip(*[r + [""] * (len(rows[0]) - len(r)) for r in rows[1:]])) if len(rows) > 1 else []
+    return [{"name": h, "type": kind(list(cols[i])) if i < len(cols) else "any"}
+            for i, h in enumerate(rows[0])]
 
 
 # ---------------------------------------------------------------------------
@@ -1275,17 +1770,24 @@ def _run_literature_search(args: dict, working_dir: str) -> tuple[str, bool]:
     query = str(args.get("query", "")).strip()
     if not query:
         return "literature_search needs a `query`.", False
-    limit = max(1, min(25, int(args.get("limit", 8) or 8)))
+    try:
+        limit = max(1, min(25, int(args.get("limit", 8) or 8)))
+    except (TypeError, ValueError):
+        limit = 8
     url = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
     params = {"query": query, "format": "json", "pageSize": limit,
               "resultType": "core"}
     try:
         data = _http_json(url, params)
     except Exception as exc:  # noqa: BLE001
-        return f"literature_search failed: {exc}", False
+        return (f"literature_search failed — the search did not run, so this "
+                f"says nothing about the literature: {exc}", False)
     results = (data.get("resultList") or {}).get("result") or []
     if not results:
-        return f"No literature hits for '{query}'.", True
+        total = (data.get("hitCount") or 0)
+        return (f"No literature hits for '{query}' on Europe PMC (hitCount "
+                f"{total}). Before concluding nothing is published, retry with "
+                f"broader terms or synonyms — the query syntax is literal.", True)
     lines = [f"Top {len(results)} results for '{query}' (Europe PMC):", ""]
     for r in results:
         authors = r.get("authorString", "")
@@ -1296,6 +1798,14 @@ def _run_literature_search(args: dict, working_dir: str) -> tuple[str, bool]:
             f"- {r.get('title','(untitled)').rstrip('.')} "
             f"({r.get('pubYear','?')}). {authors[:120]}"
             f" — cited {cite}× — {ident}")
+        # The abstract, so claims rest on what a paper reports rather than on
+        # its title. Trimmed: this is a lead to follow, not the paper.
+        abstract = " ".join(str(r.get("abstractText") or "").split())
+        if abstract:
+            import re as _re
+            abstract = _re.sub(r"<[^>]+>", "", abstract)
+            lines.append(f"  Abstract: {abstract[:600]}"
+                         + ("…" if len(abstract) > 600 else ""))
     return "\n".join(lines), True
 
 
@@ -1471,27 +1981,39 @@ SCIENCE_TOOL_DEFINITIONS = [
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "File path on the cluster. "
                      "Relative paths resolve against the job's session workspace."},
-            "dest": {"type": "string", "description": "Local filename to save as "
-                     "(optional; defaults to the remote basename)."},
+            "dest": {"type": "string", "description": "Local path to save as, "
+                     "relative to the working directory (optional). By default "
+                     "the file keeps its path within the node workspace, and an "
+                     "existing local file is never overwritten — a numbered copy "
+                     "is made instead. Give dest to replace a file on purpose."},
             "remote_id": {"type": "string", "description": "Configured remote id "
                           "(optional; defaults to the session's compute node)."},
         }, "required": ["path"]}}},
     {"type": "function", "function": {
         "name": "present_output",
-        "description": "Surface a file (plot, table, report, dataset) to the researcher: "
-                       "it appears in the conversation and opens in their live "
-                       "workspace, where they can comment to refine it. Call this "
-                       "whenever something they should see exists — including early "
-                       "looks at work in progress (interim=true). Presenting the same "
-                       "path again updates that card in place.",
+        "description": "Show the researcher a RESULT: a figure, a result table, a "
+                       "report, a curated dataset, or a deliverable they asked for. "
+                       "It appears in the conversation and their workspace, where "
+                       "they can comment to refine it. Present findings, not working "
+                       "material — scripts, install/how-to notes, job files, logs, "
+                       "tests or checks on synthetic data, and placeholders are "
+                       "refused. interim=true marks a first look at a real result "
+                       "still being completed. Presenting the same path again "
+                       "updates that card in place. (A specialist's call proposes "
+                       "the file to the orchestrator instead.)",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "Path to the output file."},
             "caption": {"type": "string"},
             "kind": {"type": "string", "enum": ["image", "table", "report", "dataset", "text", "file"]},
             "provenance": {"type": "string", "description": "One line on how it was made."},
             "interim": {"type": "boolean", "description": "True for a preliminary look "
-                        "(first-pass plot, partial table) while the work continues; "
-                        "present the same path again without it once final."},
+                        "at a real result (first-pass plot, partial table on real "
+                        "data) while the work continues; present the same path "
+                        "again without it once final."},
+            "requested": {"type": "boolean", "description": "Only when the "
+                          "researcher explicitly asked to see this very file (e.g. "
+                          "'show me the script') — it then bypasses the "
+                          "working-material filter."},
         }, "required": ["path"]}}},
     {"type": "function", "function": {
         "name": "record_provenance",
@@ -1522,8 +2044,13 @@ SCIENCE_TOOL_DEFINITIONS = [
             "title": {"type": "string"},
             "description": {"type": "string"},
             "fields": {"type": "array", "items": {"type": "object"},
-                       "description": "Column schema: [{name, type, description}, …]."},
+                       "description": "Column schema: [{name, type, description}, …]. "
+                       "If omitted, names and rough types are read from a CSV/TSV "
+                       "header — descriptions still need you."},
             "sources": {"type": "array", "items": {"type": "object"}},
+            "license": {"type": "string", "description": "Licence id chosen by "
+                        "the data owner (e.g. CC-BY-4.0, CC0-1.0). Never assume "
+                        "one — omit it and ask if it is not known."},
         }, "required": ["path"]}}},
     {"type": "function", "function": {
         "name": "literature_search",

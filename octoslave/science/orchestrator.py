@@ -14,6 +14,8 @@ the turn going until the inbox is empty — so nothing sent mid-run is dropped.
 
 from __future__ import annotations
 
+import time as _time
+
 from .. import display
 from .. import steer
 from .. import tools as _tools
@@ -28,6 +30,20 @@ from . import tools as _science_tools
 #: How many times specialist reports may extend one turn. Generous — real work
 #: runs in several waves — but finite, so a dispatch-on-every-report cycle ends.
 SUPERVISE_ROUND_LIMIT = 40
+
+#: Working memory of the orchestrator, in tokens. Older rounds beyond this are
+#: compacted into summaries: what matters long-term lives in the outputs, the
+#: provenance ledger and the summaries, and a days-long session stays as quick
+#: on its hundredth turn as on its first.
+SCIENCE_HISTORY_TOKENS = 200_000
+
+#: Seconds between saves of the orchestrator's history while its loop runs, so
+#: a crash or restart mid-turn loses at most this much of what it did.
+_HISTORY_SAVE_INTERVAL = 60.0
+
+#: Seconds between re-polls of the jobs still open on record (one round trip to
+#: the node each, so not every agent step).
+_JOB_POLL_INTERVAL = 120.0
 
 
 def run_science_turn(
@@ -55,6 +71,12 @@ def run_science_turn(
     as an FYI first); the turn only ends once the inbox is empty and closed.
     """
     emit = emit or (lambda ev: None)
+    # Without a caller's inbox nobody can steer, but the turn still needs one:
+    # specialist reports and the live-history saves ride on it.
+    if inbox is None:
+        inbox = steer.Inbox()
+    from ..agent import set_budget_cap
+    set_budget_cap(SCIENCE_HISTORY_TOKENS)
     pool = [m for m in (specialist_models or []) if m]
     crew = _specialists.Pool()
     solo = _specialists.SoloWatch()
@@ -101,6 +123,36 @@ def run_science_turn(
             if aid and aid not in refresh_ids:
                 refresh_ids.append(aid)
 
+    # Jobs are only re-polled on a timer: each poll is a round trip to the node,
+    # and nothing here is worth a connection per agent step.
+    jobs_polled: dict = {"at": 0.0}
+
+    def _job_news() -> str:
+        """Re-poll open jobs now and then; report the ones that have ended.
+
+        The orchestrator submits a job and often never polls it again, so it can
+        sit waiting for work that finished long ago — and the researcher's Jobs
+        panel keeps saying "running". Checking on a timer fixes both.
+        """
+        now = _time.monotonic()
+        if now - jobs_polled["at"] < _JOB_POLL_INTERVAL:
+            return ""
+        jobs_polled["at"] = now
+        try:
+            changed = _science_tools.reconcile_jobs(session, emit=emit)
+        except Exception:  # noqa: BLE001
+            return ""
+        if not changed:
+            return ""
+        lines = [f"- '{j.name}' (id `{j.id}`) is **{j.status}**" for j in changed]
+        return ("## Jobs you had not polled\n"
+                "The node was asked about the jobs still open on record:\n"
+                + "\n".join(lines)
+                + "\n\nUse check_cluster_job for the output of any of these you "
+                  "still need, and carry on — do not wait on them. A failed or "
+                  "unknown one has not produced a result you can rely on: look "
+                  "at its log before using anything it wrote.")
+
     def _news_mid_loop() -> str:
         """News for the orchestrator at its next step, while its loop is running:
         a specialist's report, or a reminder that it has been working alone for a
@@ -115,16 +167,37 @@ def run_science_turn(
         done = crew.collect()
         if done:
             parts.append(_specialists.format_reports(done, crew))
-        elif not crew.any_running():
-            # Only when nobody is working — if specialists are already running,
-            # the orchestrator is doing the right thing by carrying on.
+        # Jobs the orchestrator never polled: tell it the ones that have ended,
+        # so it neither waits on finished work nor leaves the panel lying.
+        jobs_news = _job_news()
+        if jobs_news:
+            parts.append(jobs_news)
+        if not parts and not crew.any_running():
+            # Only when nobody is working and there is no other news — if
+            # specialists are running, the orchestrator is right to carry on.
             nudge = solo.nudge()
             if nudge:
                 parts.append(nudge)
         return "\n\n---\n\n".join(parts)
 
+    history_saved = {"at": _time.monotonic()}
+
+    def _on_round(live: list[dict]) -> None:
+        """Track the loop's live history (it rebinds its list as it goes), so
+        every save made mid-turn — a spawn, a job, an output — writes what the
+        orchestrator has actually done, and save it now and then on its own."""
+        session.messages = live
+        now = _time.monotonic()
+        if now - history_saved["at"] >= _HISTORY_SAVE_INTERVAL:
+            history_saved["at"] = now
+            try:
+                session.save()
+            except Exception:  # noqa: BLE001
+                pass
+
     if inbox is not None:
         inbox.on_deliver = _on_deliver
+        inbox.on_round = _on_round
         # Specialist reports ride the same channel as live messages, so the
         # orchestrator hears about a finished specialist at its next step even
         # while it is busy with other work — not only once it goes idle.
@@ -345,10 +418,17 @@ def run_science_turn(
                       "dropped": True})
             inbox.on_deliver = None
             inbox.reports = None
+            inbox.on_round = None
             steer.unbind()
+        # An error ends the turn without the saves above: keep what was done.
+        try:
+            session.save()
+        except Exception:  # noqa: BLE001
+            pass
         _science_tools.unregister()
         clear_context()
         display.clear_event_callback()
+        set_budget_cap(None)
 
 
 def _last_assistant_text(messages: list[dict], raw: bool = False) -> str:

@@ -3,7 +3,8 @@ import { Markdown } from "./Markdown";
 import { FileView } from "./Viewers";
 import { useNow } from "./Feed";
 import type { Artifact, SciState } from "./store";
-import { artUrl, baseName, EDITABLE, fmtDur, fmtWhen, kindIcon, mediaType, viewUrl } from "./util";
+import { artUrl, baseName, EDITABLE, fmtAgo, fmtDur, fmtWhen, kindIcon, mediaType,
+  STALE_AFTER_MS, viewUrl } from "./util";
 
 export type Doc = { type: "art"; id: string } | { type: "file"; path: string; rel: string } | null;
 export type WsTab = "preview" | "outputs" | "team" | "jobs" | "prov";
@@ -20,12 +21,18 @@ type Props = {
   onRefine: (artId: string) => void;
   onFocusSpec: (id: string) => void;
   onMention: (rel: string) => void;
+  onAutoContinue: (on: boolean) => void;
+  onHide: (artId: string) => void;
 };
 
 export function Workspace(p: Props) {
   const { st } = p;
   const working = Object.values(st.specialists).filter((s) => s.status === "working").length;
-  const activeJobs = Object.values(st.jobs).filter((j) => ["submitted", "running"].includes(j.status)).length;
+  // Only jobs the node confirmed recently count as live — an unverified
+  // "running" from days ago must not keep the tab pulsing.
+  const activeJobs = Object.values(st.jobs).filter((j) =>
+    ["submitted", "running"].includes(j.status) && j.last_checked
+    && Date.now() - new Date(j.last_checked).getTime() <= STALE_AFTER_MS).length;
   const tabs: { id: WsTab; label: string; badge?: string | number; live?: boolean }[] = [
     { id: "preview", label: "Preview" },
     { id: "outputs", label: "Outputs", badge: st.artOrder.length || undefined },
@@ -50,7 +57,7 @@ export function Workspace(p: Props) {
           <Outputs st={st} onPick={(id) => { p.setDoc({ type: "art", id }); p.setTab("preview"); }} />
         )}
         {p.tab === "team" && <Team st={st} onFocus={p.onFocusSpec} />}
-        {p.tab === "jobs" && <Jobs st={st} />}
+        {p.tab === "jobs" && <Jobs st={st} onAutoContinue={p.onAutoContinue} />}
         {p.tab === "prov" && <Provenance st={st} workingDir={p.workingDir} />}
       </div>
     </section>
@@ -59,7 +66,7 @@ export function Workspace(p: Props) {
 
 // ---------------------------------------------------------------------------
 
-function Preview({ st, doc, setDoc, follow, setFollow, onRefine, onMention, workingDir }: Props) {
+function Preview({ st, doc, setDoc, follow, setFollow, onRefine, onHide, onMention, workingDir }: Props) {
   const art: Artifact | undefined = doc?.type === "art" ? st.artifacts[doc.id] : undefined;
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
@@ -140,6 +147,8 @@ function Preview({ st, doc, setDoc, follow, setFollow, onRefine, onMention, work
         {!art && <button className="sx-btn sm" onClick={() => onMention(rel)} title="Reference this file in your next message">Ask about this</button>}
         {editable && !editing && <button className="sx-btn sm" onClick={startEdit}>Edit</button>}
         <a className="sx-btn sm" href={url} target="_blank" rel="noreferrer">Open ↗</a>
+        {art && <button className="sx-btn sm" onClick={() => onHide(art.id)}
+          title="Not relevant? Take it off your outputs — the file stays on disk">Hide</button>}
         <span className="sx-spacer" />
         {msg && <span className="sx-muted">{msg}</span>}
         <label className="sx-follow" title="Jump to each new result as it is presented">
@@ -258,24 +267,54 @@ function Team({ st, onFocus }: { st: SciState; onFocus: (id: string) => void }) 
   );
 }
 
-function Jobs({ st }: { st: SciState }) {
+function Jobs({ st, onAutoContinue }: { st: SciState; onAutoContinue: (on: boolean) => void }) {
+  // Keep the "checked Nm ago" line and the staleness cut-off ticking over even
+  // when nothing is running — that is exactly when a reading goes stale.
+  const now = useNow(true, 30000);
   if (!st.jobOrder.length) {
     return <div className="sx-empty"><div className="sx-empty-ic">⎔</div>No jobs yet. This tracks heavy computations — work submitted to a cluster, or long runs on a compute node or here. Ordinary commands the agents run are not jobs and stay out of this list.</div>;
   }
   return (
     <div className="sx-jobs">
-      {st.jobOrder.slice().reverse().map((id) => st.jobs[id]).filter(Boolean).map((j) => (
-        <div key={j.id} className={"sx-job " + j.status}>
-          <div className="sx-job-head">
-            <span className="sx-job-name">{j.name}</span>
-            <span className={"sx-pill " + j.status}>
-              {["submitted", "running"].includes(j.status) && <span className="sx-spin sm" />} {j.status}
-            </span>
+      <label className="sx-auto" title="Between turns, open jobs are re-checked every few minutes. When one ends, the orchestrator looks at the result and carries on with the agreed plan — or stops and asks you if the next step is a decision. At most 8 times in a row without a message from you.">
+        <input type="checkbox" checked={st.autoContinue} onChange={(e) => onAutoContinue(e.target.checked)} />
+        Continue automatically when a job ends
+      </label>
+      {st.jobOrder.slice().reverse().map((id) => st.jobs[id]).filter(Boolean).map((j) => {
+        const live = ["submitted", "running"].includes(j.status);
+        const checked = j.last_checked ? new Date(j.last_checked).getTime() : 0;
+        // A "running" badge means nothing without knowing when the node last
+        // confirmed it: these jobs used to show as running for days after they
+        // had finished. Say how old the reading is, and stop spinning once it
+        // is too old to stand behind.
+        const stale = live && (!checked || now - checked > STALE_AFTER_MS);
+        return (
+          <div key={j.id} className={"sx-job " + j.status + (stale ? " stale" : "")}>
+            <div className="sx-job-head">
+              <span className="sx-job-name">{j.name}</span>
+              <span className={"sx-pill " + j.status + (stale ? " stale" : "")}>
+                {live && !stale && <span className="sx-spin sm" />} {stale ? `${j.status}?` : j.status}
+              </span>
+            </div>
+            <div className="sx-job-meta">
+              {j.remote_label || "local"} · {j.scheduler}{j.handle ? ` · #${j.handle}` : ""}
+              {live && (
+                <span className={"sx-job-checked" + (stale ? " stale" : "")}>
+                  {" · "}
+                  {j.last_checked ? `checked ${fmtAgo(j.last_checked)}` : "not verified"}
+                </span>
+              )}
+            </div>
+            {stale && (
+              <div className="sx-job-warn">
+                Last confirmed {j.last_checked ? fmtAgo(j.last_checked) : "never"} — it may
+                have finished since. Reopening the session re-checks open jobs.
+              </div>
+            )}
+            {j.output && <pre className="sx-code result">{j.output}</pre>}
           </div>
-          <div className="sx-job-meta">{j.remote_label || "local"} · {j.scheduler}{j.handle ? ` · #${j.handle}` : ""}</div>
-          {j.output && <pre className="sx-code result">{j.output}</pre>}
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }

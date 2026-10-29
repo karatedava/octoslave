@@ -14,6 +14,7 @@ import asyncio
 import json
 import os
 import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -774,6 +775,14 @@ async def view_file(file_path: str):
         return HTMLResponse("<p>File not found.</p>", status_code=404)
     suffix = path.suffix.lower()
     if suffix not in _ALLOWED_EXT:
+        # Not viewable inline — but a research output in a Science session
+        # (.xlsx, .parquet, .h5ad, .npy …) must still be retrievable: hand it
+        # over as a download instead of refusing it.
+        root = _science_root_of(path.resolve().parent)
+        if root is not None and not (path.name in _SCIENCE_INTERNAL
+                                     and path.resolve().parent == root / "science"):
+            return FileResponse(str(path), media_type="application/octet-stream",
+                                filename=path.name)
         return HTMLResponse("<p>File type not allowed.</p>", status_code=403)
     media = {
         ".html": "text/html", ".htm": "text/html",
@@ -787,9 +796,38 @@ async def view_file(file_path: str):
         ".sh": "text/plain; charset=utf-8",
         ".pdf": "application/pdf", ".webp": "image/webp",
     }
+    headers = {}
+    if suffix in (".html", ".htm", ".svg"):
+        # Reports and figures come from models, fetched pages and third-party
+        # tools. Rendered on this origin, a script in one could drive the agent
+        # and read or rewrite files through this API. A CSP sandbox gives the
+        # document an opaque origin — its own scripts (interactive plots) still
+        # run, but it cannot reach the app — whether it is shown in a preview
+        # frame or opened in its own tab.
+        headers["Content-Security-Policy"] = (
+            "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox "
+            "allow-forms allow-modals allow-downloads")
     # Everything else on the allow-list is text: serve it as such so the browser
     # shows it inline instead of downloading it.
-    return FileResponse(str(path), media_type=media.get(suffix, "text/plain; charset=utf-8"))
+    return FileResponse(str(path), media_type=media.get(suffix, "text/plain; charset=utf-8"),
+                        headers=headers)
+
+
+def _science_root_of(path: Path) -> Path | None:
+    """The Science session directory ``path`` lies in (itself or an ancestor),
+    or None. A directory is one when it holds a session's saved state or is in
+    the session history — the file endpoints below act only inside one, never
+    on the rest of the disk."""
+    from ..science import index as _index
+    known = {s.get("working_dir") for s in _index.list_sessions()}
+    for cand in (path, *path.parents):
+        if str(cand) in known or (cand / "science" / "state.json").is_file():
+            return cand
+    return None
+
+
+# The session's own bookkeeping: never edited from the page.
+_SCIENCE_INTERNAL = {"state.json", "state.json.bak", "state.json.tmp", "feed.jsonl"}
 
 
 # Names the Science file explorer never lists (tool caches, VCS, env dirs).
@@ -805,6 +843,8 @@ async def science_files(working_dir: str, path: str = ""):
     refused, so the explorer can't be walked up into the rest of the disk.
     """
     root = Path(working_dir).expanduser().resolve()
+    if await asyncio.to_thread(_science_root_of, root) != root:
+        return {"ok": False, "error": "not a Science session directory"}
     target = (root / path).resolve() if path else root
     if target != root and root not in target.parents:
         return {"ok": False, "error": "outside the working directory"}
@@ -876,16 +916,207 @@ async def science_save(payload: dict):
     content = (payload or {}).get("content")
     if not raw or content is None:
         return {"ok": False, "error": "path and content are required"}
-    path = Path(raw)
+    path = Path(raw).expanduser().resolve()
     if path.suffix.lower() not in _EDITABLE_EXT:
         return {"ok": False, "error": f"{path.suffix} is not editable in place"}
     if not path.exists() or not path.is_file():
         return {"ok": False, "error": "file not found"}
+    root = await asyncio.to_thread(_science_root_of, path.parent)
+    if root is None:
+        return {"ok": False, "error": "only files inside a Science session can be edited"}
+    if path.name in _SCIENCE_INTERNAL and path.parent == root / "science":
+        return {"ok": False, "error": "that is the session's own record, not an output"}
     try:
         path.write_text(content)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
     return {"ok": True, "path": str(path.resolve()), "size": len(content)}
+
+
+# ---------------------------------------------------------------------------
+# Science turns (shared by the websocket handler and the job watcher)
+# ---------------------------------------------------------------------------
+
+def _run_science_turn_thread(ch, key, sess, user_message, *, client, model, remote,
+                             refine_id=None, pool=(), inbox=None) -> None:
+    """Run one Science turn on its own thread. ``ch.running`` must already be
+    claimed by the caller; it is released when the turn ends."""
+    from .. import steer
+    from ..science.orchestrator import run_science_turn
+    if inbox is None:
+        inbox = steer.open_inbox(key)
+
+    def science_fn():
+        display.set_event_callback(ch.publish)
+        interrupt.register()
+        ch.agent_ident = threading.get_ident()
+        try:
+            run_science_turn(sess, user_message, client, model, permission_mode="autonomous",
+                             emit=ch.publish, remote=remote,
+                             refresh_artifact_id=refine_id, specialist_models=list(pool),
+                             inbox=inbox)
+        except interrupt.StopRequested:
+            # Record the stop in the session's own history, so the next turn
+            # knows the work was cut short by the user rather than finished.
+            try:
+                sess.messages = _mark_stopped(sess.messages)
+                sess.save()
+            except Exception:
+                pass
+            ch.publish({"type": "science_reply", "stopped": True, "text":
+                        "⏹ Stopped by you. Any running command was killed; the "
+                        "work so far is saved. Send a message to carry on."})
+        except Exception as exc:
+            ch.publish({"type": "error", "text": str(exc)})
+        finally:
+            dropped = inbox.close()
+            if dropped:
+                ch.publish({"type": "science_steer", "dropped": True,
+                            "ids": [it["id"] for it in dropped]})
+            steer.drop_inbox(key, inbox)
+            interrupt.unregister()
+            ch.agent_ident = None
+            display.clear_event_callback()
+            # The authoritative end-of-turn, to EVERY viewer. Published while
+            # still marked running, so a message queued behind this turn that
+            # starts the next one can't be followed by a stale "done".
+            ch.publish({"type": "science_done"})
+            # Between turns is the one safe moment to fold old history away.
+            try:
+                ch.compact_if_needed()
+            except Exception:
+                pass
+            ch.running = False
+            _science_watcher.ensure()
+
+    threading.Thread(target=science_fn, daemon=True).start()
+
+
+class _ScienceWatcher:
+    """Keeps an eye on Science jobs BETWEEN turns.
+
+    Inside a turn the orchestrator hears about jobs on its own. Once the turn is
+    over nobody asked: a computation that finished at 3 a.m. sat unnoticed until
+    the researcher wrote again, and the Jobs panel kept its old reading. This
+    thread re-polls the open jobs of idle sessions and, when one ends, wakes the
+    orchestrator with the news so it can carry on — within limits: at most
+    :attr:`MAX_WAKES` in a row without the researcher saying anything, and never
+    for a session where they switched it off.
+    """
+
+    TICK = 60.0              # seconds between passes
+    POLL_EVERY = 300.0       # seconds between polls of one session's jobs
+    RESCAN_EVERY = 1800.0    # seconds between looks at sessions not yet loaded
+    MAX_WAKES = 8
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._polled: dict[str, float] = {}
+        self._scanned = 0.0
+
+    def ensure(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._thread = threading.Thread(target=self._loop, name="science-watcher",
+                                            daemon=True)
+            self._thread.start()
+
+    def _loop(self) -> None:
+        while True:
+            try:
+                self.tick()
+            except Exception:  # noqa: BLE001 — a watcher must never die
+                pass
+            time.sleep(self.TICK)
+
+    def _candidates(self):
+        """Channels with a loaded session — and, now and then, sessions in the
+        history with open jobs that nobody has opened since the server started."""
+        from ..science.channel import get_channel, all_channels
+        from ..science.session import ScienceSession
+        from ..science import index as _index
+        now = time.monotonic()
+        if now - self._scanned >= self.RESCAN_EVERY:
+            self._scanned = now
+            for entry in _index.list_sessions():
+                wd = entry.get("working_dir") or ""
+                ch = get_channel(wd)
+                if ch.session is None and not ch.running:
+                    try:
+                        sess = ScienceSession.load(wd)
+                    except Exception:  # noqa: BLE001
+                        sess = None
+                    if sess is not None and _open_jobs(sess):
+                        ch.session = sess
+        return [ch for ch in all_channels() if ch.session is not None]
+
+    def tick(self) -> None:
+        from ..science.tools import reconcile_jobs
+        now = time.monotonic()
+        for ch in self._candidates():
+            sess = ch.session
+            if ch.running or not _open_jobs(sess):
+                continue
+            if now - self._polled.get(ch.key, 0.0) < self.POLL_EVERY:
+                continue
+            self._polled[ch.key] = now
+            changed = reconcile_jobs(sess, emit=ch.publish)
+            ended = [j for j in changed if j.status not in ("submitted", "running")]
+            if ended:
+                self._wake(ch, sess, ended)
+
+    def _wake(self, ch, sess, ended) -> None:
+        if not getattr(sess, "auto_continue", True):
+            return
+        if int(getattr(sess, "auto_wakes", 0) or 0) >= self.MAX_WAKES:
+            ch.publish({"type": "info", "text": (
+                f"Jobs finished, but the orchestrator has already continued on its "
+                f"own {self.MAX_WAKES} times in a row — it is waiting for you now.")})
+            return
+        if ch.running:
+            return
+        ch.running = True            # claim before anything can race us
+        try:
+            cfg = load_config()
+            resolved = resolve_backend(cfg)
+            client = make_client(resolved["api_key"], resolved["base_url"])
+            model = sess.model or cfg.get("default_model")
+            remote = get_remote(None, sess.remote_id) if sess.remote_id else None
+        except Exception as exc:  # noqa: BLE001
+            ch.running = False
+            ch.publish({"type": "info", "text": f"Jobs finished, but the orchestrator "
+                        f"could not be started to look at them: {exc}"})
+            return
+        sess.auto_wakes = int(getattr(sess, "auto_wakes", 0) or 0) + 1
+        lines = "\n".join(f"- '{j.name}' (id `{j.id}`) on {j.remote_label}: **{j.status}**"
+                          for j in ended)
+        names = ", ".join(f"“{j.name}”" for j in ended)
+        ch.publish({"type": "science_wake", "text": (
+            f"Job{'s' if len(ended) != 1 else ''} {names} ended — the orchestrator "
+            f"is picking {'them' if len(ended) != 1 else 'it'} up.")})
+        message = (
+            "[Automatic check between turns — not from the researcher]\n\n"
+            f"These jobs have ended since your last turn:\n{lines}\n\n"
+            "Look at each one's output (check_cluster_job) and what it wrote. A "
+            "failed or unknown one has not produced a result you can rely on. "
+            "Then carry on with the plan the researcher agreed to, if its next "
+            "step is clear and already within what they asked for. If the next "
+            "step needs their decision — a new direction, significant extra "
+            "compute, a result that changes the plan — do not start it: tell "
+            "them what came back and what you propose, and end the turn.")
+        _run_science_turn_thread(ch, ch.key, sess, message, client=client,
+                                 model=model, remote=remote,
+                                 pool=list(sess.specialist_models or []))
+
+
+def _open_jobs(sess) -> bool:
+    return any(getattr(j, "status", "") in ("submitted", "running")
+               for j in (getattr(sess, "jobs", None) or []))
+
+
+_science_watcher = _ScienceWatcher()
 
 
 # ---------------------------------------------------------------------------
@@ -916,6 +1147,18 @@ async def ws_endpoint(websocket: WebSocket):
             loop.call_soon_threadsafe(event_q.put_nowait, event)
         return emit
 
+    def chat_steer(msg: dict) -> dict:
+        """A message the user sent while a chat turn runs. It goes into that
+        turn's steering inbox and joins the conversation at the agent's next
+        step. With no turn to take it — none running, or one already wrapping up
+        (inbox closed) — the page is told to send it as the next turn instead."""
+        text = str(msg.get("message", "")).strip()
+        inbox = state.get("chat_inbox")
+        steer_id = inbox.post(text) if (text and inbox is not None) else None
+        if steer_id:
+            return {"type": "steer_queued", "cid": msg.get("cid"), "steer_id": steer_id}
+        return {"type": "steer_late", "cid": msg.get("cid")}
+
     async def stream_events() -> None:
         """Forward agent events to WS; concurrently handle permission_response."""
         async def _drain():
@@ -938,6 +1181,9 @@ async def ws_endpoint(websocket: WebSocket):
                         resolve_permission(bool(msg.get("allow", False)))
                     elif mt == "user_response":
                         resolve_user_response(str(msg.get("answer", "")))
+                    # ---- a message typed while the chat agent works ----
+                    elif mt == "chat_steer":
+                        event_q.put_nowait(chat_steer(msg))
                     # ---- stop the running chat/council agent ----
                     elif mt in ("stop", "stop_chat"):
                         ident = state.get("agent_ident")
@@ -1062,10 +1308,18 @@ async def ws_endpoint(websocket: WebSocket):
         state["working_dir"] = working_dir
         key = sci_key(working_dir)
         ch = get_channel(key)
-        # While a turn runs, the worker's session object is the truth (disk only
-        # catches up at the end of the turn).
-        sess = ch.session if (ch.running and ch.session is not None) \
-            else await asyncio.to_thread(ScienceSession.load, working_dir)
+        # The channel's session object is shared by every connection and is the
+        # truth whenever one exists (while a turn runs, disk lags behind it).
+        # A private copy per tab would let a stale tab's next save overwrite
+        # another tab's turn.
+        try:
+            sess = ch.session if ch.session is not None \
+                else await asyncio.to_thread(ScienceSession.load, working_dir)
+        except ValueError as exc:
+            await send({"type": "error", "sid": key, "text": str(exc)})
+            return
+        if sess is not None and ch.session is None:
+            ch.session = sess
         await sci_unview()
         if sess is None and not ch.running:
             await send({"type": "science_state", "exists": False,
@@ -1073,14 +1327,86 @@ async def ws_endpoint(websocket: WebSocket):
             return
         if sess is not None:
             state["science_session"] = sess
-        sci_subscribe(ch)
-        events = (await asyncio.to_thread(ch.history) if ch.has_log()
-                  else sci_legacy_events(sess) if sess else [])
+        if ch.has_log():
+            if not ch.running:
+                # A session that grew long before compaction existed (or since
+                # the last turn): fold its old history now, before replaying.
+                try:
+                    await asyncio.to_thread(ch.compact_if_needed)
+                except Exception:  # noqa: BLE001
+                    pass
+            q: asyncio.Queue = asyncio.Queue()
+            events = await asyncio.to_thread(ch.attach, loop, q)
+            state["sci_view"] = (ch, q, None)
+        else:
+            sci_subscribe(ch)
+            events = sci_legacy_events(sess) if sess else []
         await send({"type": "science_state", "exists": True, "working_dir": key,
                     "sid": key, "task": getattr(sess, "task", "") or "",
                     "running": ch.running, "events": events,
                     "snapshot": sess.snapshot() if sess else {}})
         sci_forward()
+        # The snapshot we just sent repeats whatever each job was last recorded
+        # as. A job nobody polled still says "running" — possibly from days ago
+        # — so ask the node about the live ones now and publish the real answer.
+        if sess is not None and not ch.running:
+            sci_settle_specialists(sess, ch)
+            sci_reconcile_jobs(sess, ch)
+        _science_watcher.ensure()
+
+    async def sci_hide_artifact(msg: dict) -> None:
+        """The researcher took an output off their workspace (its file stays)."""
+        from ..science.channel import get_channel
+        working_dir = msg.get("working_dir") or state["working_dir"]
+        ch = get_channel(sci_key(working_dir))
+        sess = ch.session
+        if sess is None:
+            return
+        art = await asyncio.to_thread(sess.hide_artifact, str(msg.get("artifact_id") or ""))
+        if art is not None:
+            ch.publish({"type": "science_artifact_removed", "id": art.id, "rel": art.rel})
+
+    async def sci_settings(msg: dict) -> None:
+        """Per-session switches set from the page (e.g. auto-continue)."""
+        from ..science.channel import get_channel
+        working_dir = msg.get("working_dir") or state["working_dir"]
+        ch = get_channel(sci_key(working_dir))
+        sess = ch.session
+        if sess is None:
+            return
+        if "auto_continue" in msg:
+            sess.auto_continue = bool(msg.get("auto_continue"))
+            if sess.auto_continue:
+                sess.auto_wakes = 0
+            await asyncio.to_thread(sess.save)
+        ch.publish({"type": "science_settings", "auto_continue": sess.auto_continue})
+
+    def sci_settle_specialists(sess, ch) -> None:
+        """Specialists a crash or restart left marked "working" (nothing runs
+        between turns) — settle them, so they can be resumed and stop showing
+        as busy."""
+        try:
+            changed = sess.settle_interrupted()
+        except Exception:  # noqa: BLE001
+            return
+        for sp in changed:
+            ch.publish({"type": "science_specialist", "event": "done", "id": sp.id,
+                        "status": "done", "summary": "interrupted (resumable)"})
+
+    def sci_reconcile_jobs(sess, ch) -> None:
+        """Re-poll this session's open jobs off-thread, publishing corrections."""
+        from ..science.tools import reconcile_jobs
+        if not any(getattr(j, "status", "") in ("submitted", "running")
+                   for j in getattr(sess, "jobs", []) or []):
+            return
+
+        def work() -> None:
+            try:
+                reconcile_jobs(sess, emit=ch.publish)
+            except Exception:  # noqa: BLE001
+                pass   # a stale status is survivable; a crashed load is not
+
+        threading.Thread(target=work, name="sci-reconcile", daemon=True).start()
 
     async def sci_message(msg: dict, mtype: str) -> None:
         """A message (or a comment on an output) for a Science session.
@@ -1166,7 +1492,6 @@ async def ws_endpoint(websocket: WebSocket):
                               as_refinement) -> None:
         """Start a turn on a session already claimed by sci_message."""
         from ..science.session import ScienceSession
-        from ..science.orchestrator import run_science_turn
         from .. import steer
 
         cfg = load_config()
@@ -1175,9 +1500,17 @@ async def ws_endpoint(websocket: WebSocket):
         _resolved = resolve_backend(cfg)
         client = make_client(_resolved["api_key"], _resolved["base_url"])
 
-        sess = state.get("science_session")
-        if sess is None or sess.working_dir != key:
-            sess = await asyncio.to_thread(ScienceSession.load, working_dir)
+        # The shared session object first (see sci_load), never a copy this
+        # connection loaded earlier — another tab may have run turns since.
+        sess = ch.session
+        if sess is None:
+            try:
+                sess = await asyncio.to_thread(ScienceSession.load, working_dir)
+            except ValueError as exc:
+                await send({"type": "error", "sid": key, "cid": cid, "text": str(exc)})
+                raise _NotStarted
+        if sess is not None:
+            sci_settle_specialists(sess, ch)
 
         # Model resolution, most specific first: what this message asked for →
         # what this SESSION was started with → the socket's model → config's
@@ -1192,7 +1525,9 @@ async def ws_endpoint(websocket: WebSocket):
             specialist_models = (list(getattr(sess, "specialist_models", []) or [])
                                  or state.get("specialist_models") or [])
         state["specialist_models"] = specialist_models
-        model, _swapped = _healthy_model(model, cfg)
+        # Off the event loop: it asks the backend for its catalog (up to 10s),
+        # which would otherwise freeze every tab and stream meanwhile.
+        model, _swapped = await asyncio.to_thread(_healthy_model, model, cfg)
         if _swapped:
             await send({"type": "info", "sid": key, "text": (
                 f"'{_swapped}' isn't available on this backend — running on "
@@ -1207,7 +1542,7 @@ async def ws_endpoint(websocket: WebSocket):
         refine_id = None
         if mtype == "science_comment":
             if sess is None:
-                await send({"type": "error", "sid": key,
+                await send({"type": "error", "sid": key, "cid": cid,
                             "text": "No science session for this directory."})
                 raise _NotStarted
             art, user_message = as_refinement(sess)
@@ -1226,6 +1561,8 @@ async def ws_endpoint(websocket: WebSocket):
             ch.seed(sci_legacy_events(sess))
 
         sess.remote_id = remote_id
+        # The researcher spoke: the job watcher may continue on its own again.
+        sess.auto_wakes = 0
         # Remember the models this session runs on, so a refine comment, a
         # reload, or reopening it later all stay on the user's choice.
         sess.model = model or sess.model
@@ -1243,45 +1580,9 @@ async def ws_endpoint(websocket: WebSocket):
         ch.publish({"type": "science_user", "text": text, "cid": cid,
                     "artifact_id": refine_id})
 
-        def science_fn(um=user_message, sc=sess, cl=client, md=model, rmt=remote,
-                       rid=refine_id, pool=specialist_models, ib=inbox):
-            display.set_event_callback(ch.publish)
-            interrupt.register()
-            ch.agent_ident = threading.get_ident()
-            try:
-                run_science_turn(sc, um, cl, md, permission_mode="autonomous",
-                                 emit=ch.publish, remote=rmt,
-                                 refresh_artifact_id=rid, specialist_models=pool,
-                                 inbox=ib)
-            except interrupt.StopRequested:
-                # Record the stop in the session's own history, so the next turn
-                # knows the work was cut short by the user rather than finished.
-                try:
-                    sc.messages = _mark_stopped(sc.messages)
-                    sc.save()
-                except Exception:
-                    pass
-                ch.publish({"type": "science_reply", "stopped": True, "text":
-                            "⏹ Stopped by you. Any running command was killed; the "
-                            "work so far is saved. Send a message to carry on."})
-            except Exception as exc:
-                ch.publish({"type": "error", "text": str(exc)})
-            finally:
-                dropped = ib.close()
-                if dropped:
-                    ch.publish({"type": "science_steer", "dropped": True,
-                                "ids": [it["id"] for it in dropped]})
-                steer.drop_inbox(key, ib)
-                interrupt.unregister()
-                ch.agent_ident = None
-                display.clear_event_callback()
-                # The authoritative end-of-turn, to EVERY viewer. Published while
-                # still marked running, so a message queued behind this turn that
-                # starts the next one can't be followed by a stale "done".
-                ch.publish({"type": "science_done"})
-                ch.running = False
-
-        threading.Thread(target=science_fn, daemon=True).start()
+        _run_science_turn_thread(ch, key, sess, user_message, client=client,
+                                 model=model, remote=remote, refine_id=refine_id,
+                                 pool=specialist_models, inbox=inbox)
 
     async def send(event: dict) -> None:
         try:
@@ -1796,29 +2097,56 @@ async def ws_endpoint(websocket: WebSocket):
 
                 turn: dict = {"stopped": False}
 
+                # Live steering: what the user sends while this turn runs lands
+                # here (chat_steer) and the agent loop folds it in at its next
+                # safe point, instead of the message waiting for the turn to end.
+                from .. import steer
+                inbox = steer.Inbox()
+
+                def _steer_delivered(items, to="", who=""):
+                    loop.call_soon_threadsafe(event_q.put_nowait, {
+                        "type": "steer_delivered", "ids": [it["id"] for it in items]})
+
+                inbox.on_deliver = _steer_delivered
+                state["chat_inbox"] = inbox
+
                 def chat_fn(txt=message_text, mdl=model, wd=working_dir, new=new_conv,
                            pp=prompt_profile, pm=permission_mode, roles=council_roles, ultra=use_ultra,
-                           rmt=remote):
+                           rmt=remote, ib=inbox):
                     display.set_event_callback(make_emit())
                     # Allow this run to be interrupted from the UI (Stop button).
                     interrupt.register()
                     state["agent_ident"] = threading.get_ident()
-                    try:
+                    steer.bind(ib)
+
+                    def follow_up(history, text):
                         if roles:
-                            if new:
-                                result = run_council_agent(txt, wd, client, roles,
-                                                           prompt_profile=pp, permission_mode=pm, ultra=ultra,
-                                                           remote=rmt)
-                            else:
-                                result = continue_council_agent(state["messages"], txt, client,
-                                                                roles, wd, pm, ultra=ultra, remote=rmt,
-                                                                prompt_profile=pp)
+                            return continue_council_agent(history, text, client, roles, wd, pm,
+                                                          ultra=ultra, remote=rmt, prompt_profile=pp)
+                        return continue_agent(history, text, mdl, wd, client, pm,
+                                              remote=rmt, prompt_profile=pp)
+
+                    try:
+                        if roles and new:
+                            result = run_council_agent(txt, wd, client, roles,
+                                                       prompt_profile=pp, permission_mode=pm, ultra=ultra,
+                                                       remote=rmt)
                         elif new:
                             result = run_agent(txt, mdl, wd, client, pp, pm, remote=rmt)
                         else:
-                            result = continue_agent(state["messages"], txt, mdl, wd, client, pm,
-                                                    remote=rmt, prompt_profile=pp)
+                            result = follow_up(state["messages"], txt)
                         state["messages"] = result
+                        # A message sent after the agent's last step still belongs
+                        # to this turn: carry on with it rather than leave it for
+                        # the user to send again. close_if_empty is atomic with
+                        # chat_steer's post, so nothing slips between the two.
+                        while not interrupt.should_stop():
+                            late = ib.close_if_empty()
+                            if not late:
+                                break
+                            _steer_delivered(late)
+                            result = follow_up(result, "\n\n".join(it["text"] for it in late))
+                            state["messages"] = result
                         # Persist a project-scoped task-outcome record so a later
                         # chat in the same working directory recalls it (the TUI
                         # does this after each turn; the web layer previously only
@@ -1854,6 +2182,16 @@ async def ws_endpoint(websocket: WebSocket):
                             event_q.put_nowait, {"type": "error", "text": str(exc)}
                         )
                     finally:
+                        # Stop / error: messages the agent never saw are reported
+                        # back, so the page can say so (and offer the text again)
+                        # rather than imply they were acted on.
+                        dropped = ib.close()
+                        steer.unbind()
+                        if state.get("chat_inbox") is ib:
+                            state["chat_inbox"] = None
+                        if dropped:
+                            loop.call_soon_threadsafe(event_q.put_nowait, {
+                                "type": "steer_dropped", "ids": [it["id"] for it in dropped]})
                         interrupt.unregister()
                         state["agent_ident"] = None
                         display.clear_event_callback()
@@ -1866,6 +2204,11 @@ async def ws_endpoint(websocket: WebSocket):
 
                 threading.Thread(target=chat_fn, daemon=True).start()
                 await stream_events()
+
+            # A steering message that arrived after its turn ended: the page
+            # sends it as the next turn.
+            elif mtype == "chat_steer":
+                await send(chat_steer(msg))
 
             elif mtype == "chat_parallel":
                 if state["running"]:
@@ -2155,6 +2498,12 @@ async def ws_endpoint(websocket: WebSocket):
 
             elif mtype in ("science_message", "science_comment"):
                 await sci_message(msg, mtype)
+
+            elif mtype == "science_settings":
+                await sci_settings(msg)
+
+            elif mtype == "science_hide_artifact":
+                await sci_hide_artifact(msg)
 
             elif mtype == "science_stop":
                 from ..science.channel import get_channel

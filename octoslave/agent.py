@@ -1023,6 +1023,9 @@ def configure_runtime(client, model: str, prompt_profile: str) -> bool:
     window = _remote_model_window(client, model)
     _RT.window = window
     _RT.soft_budget = _resolve_soft_budget(window)
+    cap = getattr(_RT, "budget_cap", None)
+    if cap:
+        _RT.soft_budget = min(_RT.soft_budget, cap)
     _RT.tool_result_chars = max(MAX_TOOL_RESULT_CHARS, min(200_000, window * 4 // 16))
     _RT.ollama_thinking = False
     # Non-local runs keep the full tool surface. We propagate the prompt-profile
@@ -1032,6 +1035,16 @@ def configure_runtime(client, model: str, prompt_profile: str) -> bool:
     _RT.tool_profile = prompt_profile
     set_tool_profile(prompt_profile)
     return False
+
+
+def set_budget_cap(tokens: int | None) -> None:
+    """Cap the proactive-trim budget for runs on THIS thread (None = no cap).
+
+    For a conversation meant to last days: kept to the model's full window, its
+    history grows to hundreds of thousands of tokens before anything is
+    compacted — every step gets slower and costlier, and old detail crowds out
+    the current work. A cap makes compaction summarise older rounds sooner."""
+    _RT.budget_cap = int(tokens) if tokens else None
 
 
 def independent_soft_budget(client, model: str) -> int | None:
@@ -3397,7 +3410,7 @@ def _agent_loop(
             # that announced an action and stopped before taking it.
             _botched_attempts = 0
             _silent_turns = 0
-            # The user sent something while this turn was running (web Science):
+            # The user sent something while this turn was running (web chat / Science):
             # answer it instead of ending the turn under their message.
             if steer.deliver(messages):
                 _no_tool_nudges = 0
@@ -3514,7 +3527,7 @@ def _agent_loop(
         # a user message wedged between two tool results breaks the contiguity
         # strict OpenAI-compatible servers require.
         drain_image_attachments(messages)
-        # Same rule for live user messages (web Science steering): they join the
+        # Same rule for live user messages (web chat / Science steering): they join the
         # conversation here, after the round's tool results, and the model sees
         # them on its very next step. New input also resets the "done" counters.
         if steer.deliver(messages):

@@ -20,6 +20,9 @@ from ..tools import all_tool_definitions
 from .llm import complete_json, complete_text
 from .state import AgentSpec, LabSession
 
+# A newline for use inside f-string expressions (no backslashes there before 3.12).
+_NL = "\n"
+
 
 MAX_TEAM = 10
 
@@ -65,7 +68,7 @@ The human has given the lab this task:
 \"\"\"{session.task}\"\"\"
 
 Working directory: {session.working_dir}
-{('Orientation brief (a survey of the working directory — data, prior work, the real objective):\\n' + files_summary) if files_summary else 'No orientation available yet.'}
+{('Orientation brief (a survey of the working directory — data, prior work, the real objective):' + _NL + files_summary) if files_summary else 'No orientation available yet.'}
 
 Design the specialist team. Rules:
 - 3 to {MAX_TEAM} specialists. Each must be genuinely necessary; no filler roles.

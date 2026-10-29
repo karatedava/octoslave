@@ -103,7 +103,7 @@ def _run_gui() -> None:
                     try:
                         _serve()
                     except Exception as exc:
-                        self.after(0, lambda: self._set_status(f"Server error: {exc}"))
+                        self.after(0, lambda exc=exc: self._set_status(f"Server error: {exc}"))
                         self._server_started = False
 
                 threading.Thread(target=_start, daemon=True).start()

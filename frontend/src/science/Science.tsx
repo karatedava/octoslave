@@ -52,15 +52,32 @@ export default function Science() {
   const [rightOpen, setRightOpen] = useState(() => lsGet("sx.right", "1") === "1");
   const [rightW, setRightW] = useState(() => Number(lsGet("sx.rightW", "0")) || Math.round(window.innerWidth * 0.4));
 
-  // Below ~1000px the sidebar and workspace become overlays: one at a time.
+  // Two breakpoints, matching science.css. Below 1180px the sessions rail
+  // floats over the conversation (there is no room to dock all three columns);
+  // below 980px the workspace floats too, and then it is one panel at a time.
+  const [tight, setTight] = useState(() => window.matchMedia("(max-width: 1180px)").matches);
   const [narrow, setNarrow] = useState(() => window.matchMedia("(max-width: 980px)").matches);
   useEffect(() => {
-    const mq = window.matchMedia("(max-width: 980px)");
-    const on = () => setNarrow(mq.matches);
-    mq.addEventListener("change", on);
-    return () => mq.removeEventListener("change", on);
+    const mqs: [MediaQueryList, (v: boolean) => void][] = [
+      [window.matchMedia("(max-width: 1180px)"), setTight],
+      [window.matchMedia("(max-width: 980px)"), setNarrow],
+    ];
+    const offs = mqs.map(([mq, set]) => {
+      const on = () => set(mq.matches);
+      mq.addEventListener("change", on);
+      return () => mq.removeEventListener("change", on);
+    });
+    return () => offs.forEach((off) => off());
   }, []);
   useEffect(() => { if (narrow && leftOpen && rightOpen) setLeftOpen(false); }, [narrow]);  // eslint-disable-line react-hooks/exhaustive-deps
+  // A width dragged out on a wide screen is kept in localStorage, so it comes
+  // back on a smaller window and used to overhang it. Pull it back in.
+  useEffect(() => {
+    const clamp = () => setRightW((w) => Math.min(w, Math.max(320, window.innerWidth - 620)));
+    clamp();
+    window.addEventListener("resize", clamp);
+    return () => window.removeEventListener("resize", clamp);
+  }, []);
   const openLeft = (v: boolean) => { setLeftOpen(v); if (v && narrow) setRightOpen(false); };
   const openRight = (v: boolean) => { setRightOpen(v); if (v && narrow) setLeftOpen(false); };
 
@@ -151,6 +168,9 @@ export default function Science() {
       resuming.current = false;
       return;
     }
+    // A reconnect re-opens the session already on screen: keep what the
+    // researcher has open (and any draft in its editor) instead of jumping away.
+    const reopened = !!sid.current && sid.current === (m.sid || m.working_dir);
     sid.current = m.sid || m.working_dir;
     const evs: any[] = m.events || [];
     lastSeq.current = evs.reduce((mx, e) => (typeof e.seq === "number" && e.seq > mx ? e.seq : mx), 0);
@@ -165,12 +185,21 @@ export default function Science() {
     }
     dispatch({ type: "hydrate", snapshot: snap, events: evs, running: !!m.running });
     const arts: string[] = (snap.artifacts || []).map((a: any) => a.id);
-    setDoc(arts.length ? { type: "art", id: arts[arts.length - 1] } : null);
+    if (!reopened) setDoc(arts.length ? { type: "art", id: arts[arts.length - 1] } : null);
     resuming.current = false;
     if (pendingFirst.current) {
       const first = pendingFirst.current;
       pendingFirst.current = "";
       send(first, null);
+    }
+  }
+
+  function hideArt(id: string) {
+    sock.send({ type: "science_hide_artifact", working_dir: cfg.current.workingDir, artifact_id: id });
+    // Don't leave the pane on an output that is going away: show the latest other one.
+    if (doc && doc.type === "art" && doc.id === id) {
+      const rest = st.artOrder.filter((x) => x !== id);
+      setDoc(rest.length ? { type: "art", id: rest[rest.length - 1] } : null);
     }
   }
 
@@ -295,9 +324,15 @@ export default function Science() {
   // ---- resize ------------------------------------------------------------
   function startDrag(e: React.MouseEvent) {
     e.preventDefault();
+    // Measure the columns' own container: the app rail, and the sessions rail
+    // when it is docked rather than floating, are not space this panel can take.
+    const body = (e.currentTarget as HTMLElement).parentElement;
+    const avail = body ? body.clientWidth : window.innerWidth;
+    const left = !tight && leftOpen ? 256 : 0;
+    const max = Math.max(300, avail - left - 380);
     const move = (ev: MouseEvent) => {
       const w = window.innerWidth - ev.clientX;
-      setRightW(Math.max(320, Math.min(w, window.innerWidth - 460)));
+      setRightW(Math.max(300, Math.min(w, max)));
     };
     const up = () => {
       window.removeEventListener("mousemove", move);
@@ -319,7 +354,11 @@ export default function Science() {
     <div className="app-page">
     <div className="sx">
       <header className="sx-top">
-        <button className="sx-icon-btn" title="Sessions & files (⌘B)" onClick={() => openLeft(!leftOpen)}>☰</button>
+        <button className={"sx-panel-btn" + (leftOpen ? " on" : "")} aria-pressed={leftOpen}
+          title="Sessions & files (⌘B)" onClick={() => openLeft(!leftOpen)}>
+          <span className="sx-panel-ic">☰</span>
+          <span className="sx-panel-label">Files</span>
+        </button>
         <div className="page-title">Science</div>
         {started && (
           <div className="sx-top-session" title={workingDir}>
@@ -358,13 +397,19 @@ export default function Science() {
           </div>
         )}
         {started && (
-          <button className={"sx-icon-btn" + (rightOpen ? " on" : "")} title="Toggle workspace (⌘J)" onClick={() => openRight(!rightOpen)}>◨</button>
+          <button className={"sx-panel-btn" + (rightOpen ? " on" : "")} aria-pressed={rightOpen}
+            title={(rightOpen ? "Hide" : "Show") + " the workspace — outputs, team, jobs, provenance (⌘J)"}
+            onClick={() => openRight(!rightOpen)}>
+            <span className="sx-panel-ic">◨</span>
+            <span className="sx-panel-label">Workspace</span>
+          </button>
         )}
       </header>
 
       <div className="sx-body">
-        {narrow && (leftOpen || (started && rightOpen)) && (
-          <div className="sx-overlay-scrim" onClick={() => { setLeftOpen(false); setRightOpen(false); }} />
+        {((tight && leftOpen) || (narrow && started && rightOpen)) && (
+          <div className="sx-overlay-scrim"
+            onClick={() => { setLeftOpen(false); if (narrow) setRightOpen(false); }} />
         )}
         {leftOpen && (
           <Sidebar sessions={sessions} current={started ? workingDir : ""} onOpen={(d) => openSession(d)}
@@ -385,7 +430,7 @@ export default function Science() {
               {loading ? (
                 <div className="sx-feed"><div className="sx-loading big">Opening session…</div></div>
               ) : (
-                <Feed st={st} onOpenArt={openArt} onRefine={startRefine} focusSpec={focusSpec}
+                <Feed st={st} onOpenArt={openArt} onRefine={startRefine} onHide={hideArt} focusSpec={focusSpec}
                   onRefinePlan={refinePlan}
                   onExample={(t) => { setInput(t); inputRef.current?.focus(); }} />
               )}
@@ -400,6 +445,9 @@ export default function Science() {
                   <Workspace st={st} workingDir={workingDir} tab={wsTab} setTab={setWsTab}
                     doc={doc} setDoc={setDoc} follow={follow} setFollow={setFollow}
                     onRefine={startRefine} onMention={mention}
+                    onHide={hideArt}
+                    onAutoContinue={(on) => sock.send({ type: "science_settings",
+                      working_dir: cfg.current.workingDir, auto_continue: on })}
                     onFocusSpec={(id) => { setFocusSpec(null); setTimeout(() => setFocusSpec(id), 0); }} />
                 </div>
               </>

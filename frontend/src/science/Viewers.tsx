@@ -50,9 +50,17 @@ function useText(url: string, limit = 400_000) {
   useEffect(() => {
     let alive = true;
     setErr("");
-    fetch(url)
-      .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))
-      .then((t) => { if (alive) setText(t.length > limit ? t.slice(0, limit) + "\n…(truncated)" : t); })
+    // Ask only for what is shown: a multi-GB table must not be downloaded
+    // whole (and freeze the tab) to preview its first rows.
+    fetch(url, { headers: { Range: `bytes=0-${limit - 1}` } })
+      .then(async (r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const t = await r.text();
+        const total = Number((r.headers.get("content-range") || "").split("/")[1] || 0);
+        const cut = (r.status === 206 && total > limit) || t.length > limit;
+        return cut ? t.slice(0, limit).replace(/[^\n]*$/, "") + "\n…(truncated)" : t;
+      })
+      .then((t) => { if (alive) setText(t); })
       .catch((e) => { if (alive) setErr(String(e.message || e)); });
     return () => { alive = false; };
   }, [url, limit]);

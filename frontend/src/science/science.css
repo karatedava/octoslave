@@ -76,6 +76,28 @@ body.sx-dragging iframe { pointer-events: none; }
 .sx-icon-btn.on { color: var(--accent); }
 .sx-icon-btn:disabled { opacity: .35; cursor: default; }
 
+/* Show/hide for the two side panels. These are primary controls — the only way
+   back to a workspace you have closed — so they are sized and labelled as such
+   rather than being bare 30px glyphs, and they carry a visible pressed state. */
+.sx-panel-btn {
+  display: inline-flex; align-items: center; gap: 7px; height: 34px; padding: 0 12px;
+  background: var(--panel2); border: 1px solid var(--border2); border-radius: 9px;
+  cursor: pointer; color: var(--muted); font-size: 12.5px; font-weight: 550;
+  white-space: nowrap; flex-shrink: 0; transition: background .12s, border-color .12s, color .12s;
+}
+.sx-panel-btn:hover { background: var(--hover); color: var(--text); border-color: var(--border2); }
+.sx-panel-btn.on {
+  background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  color: var(--text);
+}
+.sx-panel-ic { font-size: 14px; line-height: 1; }
+/* The label is the first thing to go when the bar gets crowded; the icon,
+   the tooltip and the pressed state still say what the button does. */
+@media (max-width: 860px) {
+  .sx-panel-label { display: none; }
+  .sx-panel-btn { padding: 0 9px; }
+}
+
 .sx-chip {
   border: 1px solid var(--border2); background: var(--chip); color: var(--muted);
   padding: 3px 11px; border-radius: 999px; font-size: 12px; cursor: pointer; white-space: nowrap;
@@ -99,6 +121,11 @@ body.sx-dragging iframe { pointer-events: none; }
 .sx-pill.working, .sx-pill.running, .sx-pill.submitted { color: var(--accent); background: var(--accent-soft); }
 .sx-pill.done { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }
 .sx-pill.failed { color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); }
+.sx-pill.unknown { color: var(--muted); background: var(--chip); }
+/* A live status nobody has confirmed lately: shown as a question, not a fact,
+   so it reads differently from a status the node has just backed up. */
+.sx-pill.stale { color: var(--muted); background: var(--chip);
+  border: 1px dashed color-mix(in srgb, var(--muted) 45%, transparent); }
 
 .sx-badge { font-size: 10.5px; min-width: 18px; padding: 0 5px; border-radius: 999px; background: var(--chip); color: var(--muted); margin-left: 6px; }
 .sx-livedot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); margin-left: 6px; animation: sx-pulse 1.4s infinite; }
@@ -159,9 +186,15 @@ body.sx-dragging iframe { pointer-events: none; }
 .sx-pop-h { font-weight: 600; margin-bottom: 10px; font-size: 13px; }
 
 /* ---------- layout ---------- */
-.sx-body { flex: 1; display: flex; min-height: 0; position: relative; }
+.sx-body { flex: 1; display: flex; min-height: 0; position: relative; overflow: hidden; }
 .sx-center { flex: 1; min-width: 380px; display: flex; flex-direction: column; min-height: 0; position: relative; }
-.sx-right { flex-shrink: 0; display: flex; min-width: 320px; max-width: calc(100vw - 420px); background: var(--bg2); border-left: 1px solid var(--border); }
+/* The workspace takes the dragged width as its flex basis but stays SHRINKABLE:
+   when the window is too narrow for the dragged width, flexbox takes it back off
+   this panel instead of overflowing .sx-body — an overflow here used to squash
+   the whole three-column layout. The floors (380 centre / 300 here) always fit,
+   because the sessions rail overlays rather than docking below 1180px. */
+.sx-right { flex: 0 1 auto; display: flex; min-width: 300px; max-width: calc(100% - 380px);
+  background: var(--bg2); border-left: 1px solid var(--border); }
 .sx-resizer { width: 6px; margin-right: -3px; margin-left: -3px; cursor: col-resize; z-index: 5; position: relative; }
 .sx-resizer:hover, body.sx-dragging .sx-resizer { background: var(--accent-soft); }
 
@@ -498,6 +531,10 @@ body.sx-dragging iframe { pointer-events: none; }
 .sx-job-head { display: flex; align-items: center; gap: 8px; }
 .sx-job-name { flex: 1; font-weight: 600; }
 .sx-job-meta { font-size: 11.5px; color: var(--muted); font-family: var(--mono); }
+.sx-job.stale { border-style: dashed; }
+.sx-job-checked.stale { color: color-mix(in srgb, var(--warn) 85%, transparent); }
+.sx-job-warn { font-size: 11.5px; color: var(--muted); line-height: 1.45;
+  background: var(--panel2); border-radius: 7px; padding: 6px 8px; }
 .sx-prov .sx-btn { align-self: flex-start; }
 .sx-prov-item { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 9px 12px; font-size: 12.5px; }
 .sx-prov-item b { color: var(--muted); font-weight: 600; margin-right: 4px; }
@@ -554,6 +591,16 @@ body.sx-dragging iframe { pointer-events: none; }
 
 .sx-overlay-scrim { display: none; }
 
+/* ---------- medium screens ---------- */
+/* Docked, the three columns need 256 + 380 + 300 plus the app rail — about
+   1180px of window. Below that the sessions rail floats over the conversation
+   instead of competing for width, which is what used to break the layout in
+   the band between here and the small-screen rules below. */
+@media (max-width: 1180px) {
+  .sx-side { position: absolute; left: 0; top: 0; bottom: 0; z-index: 30; box-shadow: var(--shadow); }
+  .sx-overlay-scrim { display: block; position: absolute; inset: 0; z-index: 20; background: rgba(0, 0, 0, .35); }
+}
+
 /* ---------- small screens ---------- */
 @media (max-width: 980px) {
   .sx-side { position: absolute; left: 0; top: 0; bottom: 0; z-index: 30; box-shadow: var(--shadow); }
@@ -566,3 +613,18 @@ body.sx-dragging iframe { pointer-events: none; }
   .sx-egs { grid-template-columns: 1fr; }
   .sx-top-task { max-width: 30vw; }
 }
+
+/* ---- compacted history (earlier part of a long session) ---- */
+.sx .sx-compacted { border: 1px dashed var(--border2); border-radius: 10px; margin: 4px 0 10px; background: var(--panel); }
+.sx .sx-compacted-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; width: 100%; padding: 9px 12px;
+  background: none; border: 0; color: inherit; cursor: pointer; text-align: left; font: inherit; }
+.sx .sx-compacted-title { font-weight: 600; }
+.sx .sx-compacted-meta { margin-left: auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.sx .sx-compacted-body { padding: 0 14px 12px 32px; font-size: 13px; }
+.sx .sx-compacted-why, .sx .sx-compacted-more { opacity: .65; margin: 0 0 10px; }
+.sx .sx-compacted-turn { margin: 0 0 10px; }
+.sx .sx-compacted-q { font-weight: 500; }
+.sx .sx-compacted-day { opacity: .55; font-weight: 400; }
+.sx .sx-compacted-a { opacity: .8; margin-top: 2px; white-space: pre-wrap; }
+.sx .sx-compacted-list { margin-top: 8px; opacity: .85; }
+.sx .sx-auto { display: flex; align-items: center; gap: 8px; padding: 8px 2px 12px; font-size: 13px; cursor: pointer; }

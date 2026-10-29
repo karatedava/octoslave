@@ -14,8 +14,9 @@ import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 
 def _now() -> str:
@@ -48,6 +49,10 @@ class Job:
     status: str = "submitted"     # submitted | running | done | failed | unknown
     output: str = ""
     submitted_at: str = field(default_factory=_now)
+    # When the node was last asked about this job. A status is only as good as
+    # its timestamp: "running" set at submit time and never re-checked means
+    # nothing, so the panel shows this and reconcile_jobs() refreshes it.
+    last_checked: str = ""
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
 
 
@@ -89,6 +94,17 @@ class ScienceSession:
         self.artifacts: list[Artifact] = []
         self.provenance: list[dict] = []   # {artifact, method, inputs, notes, at}
         self.remote_id: Optional[str] = None
+        # Where this session's workspace is on each compute node (by remote id),
+        # fixed at first use so it never moves under the work already there.
+        self.remote_workspaces: dict[str, str] = {}
+        # Whether the orchestrator may pick up jobs that end between turns on
+        # its own, and how many times in a row it has (reset when the
+        # researcher writes) — see the web layer's job watcher.
+        self.auto_continue: bool = True
+        self.auto_wakes: int = 0
+        # Outputs the researcher removed from their workspace (absolute paths):
+        # not presented again unless they ask for that file.
+        self.hidden_outputs: list[str] = []
         self._lock = threading.Lock()
 
     # -- filesystem layout ------------------------------------------------
@@ -124,6 +140,29 @@ class ScienceSession:
                     break
             self.touch()
             self._save_locked()
+
+    def settle_interrupted(self) -> list[Specialist]:
+        """Mark specialists left "working" by a process that is gone.
+
+        Their status is saved as "working" when dispatched, and only the turn's
+        own clean-up resets it — which a crash, a restart or a self-update never
+        runs. Left alone, such a specialist shows as working forever and refuses
+        continue_specialist. Call only when no turn is running on this session.
+        Returns the specialists it changed.
+        """
+        changed: list[Specialist] = []
+        with self._lock:
+            for sp in self.specialists:
+                if sp.status == "working":
+                    sp.status = "done"
+                    sp.summary = ("⚠ INCOMPLETE — interrupted: the server stopped "
+                                  "while it was working. Resume it with "
+                                  "continue_specialist.")
+                    changed.append(sp)
+            if changed:
+                self.touch()
+                self._save_locked()
+        return changed
 
     def get_specialist(self, ref: str) -> Optional[Specialist]:
         """Look a specialist up by id, or (case-insensitively) by name."""
@@ -191,6 +230,19 @@ class ScienceSession:
             self._save_locked()
         return art
 
+    def hide_artifact(self, aid: str) -> Optional[Artifact]:
+        """Take an output off the researcher's workspace (the file stays)."""
+        with self._lock:
+            for i, a in enumerate(self.artifacts):
+                if a.id == aid:
+                    del self.artifacts[i]
+                    if a.path not in self.hidden_outputs:
+                        self.hidden_outputs.append(a.path)
+                    self.touch()
+                    self._save_locked()
+                    return a
+        return None
+
     def get_artifact(self, aid: str) -> Optional[Artifact]:
         for a in self.artifacts:
             if a.id == aid:
@@ -208,9 +260,20 @@ class ScienceSession:
         return None
 
     def add_provenance(self, entry: dict) -> None:
+        """Record how an output was made. Re-recording the same output replaces
+        its entry (the ledger describes each output as it now is), keeping when
+        it was first recorded and how many times it was revised."""
         with self._lock:
             entry = {"at": _now(), **entry}
-            self.provenance.append(entry)
+            key = entry.get("artifact")
+            for i, old in enumerate(self.provenance):
+                if key and old.get("artifact") == key:
+                    entry["first_recorded"] = old.get("first_recorded") or old.get("at")
+                    entry["revision"] = int(old.get("revision") or 1) + 1
+                    self.provenance[i] = entry
+                    break
+            else:
+                self.provenance.append(entry)
             self.touch()
             self._save_locked()
             self._write_provenance_md_locked()
@@ -232,6 +295,10 @@ class ScienceSession:
             "artifacts": [asdict(a) for a in list(self.artifacts)],
             "provenance": list(self.provenance),
             "remote_id": self.remote_id,
+            "remote_workspaces": dict(self.remote_workspaces),
+            "auto_continue": self.auto_continue,
+            "auto_wakes": self.auto_wakes,
+            "hidden_outputs": list(self.hidden_outputs),
         }
 
     def save(self) -> None:
@@ -248,7 +315,10 @@ class ScienceSession:
         # the next save catches up.
         for _ in range(5):
             try:
-                text = json.dumps(self.to_dict(), indent=2)
+                # No indent: the history makes this file megabytes on a long
+                # session, and it is rewritten on every change — the compact C
+                # encoder is several times faster than the indented one.
+                text = json.dumps(self.to_dict(), ensure_ascii=False)
                 break
             except RuntimeError:
                 time.sleep(0.02)
@@ -256,6 +326,11 @@ class ScienceSession:
             return
         tmp = self.state_path.with_suffix(".json.tmp")
         tmp.write_text(text)
+        # Keep the previous version: if this file is ever found unreadable (a
+        # torn write on a synced or full disk), load() falls back to it instead
+        # of the session reading as new — and being overwritten by its first save.
+        if self.state_path.exists():
+            os.replace(self.state_path, self.state_path.with_suffix(".json.bak"))
         os.replace(tmp, self.state_path)
 
     def _write_provenance_md_locked(self) -> None:
@@ -351,12 +426,37 @@ class ScienceSession:
     @classmethod
     def load(cls, working_dir: str) -> Optional["ScienceSession"]:
         p = Path(working_dir).expanduser().resolve() / "science" / "state.json"
-        if not p.exists():
+        bak = p.with_suffix(".json.bak")
+        if not p.exists() and not bak.exists():
             return None
-        try:
-            data = json.loads(p.read_text())
-        except Exception:
-            return None
+        data = None
+        io_error: OSError | None = None
+        for cand in (p, bak):
+            if not cand.exists():
+                continue
+            try:
+                data = json.loads(cand.read_text())
+                break
+            except OSError as exc:      # could not read it (yet): not corrupt
+                io_error = exc
+            except ValueError:
+                continue
+        if data is None and io_error is not None:
+            raise ValueError(f"The saved state of this Science session ({p}) "
+                             f"could not be read right now: {io_error}. Try "
+                             f"again in a moment.")
+        if data is None:
+            # Neither copy reads. Returning None would present this as a new
+            # session whose first save destroys what is left: move the files
+            # aside, named so they are found, and refuse instead.
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            for cand in (p, bak):
+                if cand.exists():
+                    os.replace(cand, cand.with_name(f"{cand.name}.unreadable-{stamp}"))
+            raise ValueError(
+                f"The saved state of this Science session ({p}) could not be read; "
+                f"it was kept as state.json.unreadable-{stamp}. Nothing was "
+                f"overwritten.")
         s = cls(task=data.get("task", ""), working_dir=working_dir,
                 model=data.get("model", ""))
         s.specialist_models = [m for m in (data.get("specialist_models") or [])
@@ -370,6 +470,12 @@ class ScienceSession:
         s.artifacts = [Artifact(**_known(Artifact, d)) for d in data.get("artifacts", [])]
         s.provenance = data.get("provenance", [])
         s.remote_id = data.get("remote_id")
+        s.remote_workspaces = dict(data.get("remote_workspaces") or {})
+        # Off for sessions saved before the job watcher existed: it must not
+        # start turns on an old project nobody asked it to continue.
+        s.auto_continue = bool(data.get("auto_continue", False))
+        s.auto_wakes = int(data.get("auto_wakes") or 0)
+        s.hidden_outputs = [p for p in (data.get("hidden_outputs") or []) if isinstance(p, str)]
         return s
 
     # -- UI snapshot ------------------------------------------------------
@@ -385,6 +491,7 @@ class ScienceSession:
             "artifacts": [asdict(a) for a in self.artifacts],
             "provenance": self.provenance,
             "remote_id": self.remote_id,
+            "auto_continue": self.auto_continue,
         }
 
 

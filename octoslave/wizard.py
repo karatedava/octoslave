@@ -354,7 +354,7 @@ class _PageTest(_Page):
                 _ = resp.choices[0].message.content
                 self.after(0, lambda: self._done(True, "Connection successful!"))
             except Exception as exc:
-                self.after(0, lambda: self._done(False, f"Error: {exc}"))
+                self.after(0, lambda exc=exc: self._done(False, f"Error: {exc}"))
 
         threading.Thread(target=_worker, daemon=True).start()
 

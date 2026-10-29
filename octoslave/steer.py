@@ -1,6 +1,6 @@
 """Live steering: messages a user sends while an agent is already working.
 
-The web Science tab lets the researcher keep talking while the orchestrator
+The web Science tab and the web chat let the user keep talking while the agent
 works. Those messages cannot start a new turn (one is in flight) and must not
 wait for it to end either — the whole point is to change what the agent is
 doing *now*. They land in an :class:`Inbox` bound to the worker thread, and the
@@ -22,8 +22,11 @@ An Inbox is shared by those threads, and each item tracks which specialists have
 already seen it, so a relay to one never hides it from another or from the
 orchestrator.
 
-With no inbox bound to the thread every function here is a no-op, so the chat,
-the Lab and the CLI are unaffected.
+The web chat binds an Inbox to its single worker (the agent loop, or the
+council loop in Improved / Ultra mode); there is nothing to relay to.
+
+With no inbox bound to the thread every function here is a no-op, so the Lab
+and the CLI are unaffected.
 """
 
 from __future__ import annotations
@@ -54,6 +57,11 @@ class Inbox:
         # (e.g. a background worker reporting back) as ready-to-send text, or "".
         # Folded in at the same safe points as user messages.
         self.reports: Optional[Callable[[], str]] = None
+        # Optional: called as on_round(messages) with the orchestrator loop's
+        # LIVE history at each safe point. The loop rebinds its list as it goes
+        # (repair, trimming, compaction), so a reference taken at turn start goes
+        # stale — anything saved mid-turn needs this one.
+        self.on_round: Optional[Callable[[list[dict]], None]] = None
 
     def post(self, text: str, *, prompt: str = "", meta: dict | None = None) -> str | None:
         """Queue a message. Returns its id, or None when the turn is already
@@ -211,6 +219,11 @@ def deliver(messages: list[dict]) -> int:
     items were delivered (0 when there was nothing, or no inbox is bound to this
     thread); a non-zero result means the loop should keep going."""
     inbox = current()
+    if inbox is not None and inbox.on_round is not None:
+        try:
+            inbox.on_round(messages)
+        except Exception:
+            pass
     # A stop is ending this turn: leave the message queued so it is reported as
     # undelivered, rather than slipped into a history nothing will act on.
     if inbox is None or interrupt.should_stop():

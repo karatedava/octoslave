@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useState, type RefObject } from "react";
 import type { Ask } from "../AskCard";
 import type { SciState } from "./store";
 import { useNow } from "./Feed";
-import { fmtDur } from "./util";
+import { fmtDur, STALE_AFTER_MS } from "./util";
 
 export type RefineCtx = { id: string; label: string } | null;
 
@@ -94,7 +94,9 @@ function LiveBar({ st, onStop }: { st: SciState; onStop: () => void }) {
   if (!st.running) return null;
   const working = Object.values(st.specialists).filter((s) => s.status === "working");
   const queued = st.items.filter((i) => i.k === "user" && (i.steer === "queued" || i.steer === "seen" || i.steer === "sending")).length;
-  const jobs = Object.values(st.jobs).filter((j) => ["submitted", "running"].includes(j.status)).length;
+  // Same rule as the Jobs tab: only a reading the node confirmed recently counts.
+  const jobs = Object.values(st.jobs).filter((j) => ["submitted", "running"].includes(j.status)
+    && j.last_checked && now - new Date(j.last_checked).getTime() <= STALE_AFTER_MS).length;
   // Specialists work in the background, so the orchestrator is usually busy at
   // the same time. Keep the line about the orchestrator whenever it is doing
   // something — it is the one the researcher is talking to — and fall back to

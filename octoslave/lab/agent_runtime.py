@@ -456,6 +456,7 @@ def run_agent_task(
                     messages.pop()
                     popped += 1
                 if popped == 0:
+                    stopped_reason = "the model's replies kept arriving cut off"
                     break
                 messages.append({"role": "user", "content": (
                     "Your previous response was cut off before the tool arguments "
@@ -469,6 +470,9 @@ def run_agent_task(
                 iteration -= 1
                 continue
             display.print_error(f"[{spec.name}] API error: {e}")
+            # Its last words were said mid-task — this is not a report of
+            # finished work, so it must be flagged as partial.
+            stopped_reason = f"the model endpoint kept failing ({type(e).__name__})"
             break
         except KeyboardInterrupt:
             display.stream_end(False)

@@ -2910,3 +2910,13 @@ details.tool-block.tool-block-fail {
 #tab-settings .settings-subhead {
   font-size: 15px; font-weight: 650; color: var(--text); text-transform: none; letter-spacing: 0; margin: 0;
 }
+
+/* Live steering: a message sent while the agent works, until it is read */
+.msg-user.msg-steer .msg-bubble { opacity: 0.6; }
+.msg-user.msg-steer-dropped .msg-bubble { opacity: 0.45; text-decoration: line-through; }
+.msg-steer-status {
+  margin-top: 4px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+.msg-steer-status[data-kind="dropped"] { color: var(--error); }

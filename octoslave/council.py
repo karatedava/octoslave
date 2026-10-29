@@ -46,6 +46,7 @@ from openai import OpenAI
 from . import display
 from . import logger
 from . import interrupt
+from . import steer
 from .agent import (
     MAX_ITERATIONS,
     note_stopped,
@@ -737,6 +738,16 @@ def _is_work_tool(name: str) -> bool:
 # Council loop — Worker-driven, with adaptive Thinker/Verifier routing
 # ---------------------------------------------------------------------------
 
+def _with_steering(task: str, msg: dict) -> str:
+    """The task as the graders should judge it once the user has added to it
+    mid-run (a live message, see steer.py) — otherwise the completion gate would
+    hold the worker to the original wording and reject the redirected work."""
+    said = (msg.get("_display") or "").strip()
+    if not said:
+        return task
+    return f"{task}\n\n[Added by the user while the work was under way]\n{said}"
+
+
 def _council_loop(
     messages: list[dict],
     roles: dict[str, str],
@@ -857,6 +868,12 @@ def _council_loop(
                     "nothing ran. Call the tool through the function-calling interface directly. "
                     "Retry the action now."
                 )})
+                continue
+
+            # The user sent something while the worker was busy (web chat):
+            # answer it instead of ending the turn under their message.
+            if steer.deliver(messages):
+                task = _with_steering(task, messages[-1])
                 continue
 
             # Nothing has actually been executed yet — a "done" claim here is
@@ -1139,6 +1156,10 @@ def _council_loop(
         # Attach anything view_image queued — after ALL of this turn's tool
         # results, so the assistant turn's tool messages stay contiguous.
         drain_image_attachments(messages)
+        # Same rule for live user messages: after the round's tool results, so
+        # the worker sees them on its very next step.
+        if steer.deliver(messages):
+            task = _with_steering(task, messages[-1])
 
         # A Stop clicked *during* tool execution (e.g. a long bash) should abort
         # before we spend more model calls on error/stall consults below.

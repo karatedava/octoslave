@@ -264,6 +264,8 @@ function updateAttachmentChips() {
       <button class="chip-remove" onclick="removeAttachment('${file.path}')">×</button>
     </div>
   `).join('');
+  // Send vs Stop depends on whether there is something to send.
+  window.updateSendButton?.();
 }
 
 /**

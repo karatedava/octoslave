@@ -70,6 +70,10 @@ function handleServerMessage(msg) {
     // server's `turn_end` says the whole turn is over.
     case 'done':          onLoopDone(msg.iterations, msg.stopped); break;
     case 'turn_end':      onTurnEnd(msg); break;
+    case 'steer_queued':    onSteerQueued(msg); break;
+    case 'steer_delivered': onSteerDelivered(msg.ids || []); break;
+    case 'steer_dropped':   onSteerDropped(msg.ids || []); break;
+    case 'steer_late':      onSteerLate(msg.cid); break;
     case 'info':          appendChatInfo(msg.text); break;
     case 'error':         onServerError(msg.text); break;
     case 'cleared':       break;
@@ -310,11 +314,35 @@ function stopChat() {
   if (btn) btn.title = 'Stopping…';
 }
 
+// The composer's message (typed text + attached file list), or '' when empty.
+function composerText() {
+  const text = document.getElementById('chat-textarea').value.trim();
+  const files = window.appState.attachedFiles;
+  if (!files.length) return text;
+  const paths = files.map(f => `- ${f.path}`).join('\n');
+  return text + (text ? '\n\n' : '') + `Attached files:\n${paths}`;
+}
+
+function clearComposer() {
+  const textarea = document.getElementById('chat-textarea');
+  textarea.value = '';
+  autoResizeTextarea(textarea);
+  document.getElementById('chat-attachments').innerHTML = '';
+  window.appState.attachedFiles = [];
+  updateSendButton();
+}
+
 function sendChat() {
   const textarea = document.getElementById('chat-textarea');
   const text = textarea.value.trim();
   const hasFiles = window.appState.attachedFiles.length > 0;
-  if ((!text && !hasFiles) || window.appState.running) return;
+  if (!text && !hasFiles) return;
+  // A message sent while the agent works steers the running turn (parallel
+  // runs have no single conversation to steer).
+  if (window.appState.running) {
+    if (canSteer()) steerChat();
+    return;
+  }
 
   // Check for slash commands first
   if (text.startsWith('/')) {
@@ -326,22 +354,21 @@ function sendChat() {
     }
   }
 
-  let fullText = text;
-  if (hasFiles) {
-    const paths = window.appState.attachedFiles.map(f => `- ${f.path}`).join('\n');
-    fullText += (text ? '\n\n' : '') + `Attached files:\n${paths}`;
-  }
-
+  const fullText = composerText();
   appendUserMessage(fullText);
+  clearComposer();
+  dispatchChat(fullText);
+}
+
+// Start a turn on the server with an already-shown user message.
+function dispatchChat(fullText) {
   window.appState.turnActivity = false;
   window.appState.lastIterations = 0;
   window.appState.lastStopped = false;
-  textarea.value = '';
-  autoResizeTextarea(textarea);
-  document.getElementById('chat-attachments').innerHTML = '';
-  window.appState.attachedFiles = [];
   // New user turn → start a fresh task checklist card if one appears.
   window._lastTodoCard = null;
+  // Parallel runs have no single conversation to steer.
+  window.appState.parallelTurn = !!window.parallelConfig?.enabled;
   setChatRunning(true);
 
   const model = document.getElementById('chat-model-select').value.trim();
@@ -400,6 +427,154 @@ function appendUserMessage(text) {
   div.innerHTML = `<div class="msg-bubble">${esc(text)}</div>`;
   container.appendChild(div);
   scrollToBottom(container);
+  return div;
+}
+
+// ──────────────────────────────────────────────────────────────
+// Live steering — messages sent while the agent is working
+//
+// They go to the running turn's inbox (`chat_steer`) and join the conversation
+// at the agent's next step. The bubble shows where each one stands: queued →
+// delivered (moved to where the agent picked it up), dropped (a Stop ended the
+// turn first; the text goes back into the composer), or late (the turn was
+// already wrapping up, so it is sent as the next turn instead).
+// ──────────────────────────────────────────────────────────────
+
+const steers = { byCid: {}, cidById: {} };
+
+function steerChat() {
+  const text = composerText();
+  if (!text) return;
+  const cid = 's' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const div = appendUserMessage(text);
+  div.classList.add('msg-steer');
+  steers.byCid[cid] = { div, text, late: false };
+  setSteerStatus(cid, 'queued — the agent reads it at its next step');
+  clearComposer();
+  sendMsg({ type: 'chat_steer', message: text, cid });
+}
+
+function setSteerStatus(cid, label, kind = '') {
+  const s = steers.byCid[cid];
+  if (!s) return;
+  let el = s.div.querySelector('.msg-steer-status');
+  if (!label) { el?.remove(); return; }
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'msg-steer-status';
+    s.div.appendChild(el);
+  }
+  el.textContent = label;
+  el.dataset.kind = kind;
+}
+
+// After a reconnect nothing more will be heard about messages in flight.
+function forgetSteers() {
+  for (const cid of Object.keys(steers.byCid)) {
+    setSteerStatus(cid, 'sent while the connection dropped — check the saved chat', 'dropped');
+    delete steers.byCid[cid];
+  }
+  steers.cidById = {};
+}
+
+function onSteerQueued(msg) {
+  if (msg.cid && msg.steer_id && steers.byCid[msg.cid]) steers.cidById[msg.steer_id] = msg.cid;
+}
+
+function takeSteer(id) {
+  const cid = steers.cidById[id];
+  delete steers.cidById[id];
+  return cid && steers.byCid[cid] ? cid : null;
+}
+
+function onSteerDelivered(ids) {
+  const container = document.getElementById('chat-messages');
+  for (const id of ids) {
+    const cid = takeSteer(id);
+    if (!cid) continue;
+    const { div } = steers.byCid[cid];
+    delete steers.byCid[cid];
+    div.classList.remove('msg-steer');
+    div.querySelector('.msg-steer-status')?.remove();
+    // Show it where the agent took it in; what follows is the reply to it.
+    container.appendChild(div);
+  }
+  currentAssistantBubble = null;
+  currentToolCallsDiv = null;
+  scrollToBottom(container);
+}
+
+function dropSteer(cid) {
+  const s = steers.byCid[cid];
+  delete steers.byCid[cid];
+  s.div.classList.remove('msg-steer');
+  s.div.classList.add('msg-steer-dropped');
+  const el = document.createElement('div');
+  el.className = 'msg-steer-status';
+  el.dataset.kind = 'dropped';
+  el.textContent = 'not delivered — the turn ended before the agent read it';
+  s.div.querySelector('.msg-steer-status')?.remove();
+  s.div.appendChild(el);
+  // Offer the text again rather than losing it.
+  const textarea = document.getElementById('chat-textarea');
+  if (textarea && !textarea.value.trim()) {
+    textarea.value = s.text;
+    autoResizeTextarea(textarea);
+    updateSendButton();
+  }
+}
+
+function onSteerDropped(ids) {
+  for (const id of ids) {
+    const cid = takeSteer(id);
+    if (cid) dropSteer(cid);
+  }
+}
+
+function onSteerLate(cid) {
+  const s = steers.byCid[cid];
+  if (!s) return;
+  s.late = true;
+  setSteerStatus(cid, 'sends as soon as the current turn ends');
+  if (!window.appState.running) flushLateSteers(!!steers.lastStopped);
+}
+
+// Messages that missed the turn they were sent into become the next turn —
+// unless the user stopped that turn, in which case they are handed back.
+function flushLateSteers(stopped) {
+  const late = Object.keys(steers.byCid).filter(cid => steers.byCid[cid].late);
+  if (!late.length) return;
+  if (stopped) { late.forEach(dropSteer); return; }
+  const container = document.getElementById('chat-messages');
+  const text = late.map(cid => steers.byCid[cid].text).join('\n\n');
+  for (const cid of late) {
+    const { div } = steers.byCid[cid];
+    delete steers.byCid[cid];
+    div.classList.remove('msg-steer');
+    div.querySelector('.msg-steer-status')?.remove();
+    container.appendChild(div);
+  }
+  currentAssistantBubble = null;
+  currentToolCallsDiv = null;
+  dispatchChat(text);
+}
+
+// While the agent works the button is Stop — until there is something typed,
+// then it sends that to the agent.
+function canSteer() {
+  return !!window.appState.running && !window.appState.parallelTurn && !parallelLive.active;
+}
+
+function updateSendButton() {
+  const sendBtn = document.getElementById('chat-send-btn');
+  if (!sendBtn) return;
+  const running = !!window.appState.running;
+  const steerable = canSteer() && !!composerText();
+  const stop = running && !steerable;
+  sendBtn.disabled = false;
+  sendBtn.classList.toggle('running', stop);
+  sendBtn.title = stop ? (window.appState.stopping ? 'Stopping…' : 'Stop the agent')
+    : steerable ? 'Send to the agent while it works' : 'Send message';
 }
 
 function ensureAssistantBubble() {
@@ -698,14 +873,16 @@ function onTurnEnd(msg) {
   window.appState.lastIterations = 0;
   window.appState.lastStopped = false;
   if (parallelLive.active) { setChatRunning(false); return; }
+  steers.lastStopped = stopped;
   if (msg.error) {   // already shown by the `error` event
     setChatRunning(false);
     if (window.appState.messages.length > 0) {
       sendMsg({ type: 'save_chat', chat_id: window.appState.currentChatId || '' });
     }
-    return;
+  } else {
+    onDone(iterations, stopped);
   }
-  onDone(iterations, stopped);
+  flushLateSteers(stopped);
 }
 
 function onDone(iterations, stopped) {
@@ -748,10 +925,13 @@ function setChatRunning(running) {
 
   // The send button doubles as a stop button while a task runs — keep it
   // enabled and swap its icon/colour via the `.running` class.
-  if (sendBtn) {
-    sendBtn.disabled = false;
-    sendBtn.classList.toggle('running', running);
-    sendBtn.title = running ? 'Stop the agent' : 'Send message';
+  if (sendBtn) updateSendButton();
+  const textarea = document.getElementById('chat-textarea');
+  if (textarea) {
+    textarea.dataset.idlePlaceholder ??= textarea.placeholder;
+    textarea.placeholder = canSteer()
+      ? 'Message the agent while it works — it reads this at its next step…'
+      : textarea.dataset.idlePlaceholder;
   }
 }
 
@@ -1035,6 +1215,7 @@ function initApp() {
     textarea.addEventListener('input', () => {
       autoResizeTextarea(textarea);
       maybeShowFilePicker(textarea);
+      updateSendButton();
     });
 
     // Close picker when caret leaves the @-token
@@ -1043,6 +1224,7 @@ function initApp() {
 
   // Expose for slash-commands.js
   window.setChatRunningExternal = setChatRunning;
+  window.updateSendButton = updateSendButton;
 
   // Update pill — checks GitHub for a newer release (cached server-side).
   initUpdater();
@@ -1055,7 +1237,7 @@ function initApp() {
 
   // Send button doubles as a stop button while the agent is working.
   document.getElementById('chat-send-btn')?.addEventListener('click', () => {
-    if (window.appState.running) stopChat();
+    if (window.appState.running && !(canSteer() && composerText())) stopChat();
     else sendChat();
   });
 
@@ -1212,6 +1394,7 @@ function initApp() {
         setChatRunning(false);
         appendChatInfo('Reconnected. The live output of the running task was lost; '
           + 'if it finished, its result is in the saved chat.');
+        forgetSteers();
       }
       // A new connection starts with an EMPTY server-side history. Without this,
       // the next message is silently treated as a brand-new conversation and

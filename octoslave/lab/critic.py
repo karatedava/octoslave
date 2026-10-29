@@ -14,6 +14,9 @@ from openai import OpenAI
 from .llm import complete_json
 from .state import LabSession
 
+# A newline for use inside f-string expressions (no backslashes there before 3.12).
+_NL = "\n"
+
 
 _CRITIC_SYSTEM = (
     "You are the Critic — the lab's scientific skeptic. You are sharp, fair, and "
@@ -43,7 +46,7 @@ Task: {session.task}
 Proposed plan / design to scrutinize:
 {proposal[:18000]}
 
-{('Additional context:\\n' + context[:6000]) if context else ''}
+{('Additional context:' + _NL + context[:6000]) if context else ''}
 
 Challenge this proposal before the team implements it. Decide a verdict:
 - "approve": concrete, sound, worth doing now.

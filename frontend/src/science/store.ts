@@ -18,7 +18,7 @@ export type Step = {
   end?: number;
 };
 
-export type SteerState = "sending" | "queued" | "seen" | "delivered" | "dropped";
+export type SteerState = "sending" | "queued" | "seen" | "delivered" | "dropped" | "failed";
 
 export type Item =
   | { k: "user"; id: number; text: string; cid?: string; steerId?: string;
@@ -28,6 +28,7 @@ export type Item =
   | { k: "spec"; id: number; specId: string; run: number }
   | { k: "art"; id: number; artId: string; by?: string; icon?: string }
   | { k: "plan"; id: number; todos: Todo[]; revised: boolean }
+  | { k: "compacted"; id: number; digest: Digest }
   | { k: "note"; id: number; text: string; tone?: string } & Speaker;
 
 export type Artifact = {
@@ -59,6 +60,21 @@ export type Specialist = {
 export type Job = {
   id: string; name: string; status: string; remote_label: string;
   scheduler: string; handle: string; output?: string; at: number;
+  // When the node was last asked about this job. Without it a "running" badge
+  // cannot be told apart from one set at submit time and never re-checked.
+  last_checked?: string;
+};
+
+// What the earlier, compacted part of a long session amounted to (the server
+// folds old history into this between turns; the details are archived).
+export type Digest = {
+  turns: { asked: string; answer?: string; also?: string[]; ts?: number; auto?: boolean }[];
+  earlier_turns: number;
+  outputs: Record<string, string>;
+  jobs: Record<string, string>;
+  specialists: Record<string, string>;
+  steps: number;
+  from?: number; to?: number;
 };
 
 export type Prov = { artifact: string; method?: string; inputs?: string; notes?: string; at?: string };
@@ -87,12 +103,14 @@ export type SciState = {
   lastAssistant: string;
   lastArt: { id: string; isNew: boolean; n: number } | null;  // for auto-follow in the workspace
   turnStarted: number;
+  autoContinue: boolean;       // the orchestrator may pick up jobs ending between turns
 };
 
 export const initialState: SciState = {
   items: [], nextId: 1, artifacts: {}, artOrder: [], specialists: {}, specOrder: [],
   jobs: {}, jobOrder: [], prov: [], todos: [], running: false, live: null, thinking: 0,
   activity: null, ask: null, lastAssistant: "", lastArt: null, turnStarted: 0,
+  autoContinue: true,
 };
 
 export type Action =
@@ -143,11 +161,18 @@ export function reducer(s: SciState, a: Action): SciState {
       for (const art of snap.artifacts || []) {
         const cur = st.artifacts[art.id];
         st.artifacts[art.id] = { ...(cur || { ver: 1, at: 0 }), ...art, ver: cur?.ver || 1 } as Artifact;
-        if (!cur) {
-          st.artOrder = [...st.artOrder, art.id];
-          st = push(st, { k: "art", artId: art.id });
-        }
+        // An output presented in history that has since been compacted: it
+        // stays in the Outputs tab, but is not piled onto the end of the
+        // conversation as if it had just appeared.
+        if (!cur) st.artOrder = [...st.artOrder, art.id];
       }
+      // Jobs too: the snapshot is the latest reading.
+      for (const j of snap.jobs || []) {
+        const cur = st.jobs[j.id];
+        if (cur) st.jobs = { ...st.jobs, [j.id]: { ...cur, status: j.status,
+          last_checked: j.last_checked || cur.last_checked, output: j.output ?? cur.output } };
+      }
+      if (typeof snap.auto_continue === "boolean") st.autoContinue = snap.auto_continue;
       st.prov = snap.provenance || st.prov;
       st.running = a.running;
       if (!a.running) {
@@ -248,8 +273,27 @@ function settleAll(s: SciState): SciState {
 
 function onEvent(s: SciState, ev: any, replay: boolean): SciState {
   const sp = speakerOf(ev);
-  const now = Date.now();
+  // Replayed records carry when they happened; without it every finished
+  // step of a reopened session would read "0s".
+  const now = replay && typeof ev.ts === "number" ? ev.ts * 1000 : Date.now();
   switch (ev.type) {
+    case "science_compacted":
+      return ev.digest ? push(s, { k: "compacted", digest: ev.digest }) : s;
+    case "science_wake": {
+      // The job watcher started a turn on its own (a job ended between turns).
+      const st = note(s, `⏰ ${ev.text || "A job ended — the orchestrator is picking it up."}`, "job");
+      return replay ? st : { ...st, running: true, turnStarted: s.running ? s.turnStarted : now };
+    }
+    case "science_artifact_removed": {
+      // Taken off the workspace by the researcher: drop its card everywhere.
+      if (!s.artifacts[ev.id]) return s;
+      const { [ev.id]: _gone, ...rest } = s.artifacts;
+      const st: SciState = { ...s, artifacts: rest, artOrder: s.artOrder.filter((x) => x !== ev.id),
+        items: s.items.filter((it) => !(it.k === "art" && it.artId === ev.id)) };
+      return replay ? st : note(st, `Removed “${ev.rel}” from the outputs — the file itself is kept.`, "info");
+    }
+    case "science_settings":
+      return typeof ev.auto_continue === "boolean" ? { ...s, autoContinue: ev.auto_continue } : s;
     case "science_user": {
       // Our own optimistic message coming back: attach the server's ids.
       if (ev.cid) {
@@ -409,12 +453,17 @@ function onEvent(s: SciState, ev: any, replay: boolean): SciState {
     case "science_job": {
       const prev = s.jobs[ev.id];
       const job: Job = { id: ev.id, name: ev.name, status: ev.status, remote_label: ev.remote,
-        scheduler: ev.scheduler, handle: ev.handle, output: ev.output, at: prev?.at || now };
+        scheduler: ev.scheduler, handle: ev.handle, output: ev.output, at: prev?.at || now,
+        last_checked: ev.last_checked || prev?.last_checked };
       let st: SciState = { ...s, jobs: { ...s.jobs, [ev.id]: job },
         jobOrder: prev ? s.jobOrder : [...s.jobOrder, ev.id] };
       if (!prev || prev.status !== ev.status) {
-        const icon = ev.status === "failed" ? "⚠" : ev.status === "done" ? "✓" : "🖥";
-        st = note(st, `${icon} Job “${ev.name}” on ${ev.remote || "local"} — ${ev.status}`,
+        const icon = ev.status === "failed" ? "⚠" : ev.status === "done" ? "✓"
+          : ev.status === "unknown" ? "?" : "🖥";
+        // A correction from the job re-check reads oddly as fresh news ("Job X
+        // — done" for work that ended yesterday), so say where it came from.
+        const how = ev.reconciled && prev ? " (re-checked on the node)" : "";
+        st = note(st, `${icon} Job “${ev.name}” on ${ev.remote || "local"} — ${ev.status}${how}`,
           ev.status === "failed" ? "bad" : ev.status === "done" ? "ok" : "job", sp);
       }
       return st;
@@ -451,8 +500,19 @@ function onEvent(s: SciState, ev: any, replay: boolean): SciState {
       return s;
     case "info":
       return ev.text ? note(s, ev.text, "info", sp) : s;
-    case "error":
-      return ev.text ? note(s, ev.text, "bad", sp) : s;
+    case "error": {
+      // A message the server refused (the session was still finishing, could
+      // not be loaded…): say so on its bubble, and if it was meant to start a
+      // turn, no turn is running — leaving "running" on would show a Stop
+      // button that stops nothing and a bubble stuck on "sending…".
+      let st = s;
+      const mine = ev.cid ? s.items.find((it) => it.k === "user" && it.cid === ev.cid) : undefined;
+      if (mine && mine.k === "user") {
+        st = mapItems(st, (it) => it.k === "user" && it.cid === ev.cid ? { ...it, steer: "failed" } : it);
+        if (!mine.steer) st = { ...st, running: false };
+      }
+      return ev.text ? note(st, ev.text, "bad", sp) : st;
+    }
   }
   return s;
 }

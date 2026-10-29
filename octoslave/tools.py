@@ -57,6 +57,16 @@ MODIFYING_TOOLS = {"write_file", "edit_file", "apply_patch", "bash",
 # Tools that require permission only in controlled mode (not supervised)
 FILE_MODIFYING_TOOLS = {"write_file", "edit_file", "apply_patch"}
 
+# Optional check run before a file-modifying tool: guard(name, args, working_dir)
+# returns a refusal message, or None to go ahead. Set by the Science package to
+# keep parallel specialists from overwriting each other's files; None elsewhere.
+_write_guard = None
+
+
+def set_write_guard(guard) -> None:
+    global _write_guard
+    _write_guard = guard
+
 # ---------------------------------------------------------------------------
 # Tool schemas (sent to the model)
 # ---------------------------------------------------------------------------
@@ -1139,6 +1149,13 @@ def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str =
     err = _validate_required_args(name, args)
     if err is not None:
         return err, False
+    if _write_guard is not None and name in FILE_MODIFYING_TOOLS:
+        try:
+            refusal = _write_guard(name, args, working_dir)
+        except Exception:
+            refusal = None
+        if refusal:
+            return refusal, False
 
     # When the whole session runs on a remote host, translate the local session
     # working_dir into a real remote directory so every tool (bash, file ops,

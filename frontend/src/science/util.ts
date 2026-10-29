@@ -73,6 +73,24 @@ export function fmtWhen(iso: string | number): string {
     : d.toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
+// "just now" / "4m ago" / "2d ago" — how old a reading is, which for a job
+// status matters as much as the status itself.
+export function fmtAgo(iso: string): string {
+  if (!iso) return "";
+  const t = new Date(iso).getTime();
+  if (isNaN(t)) return "";
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (s < 45) return "just now";
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 36) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
+}
+
+// A status reading older than this is too old to present as current.
+export const STALE_AFTER_MS = 10 * 60 * 1000;
+
 export function fmtDur(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000));
   if (s < 60) return `${s}s`;
