@@ -213,11 +213,129 @@ def _overlap(a: str, b: str) -> float:
     return len(ta & tb) / min(len(ta), len(tb))
 
 
-# Calibrated on real sessions: a re-worded clone of an existing remit lands
-# around 0.4+, while distinct work in the same field (modelling, plotting,
-# structure prediction over the same data) stays near 0.1.
-_DUP_THRESHOLD = 0.3
+def _ambient_terms(session) -> set[str]:
+    """Vocabulary that describes the PROJECT rather than any one specialist's job.
+
+    Every specialist in a focused project talks about the same subject matter, so
+    the subject words carry no information about WHAT WORK an agent is doing: in a
+    binder-design session "binder", "candidate" and "target" say only "this is the
+    binder project". Comparing remits on those words makes every new specialist
+    look like a copy of the last one — and the longer the session, the worse it
+    gets, because the shared vocabulary only grows.
+
+    Two domain-agnostic sources, no hard-coded field terms: the session's own task
+    (definitionally about the project as a whole) and any term that recurs across
+    the existing specialists' goals.
+    """
+    ambient = _terms(getattr(session, "task", "") or "")
+    goals = [_terms(s.goal) for s in session.specialists if (s.goal or "").strip()]
+    if len(goals) >= 3:
+        from collections import Counter
+        df = Counter(t for g in goals for t in g)
+        recurring = max(2, int(len(goals) * 0.4))
+        ambient |= {t for t, n in df.items() if n >= recurring}
+    return ambient
+
+
+def _same_work(a: str, b: str) -> float:
+    """Whether two descriptions say the SAME thing — symmetric (Jaccard).
+
+    Used only for the "near-identical wording" shortcut, where containment is
+    the wrong question: a narrower follow-up is fully contained in a broad remit
+    without being a copy of it. A re-worded clone still scores high here; a
+    subset does not.
+    """
+    ta, tb = _terms(a), _terms(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def _remit_scores(a: str, b: str, ambient: set[str]) -> tuple[float, float]:
+    """``(mutual, contained)`` for two remits, on their DISTINGUISHING terms —
+    the method and the action ("MD simulation", "stability" vs "predict",
+    "ESMFold") — with the project's shared vocabulary discounted.
+
+    ``mutual`` (shared terms over the LARGER remit) is high only when each
+    remit covers most of the other: the same job. ``contained`` (over the
+    SMALLER one) is also high when one is merely a part of the other — a
+    narrower follow-up, or the next stage of the same work. Refusing on
+    containment refused exactly those ("plot the per-residue contributions" as
+    a clone of a long MD remit that mentioned plotting), so it only ever
+    decides the advisory note, never a refusal.
+    """
+    ta, tb = _terms(a) - ambient, _terms(b) - ambient
+    # Once the shared subject matter is gone there may be too little left to
+    # judge. Err towards dispatching: a needless specialist costs one agent run,
+    # a wrongly blocked one costs the orchestrator doing the whole job itself.
+    if len(ta) < 2 or len(tb) < 2:
+        return 0.0, 0.0
+    shared = len(ta & tb)
+    return shared / max(len(ta), len(tb)), shared / min(len(ta), len(tb))
+
+
+# A near-certain clone: each remit covers at least half of the other on the
+# terms that distinguish it. Measured on real cases, clones scored 0.67-0.75 and
+# narrower follow-ups / next stages / new work at most 0.35.
+_DUP_THRESHOLD = 0.5
+# Worth mentioning, not worth refusing: one remit is largely contained in the
+# other (a part of it, or its next stage), so the spawn goes ahead with a
+# pointer to the related specialist — continue_specialist would keep its
+# context. A false positive here costs a line of text.
+_ADVISE_THRESHOLD = 0.5
+# How much two role titles must agree to count as the same discipline.
+_ROLE_MATCH = 0.5
+# Above this mutual coverage the titles do not matter: "Structure Predictor"
+# predicting structures with ESMFold is the "Structural Biologist" doing so.
+_ROLE_IRRELEVANT = 0.6
 _MIN_TERMS = 4
+# Raw wording so alike that it is a clone whatever the vocabulary overlap says.
+_NEAR_IDENTICAL = 0.85
+# Cost bound only; the ambient discount is what prevents false positives.
+_COMPARE_LAST = 30
+
+
+def _compare_specialists(session, role: str, goal: str):
+    """``(clone, clone_score, related, related_score)`` against this session's
+    live specialists: the best candidate for a refusal (mutual coverage) and
+    the best for an advisory pointer (containment)."""
+    ambient = _ambient_terms(session)
+    clone, clone_score, related, related_score = None, 0.0, None, 0.0
+    # Filter by status BEFORE bounding the comparison, or a run of failed or
+    # stopped specialists pushes the live ones out of the window and an exact
+    # clone sails through.
+    recent = [s for s in session.specialists
+              if s.status in ("working", "done")][-_COMPARE_LAST:]
+    for s in recent:
+        # A remit can be phrased almost entirely in the project's own vocabulary
+        # ("design the binders"), leaving nothing distinguishing to compare.
+        # Near-identical WORDING is clone enough on its own, so it is judged
+        # first — symmetrically (_same_work), or a short goal would match any
+        # longer one that contains its words.
+        raw = _same_work(goal, s.goal)
+        if raw >= _NEAR_IDENTICAL:
+            mutual = contained = raw
+        else:
+            # Too-short descriptions carry no signal — don't judge on them.
+            if min(len(_terms(goal)), len(_terms(s.goal))) < _MIN_TERMS:
+                continue
+            mutual, contained = _remit_scores(goal, s.goal, ambient)
+        # A different discipline is different work even when it reads
+        # similarly — unless the two remits are substantially the same job.
+        if mutual < _ROLE_IRRELEVANT and _overlap(role, s.role) < _ROLE_MATCH:
+            mutual *= 0.5
+        if mutual > clone_score:
+            clone, clone_score = s, mutual
+        if contained > related_score:
+            related, related_score = s, contained
+    return clone, clone_score, related, related_score
+
+
+def _closest_specialist(session, role: str, goal: str):
+    """The existing specialist this remit would CLONE, as ``(specialist,
+    score)`` — the score a refusal is decided on (see _compare_specialists)."""
+    clone, score, _, _ = _compare_specialists(session, role, goal)
+    return clone, score
 
 
 def _duplicate_of(session, role: str, goal: str) -> "Specialist | None":
@@ -226,17 +344,8 @@ def _duplicate_of(session, role: str, goal: str) -> "Specialist | None":
     Spawning a near-clone is the common failure mode: the fresh agent has none of
     the first one's findings, so it re-treads the same sources and dead ends.
     """
-    best, best_score = None, 0.0
-    for s in session.specialists:
-        if s.status not in ("working", "done"):
-            continue
-        # Too-short descriptions carry no signal — don't block on them.
-        if min(len(_terms(goal)), len(_terms(s.goal))) < _MIN_TERMS:
-            continue
-        score = max(_overlap(goal, s.goal), _overlap(f"{role} {goal}", f"{s.role} {s.goal}"))
-        if score > best_score:
-            best, best_score = s, score
-    return best if best_score >= _DUP_THRESHOLD else None
+    best, score = _closest_specialist(session, role, goal)
+    return best if score >= _DUP_THRESHOLD else None
 
 
 def _prior_work(session, exclude_id: str = "") -> str:
@@ -267,13 +376,108 @@ _SPECIALIST_BRIEF = ("You are a specialist reporting to a research orchestrator.
 
 # Tools every specialist gets on top of its grant: surfacing its own results,
 # recording how they were made, and LOOKING at a figure or page before reporting
-# it. The other science tools (dispatching agents, cluster jobs) stay with the
-# orchestrator — no recursion, one place that owns compute.
+# it. The agent-dispatching tools stay with the orchestrator — no recursion.
 SPECIALIST_SHARED_TOOLS = ("present_output", "record_provenance", "view_image")
 
 # Science tools a specialist may be GIVEN when the orchestrator asks for them:
 # self-contained lookups with no session side effects and no way to recurse.
+# NOT curate_dataset: it adds and shows an artifact itself, skipping the
+# "specialist proposes, orchestrator decides" gate, the working-material filter
+# and the outputs the researcher removed.
 SPECIALIST_GRANTABLE = ("literature_search",)
+
+# Tools only the orchestrator may hold: dispatching and supervising agents. A
+# specialist with these would recurse (a specialist spawning specialists).
+ORCHESTRATOR_ONLY = ("spawn_specialist", "continue_specialist", "check_specialists")
+
+# File/shell tools that make an agent "code-capable" — the ones that make
+# offloading a heavy step to a compute node meaningful. Mirrors
+# lab.agent_runtime.tools_for_agent, which auto-grants the cluster tools to such
+# an agent when a node is configured.
+_CODE_CAPABLE = frozenset({"bash", "write_file", "edit_file", "apply_patch"})
+
+
+def _specialist_grantable() -> frozenset[str]:
+    """Science tools the orchestrator may grant to a specialist right now.
+
+    The cluster tools are included WHENEVER this session has a compute node, so
+    a specialist can run its own heavy step on the node instead of handing the
+    work back. Refusing them made the orchestrator do every computation itself
+    — it was told "orchestrator-only" while the specialist was in fact offered
+    those tools anyway (lab.agent_runtime auto-grants them to a code-capable
+    agent), so the refusal was both wrong and the thing that stopped delegation.
+    """
+    grantable = set(SPECIALIST_GRANTABLE)
+    try:
+        if active_compute_node() is not None:
+            grantable |= set(CLUSTER_TOOL_NAMES)
+    except Exception:  # noqa: BLE001 — never block a spawn on this
+        pass
+    return frozenset(grantable)
+
+
+def _auto_cluster_grant(granted) -> tuple[str, ...]:
+    """The cluster tools a code-capable specialist is auto-granted at runtime,
+    so the persisted record matches what it is actually offered. Empty when
+    this session has no compute node, or the specialist has no way to use one."""
+    try:
+        if active_compute_node() is None:
+            return ()
+    except Exception:  # noqa: BLE001
+        return ()
+    return CLUSTER_TOOL_NAMES if (_CODE_CAPABLE & set(granted)) else ()
+
+
+def _known_tool(name: str, valid: set[str]) -> bool:
+    """A real tool name, or ``mcp__<connector>`` for a CONNECTED MCP connector —
+    granted whole and expanded to its tools when the specialist runs
+    (lab.agent_runtime.effective_tool_names), so the record stays one line."""
+    if name in valid:
+        return True
+    if not name.startswith("mcp__"):
+        return False
+    try:
+        from ..mcp_client import manager
+        return manager.expand_server_grants([name]) != [name]
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _withheld_note(withheld: list[str], valid: set[str]) -> str:
+    """Say WHY each requested tool was not granted. "unknown, or
+    orchestrator-only" told the orchestrator nothing it could act on: a typo, a
+    tool that needs a compute node, and a genuine recursion guard all read the
+    same, so it gave up on delegating instead of fixing the call."""
+    if not withheld:
+        return ""
+    # One bucket per tool, so nothing is explained twice.
+    unknown = [t for t in withheld if t not in valid]
+    connectors = [t for t in unknown if t.startswith("mcp__")]
+    unknown = [t for t in unknown if t not in connectors]
+    rest = [t for t in withheld if t not in unknown and t not in connectors]
+    meta = [t for t in rest if t in ORCHESTRATOR_ONLY]
+    cluster = [t for t in rest if t in CLUSTER_TOOL_NAMES and t not in meta]
+    other = [t for t in rest if t not in meta and t not in cluster]
+    parts = []
+    if unknown:
+        parts.append(f"{', '.join(unknown)} — no such tool (check the name).")
+    if connectors:
+        parts.append(f"{', '.join(connectors)} — no connected MCP connector by "
+                     f"that name. Connect it first (find_connector → "
+                     f"connect_connector), then grant `mcp__<connector>`; or grant "
+                     f"bash and let the specialist connect it itself.")
+    if meta:
+        parts.append(f"{', '.join(meta)} — yours only; a specialist cannot "
+                     f"dispatch specialists. Break the work up yourself.")
+    if cluster:
+        parts.append(f"{', '.join(cluster)} — this session has no compute node, "
+                     f"so there is no node to work on. A specialist with bash "
+                     f"already has run_background for a long LOCAL computation; "
+                     f"pick a node in the session settings if it needs a cluster.")
+    if other:
+        parts.append(f"{', '.join(other)} — not available to a specialist. Do "
+                     f"that part yourself, or give the specialist its result.")
+    return "Not granted: " + " ".join(parts)
 
 
 def _run_specialist(ctx, rec, spec, task: str, working_dir: str, *,
@@ -405,7 +609,11 @@ def _finish_specialist(ctx, pool, rec, spec, task, working_dir, history,
     ctx.session.save_transcript(rec.id, transcript)
     ctx.session.update_specialist(rec.id, status="done", summary=summary)
     sp.emit({"type": "science_specialist", "event": "done", "id": rec.id,
-             "status": "done", "summary": summary})
+             "status": "done", "summary": summary,
+             # What it offered to show. The orchestrator decides what is
+             # actually presented, so without this the ones it passes over are
+             # invisible — the researcher never learns the file exists.
+             "proposed": pool.proposals_of(rec.id)})
     pool.finish(rec.id, "done", summary, ok=True)
 
 
@@ -520,49 +728,66 @@ def _run_spawn_specialist(args: dict, working_dir: str) -> tuple[str, bool]:
         return "spawn_specialist needs a `goal` (and ideally a `task`).", False
 
     valid = _tools.valid_tool_names()
-    # Never hand a spawned specialist the meta science tools (no recursion).
-    granted = [t for t in req_tools if t in valid
-               and (t not in SCIENCE_TOOL_NAMES or t in SPECIALIST_GRANTABLE)]
-    # Say what was not granted: a specialist told to do a literature sweep
-    # without the tool for it otherwise improvises, and nobody knows why.
-    withheld = [t for t in req_tools if t not in granted]
-    if withheld:
-        note_tools = (f"Not granted (unknown, or orchestrator-only): "
-                      f"{', '.join(withheld)}. Do that part yourself, or give the "
-                      f"specialist its result.")
-    else:
-        note_tools = ""
+    grantable = _specialist_grantable()
+    # Never hand a spawned specialist the agent-dispatching tools (no recursion).
+    granted = [t for t in req_tools if _known_tool(t, valid)
+               and (t not in SCIENCE_TOOL_NAMES or t in grantable)]
+    # Say what was not granted, and why: a specialist told to do a literature
+    # sweep without the tool for it otherwise improvises, and nobody knows why.
+    # The shared tools below are added to every specialist, so asking for one is
+    # never a refusal — reporting it as withheld was simply false.
+    withheld = [t for t in req_tools
+                if t not in granted and t not in SPECIALIST_SHARED_TOOLS]
+    note_tools = _withheld_note(withheld, valid)
     if not granted:
         granted = ["read_file", "write_file", "edit_file", "bash",
                    "glob", "grep", "list_dir"]
     # Every specialist can surface its own (interim) results to the researcher.
     granted += [t for t in SPECIALIST_SHARED_TOOLS if t in valid and t not in granted]
+    # Record the cluster tools this specialist will in fact be offered (the
+    # runtime auto-grants them to a code-capable agent when a node is
+    # configured). Without this the record, the UI card and the specialist's own
+    # "your tools" line all understated what it had, so it never used the node.
+    granted += [t for t in _auto_cluster_grant(granted) if t not in granted]
 
     spec_model, model_note = _resolve_specialist_model(ctx, args.get("model"))
 
-    # Don't clone an existing specialist. If one already covers this remit, the
-    # orchestrator should resume it (it keeps the sources it already tried) —
-    # unless it deliberately says this is a different angle.
+    # Don't clone an existing specialist: a fresh agent has none of the first
+    # one's findings, so it re-treads the same sources and dead ends. But in a
+    # focused project most specialists ARE related, and refusing those would
+    # leave the orchestrator doing the work itself — so only a near-certain
+    # clone is refused, and a merely related one is dispatched with a pointer.
+    near_note = ""
     if not _truthy(args.get("force")):
-        dup = _duplicate_of(ctx.session, role, goal or task)
-        if dup is not None:
+        close, score, rel, rel_score = _compare_specialists(ctx.session, role, goal or task)
+        if close is not None and score >= _DUP_THRESHOLD:
             return (
-                f"Not spawned — '{dup.name}' ({dup.role}, id `{dup.id}`, status "
-                f"{dup.status}) already covers this remit:\n  {dup.goal}\n\n"
-                f"Resume it with continue_specialist(id=\"{dup.id}\", task=…) so it "
+                f"Not spawned — '{close.name}' ({close.role}, id `{close.id}`, status "
+                f"{close.status}) already covers this remit:\n  {close.goal}\n\n"
+                f"Resume it with continue_specialist(id=\"{close.id}\", task=…) so it "
                 f"keeps everything it already found and the dead ends it already hit. "
                 f"Only spawn a new specialist if this is genuinely different work — "
                 f"then say so in the goal (and pass force=true).", False)
+        if rel is not None and rel_score >= _ADVISE_THRESHOLD:
+            near_note = (
+                f"Note: '{rel.name}' ({rel.role}, id `{rel.id}`) worked on "
+                f"something related — {' '.join((rel.goal or '').split())[:160]}. "
+                f"This was dispatched "
+                f"as new work. If you meant to take that earlier work further, "
+                f"continue_specialist(id=\"{rel.id}\") would have kept its context.")
 
     from ..lab.state import AgentSpec
 
-    spec = AgentSpec(name=name, role=role, expertise=role, goal=goal or task,
-                     tools=granted, model=spec_model, icon=icon)
     rec = Specialist(name=name, role=role, goal=goal or task, tools=granted,
                      icon=icon, status="working")
+    # The agent's id IS the specialist's: its node working directory is named
+    # after it, so a fresh random id per dispatch would point a resumed
+    # specialist at a different directory from the one its files are in.
+    spec = AgentSpec(name=name, role=role, expertise=role, goal=goal or task,
+                     tools=granted, model=spec_model, icon=icon, id=rec.id)
     ctx.session.add_specialist(rec)
     runner = _run_specialist_blocking if _truthy(args.get("wait")) else _run_specialist
-    note = "\n".join(n for n in (model_note, note_tools) if n)
+    note = "\n".join(n for n in (model_note, note_tools, near_note) if n)
     return runner(ctx, rec, spec, task or goal, working_dir, note=note)
 
 
@@ -590,27 +815,45 @@ def _run_continue_specialist(args: dict, working_dir: str) -> tuple[str, bool]:
     if isinstance(extra, str):
         extra = [t.strip() for t in extra.split(",") if t.strip()]
     valid = _tools.valid_tool_names()
-    for t in extra:
-        if t in valid and t not in SCIENCE_TOOL_NAMES and t not in tools:
+    # Same grant rules as spawn_specialist. This used to drop EVERY science tool
+    # silently — so literature_search (explicitly grantable on spawn) and the
+    # cluster tools could not be added to a specialist already in flight, with
+    # no note saying so. Widening a specialist's remit is a normal move.
+    grantable = _specialist_grantable()
+    added = [t for t in extra if _known_tool(t, valid)
+             and (t not in SCIENCE_TOOL_NAMES or t in grantable)]
+    for t in added:
+        if t not in tools:
             tools.append(t)
+    note_tools = _withheld_note(
+        [t for t in extra if t not in added and t not in SPECIALIST_SHARED_TOOLS],
+        valid)
     for t in SPECIALIST_SHARED_TOOLS:
         if t in valid and t not in tools:
             tools.append(t)
+    # The record keeps the cluster tools it was granted while a node was
+    # attached. With the node since removed they would still be offered (the
+    # registry serves them to any Science run) while the orchestrator was told
+    # "no compute node" — so they go, and come back if a node is attached again.
+    if any(t in tools for t in CLUSTER_TOOL_NAMES) \
+            and not set(CLUSTER_TOOL_NAMES) <= _specialist_grantable():
+        tools = [t for t in tools if t not in CLUSTER_TOOL_NAMES]
+    tools += [t for t in _auto_cluster_grant(tools) if t not in tools]
     if tools != rec.tools:
         ctx.session.update_specialist(rec.id, tools=tools)
         rec.tools = tools
 
     spec_model, model_note = _resolve_specialist_model(ctx, args.get("model"))
     spec = AgentSpec(name=rec.name, role=rec.role, expertise=rec.role, goal=rec.goal,
-                     tools=tools, model=spec_model, icon=rec.icon)
+                     tools=tools, model=spec_model, icon=rec.icon, id=rec.id)
     if not history:
         # Transcript lost (e.g. an older session) — run it fresh, but hand over
         # what it reported last time so it doesn't start from zero.
         task = (f"{task}\n\n(Your previous run reported: "
                 f"{' '.join((rec.summary or 'nothing recorded').split())[:800]})")
     runner = _run_specialist_blocking if _truthy(args.get("wait")) else _run_specialist
-    return runner(ctx, rec, spec, task, working_dir,
-                  history=history or None, note=model_note)
+    return runner(ctx, rec, spec, task, working_dir, history=history or None,
+                  note="\n".join(n for n in (model_note, note_tools) if n))
 
 
 def _truthy(v) -> bool:
@@ -963,13 +1206,24 @@ def _submit_remote(remote: dict, command: str, cwd: str, scheduler: str,
     # command into one) and non-ASCII text as "\uXXXX".
     qcwd = shlex.quote(cwd)
     rc = f"science_{jid}.rc"
-    wrapped = (f"mkdir -p {qcwd} && cd {qcwd} && rm -f {rc} && "
+    # Preparing the directory and launching the job are two SEPARATE commands.
+    # Written as one `a && b && nohup job > log 2>&1 & echo $!`, the `&` puts the
+    # WHOLE and-list in the background, and the subshell running it keeps the
+    # session's stdout open even though the job's own output is redirected. ssh
+    # waits for that pipe to close, so the "detached" launch did not return
+    # until the JOB FINISHED: a short job blocked the agent for its whole run,
+    # and one longer than the timeout came back "NOT submitted" while it went
+    # on running on the node — inviting a duplicate submit. Only the nohup'd
+    # command is backgrounded here, with all three streams pointed away from
+    # the session, so the launch returns the moment the job is started.
+    wrapped = (f"mkdir -p {qcwd} && cd {qcwd} && rm -f {rc} || "
+               f"{{ echo octoslave: cannot prepare {qcwd} on the node >&2; exit 125; }}; "
                f"nohup sh -c {shlex.quote(_with_exit_code(command, rc))} "
-               f"> {log} 2>&1 & echo $!")
-    # Launching is quick, but the host's setup snippet and the login shell run
-    # first; 60s was not always enough, and a submit that times out looks like a
-    # job that never started.
-    out, err, code = sess.run(wrapped, cwd, timeout=180)
+               f"> {log} 2>&1 < /dev/null & echo $!")
+    # The wrapper creates and enters the job directory itself, so no `cd` guard
+    # in front of it: that guard ran first and refused a job directory that did
+    # not exist yet — before the `mkdir -p` above could create it.
+    out, err, code = sess.run(wrapped, None, timeout=180)
     return _parse_pid(out), (out + err).strip()
 
 
@@ -1075,6 +1329,90 @@ def _clip_job_output(text: str, budget: int = _JOB_OUT_BUDGET) -> str:
             f"{text[-tail:]}")
 
 
+#: Waiting out a job in ONE call. A specialist gets ~40 steps per dispatch, and
+#: `check_cluster_job` could only take a reading — so an agent given a long
+#: computation had to poll it by hand, spent its whole budget on polls and
+#: reported back INCOMPLETE with the job still running. ``wait`` lets one step
+#: sit on the job instead. Mirrors check_specialists(wait=true): a Stop or a live
+#: message from the researcher ends the wait at once.
+_JOB_WAIT_DEFAULT = 900.0
+_JOB_WAIT_MAX = 3600.0
+_JOB_WAIT_GAPS = (10.0, 20.0, 30.0, 60.0)
+
+
+def _job_wait_budget(wait, seconds=None) -> float:
+    """Seconds this check may block for. 0 = take a reading and return.
+
+    ``wait`` says whether to wait; ``seconds`` bounds the wait (and implies
+    one). A model sending ``wait: 1`` means "yes", not "one second", so 1 is
+    read as true; a larger bare number in ``wait`` is still taken as seconds.
+    """
+    def _num(v):
+        try:
+            return float(str(v).strip())
+        except (TypeError, ValueError):
+            return None
+
+    if seconds is not None and not isinstance(seconds, bool) and seconds != "":
+        n = _num(seconds)
+        if n is not None and n > 0:
+            return min(_JOB_WAIT_MAX, n)
+    if wait is None or wait is False or wait == "":
+        return 0.0
+    if wait is True:
+        return _JOB_WAIT_DEFAULT
+    text = str(wait).strip().lower()
+    if text in ("true", "yes", "on", "1"):
+        return _JOB_WAIT_DEFAULT
+    if text in ("false", "no", "off", "0"):
+        return 0.0
+    n = _num(text)
+    if n is None:
+        return _JOB_WAIT_DEFAULT
+    return max(0.0, min(_JOB_WAIT_MAX, n))
+
+
+def _wait_ender(ctx):
+    """What ends a job wait early on THIS thread — returns a check giving the
+    reason ("" = keep waiting).
+
+    It depends on who is waiting. The orchestrator is the one the researcher
+    talks to: any message it has not taken ends its wait, and so does a
+    specialist reporting back. A specialist ends its wait only for a message IT
+    has not been shown — `pending()` stays true until the ORCHESTRATOR takes a
+    message, so a specialist asking that saw the same, already-relayed news on
+    every call and its "wait" returned after a single look, each time. A Lab
+    agent is never registered with `interrupt`, so the Lab's own Stop (the
+    session's status) is checked too, or the wait would be a plain sleep.
+    """
+    from .. import interrupt
+    inbox = getattr(ctx, "inbox", None)
+    who = (_ctx.speaker() or {}).get("agent_name") or ""
+    pool = None if who else getattr(ctx, "pool", None)
+    session = getattr(ctx, "session", None)
+
+    def check() -> str:
+        if interrupt.should_stop() or getattr(session, "stopped", False):
+            return "stop"
+        if inbox is not None:
+            if who:
+                if inbox.has_unseen(who):
+                    return "message"
+            elif inbox.pending():
+                return "message"
+        if pool is not None and pool.has_news():
+            return "report"
+        return ""
+    return check
+
+
+_WAIT_ENDED = {
+    "stop": " Stopped waiting: the run was stopped.",
+    "message": " Stopped waiting: there is a new message from the researcher.",
+    "report": " Stopped waiting: a specialist has reported back.",
+}
+
+
 def _run_check_job(args: dict, working_dir: str) -> tuple[str, bool]:
     ctx = _compute_ctx()
     if ctx is None:
@@ -1091,30 +1429,69 @@ def _run_check_job(args: dict, working_dir: str) -> tuple[str, bool]:
         lines = 120
     remote = _remote_for(job.remote_id or "")
     sci_dir = ctx.session.science_dir
-    try:
-        status, out = _poll_job(job, remote, sci_dir, lines=lines)
-    except Exception as exc:  # noqa: BLE001
-        # Not reaching the node says nothing about the job: keep its last known
-        # status (and its old check time, so the panel shows it as unconfirmed).
-        since = f" (last confirmed {job.last_checked})" if job.last_checked else ""
-        return (f"Could not reach {job.remote_label} to check job '{job.name}' "
-                f"({job.id}): {exc}\nIts status is NOT known right now — the "
-                f"last reading was '{job.status}'{since}. Do not treat it as "
-                f"finished; try again later or check the connection.", False)
+    from .. import interrupt
 
-    job.status = status
-    job.last_checked = _now_stamp()
-    if out:
-        job.output = _clip_job_output(out, 4000)
-    # persist by re-adding through the session lock path
-    for j in ctx.session.jobs:
-        if j.id == job.id:
-            j.status, j.output = job.status, job.output
-            j.last_checked = job.last_checked
-    ctx.session.save()
-    _emit_job(job)
-    return (f"Job '{job.name}' ({job.id}) on {job.remote_label}: {status}. "
-            f"Log: {_job_log_path(job, remote, sci_dir)}\n"
+    budget = _job_wait_budget(args.get("wait"), args.get("wait_seconds"))
+    started = time.monotonic()
+    deadline = started + budget
+    ends = _wait_ender(ctx)
+    ended = ""
+    looks = 0
+    while True:
+        try:
+            status, out = _poll_job(job, remote, sci_dir, lines=lines)
+        except Exception as exc:  # noqa: BLE001
+            # Not reaching the node says nothing about the job: keep its last known
+            # status (and its old check time, so the panel shows it as unconfirmed).
+            since = f" (last confirmed {job.last_checked})" if job.last_checked else ""
+            return (f"Could not reach {job.remote_label} to check job '{job.name}' "
+                    f"({job.id}): {exc}\nIts status is NOT known right now — the "
+                    f"last reading was '{job.status}'{since}. Do not treat it as "
+                    f"finished; try again later or check the connection.", False)
+
+        job.status = status
+        job.last_checked = _now_stamp()
+        if out:
+            job.output = _clip_job_output(out, 4000)
+        # persist by re-adding through the session lock path
+        for j in ctx.session.jobs:
+            if j.id == job.id:
+                j.status, j.output = job.status, job.output
+                j.last_checked = job.last_checked
+        ctx.session.save()
+        # Every look updates the Jobs panel, so a long wait shows as live
+        # progress rather than a turn that has gone quiet.
+        _emit_job(job)
+
+        left = deadline - time.monotonic()
+        if status != "running" or left <= 0:
+            break
+        ended = ends()
+        if ended:
+            break
+        # Sleep in short slices, so whatever ends the wait is noticed at once
+        # rather than at the next look (up to a minute away).
+        until = time.monotonic() + min(_JOB_WAIT_GAPS[min(looks, len(_JOB_WAIT_GAPS) - 1)], left)
+        while not ended and (rest := until - time.monotonic()) > 0:
+            if interrupt.wait(min(1.0, rest)):
+                ended = "stop"
+            else:
+                ended = ends()
+        if ended:
+            break
+        looks += 1
+
+    waited_for = time.monotonic() - started if budget else 0.0
+    waited_note = ""
+    if waited_for >= 1:
+        span = (f"{waited_for:.0f} s" if waited_for < 90
+                else f"{waited_for / 60.0:.0f} min")
+        waited_note = (f" Waited {span} for it"
+                       + (" — still running." if status == "running"
+                          else " to finish."))
+    waited_note += _WAIT_ENDED.get(ended, "") if status == "running" else ""
+    return (f"Job '{job.name}' ({job.id}) on {job.remote_label}: {status}."
+            f"{waited_note} Log: {_job_log_path(job, remote, sci_dir)}\n"
             f"{_clip_job_output(out) if out else ''}", True)
 
 
@@ -1354,10 +1731,17 @@ def _poll_pbs(job: Job, h: str, remote, lines: int) -> tuple[str, str]:
 
 
 def _emit_job(job: Job) -> None:
+    # The panel decides what a long run is doing from this, so it carries the
+    # facts that make a status mean something: WHEN it was submitted (a "running"
+    # with no start time says nothing about a 14-hour job), WHAT was run, and
+    # WHERE. These were recorded on the job all along but never sent.
     _emit_compute({"type": "science_job", "id": job.id, "name": job.name,
                    "status": job.status, "remote": job.remote_label,
                    "scheduler": job.scheduler, "handle": job.handle,
                    "last_checked": job.last_checked,
+                   "submitted_at": job.submitted_at,
+                   "command": (job.command or "")[:2000],
+                   "cwd": job.cwd,
                    "output": job.output[-1500:]})
 
 
@@ -1851,7 +2235,9 @@ SCIENCE_TOOL_DEFINITIONS = [
             "goal": {"type": "string", "description": "What they must accomplish."},
             "task": {"type": "string", "description": "Concrete instructions to execute now."},
             "tools": {"type": "array", "items": {"type": "string"},
-                      "description": "Allowlist of tool names to grant (from the tool registry)."},
+                      "description": "Allowlist of tool names to grant (from the tool "
+                      "registry). To hand over a connected MCP connector, grant "
+                      "`mcp__<connector>` (all its tools)."},
             "icon": {"type": "string", "description": "An emoji for the UI (optional)."},
             "model": {"type": "string", "description": "Which model this specialist "
                       "should run on — choose from the configured specialist pool "
@@ -1947,11 +2333,24 @@ SCIENCE_TOOL_DEFINITIONS = [
                        "submit_cluster_job. Long output is clipped in the MIDDLE (head "
                        "and tail are both kept) and the log's path is returned, so "
                        "there is never a need to re-submit a job just to see what it "
-                       "printed.",
+                       "printed. Pass wait=true to sit on the job until it finishes "
+                       "instead of polling it yourself.",
         "parameters": {"type": "object", "properties": {
             "job_id": {"type": "string"},
             "lines": {"type": "integer", "description": "How many trailing log lines "
                       "to read (default 120, max 1000)."},
+            "wait": {"type": "boolean", "description": "Block until the job leaves "
+                     "'running' instead of returning its status right now (up to 15 "
+                     "minutes, or wait_seconds). ONE step instead of a polling loop; "
+                     "the wait ends early on a Stop, a message from the researcher, "
+                     "or (for the orchestrator) a specialist reporting back. Use it "
+                     "for a job you expect to finish within a few minutes when it is "
+                     "the only thing left to do. As the orchestrator, do not wait out "
+                     "a LONG job: say it is running and end your turn — a job that "
+                     "finishes between turns is brought back to you. Don't use it "
+                     "while you have other work to do."},
+            "wait_seconds": {"type": "integer", "description": "Upper bound for wait, "
+                             "in seconds (max 3600). Implies wait."},
         }, "required": ["job_id"]}}},
     {"type": "function", "function": {
         "name": "write_cluster_file",
@@ -2090,13 +2489,40 @@ _REG_LOCK = threading.Lock()
 _REG_USERS: dict[str, int] = {}
 
 
+def _in_science_run() -> bool:
+    """Is the thread asking inside a Science run (orchestrator or specialist)?"""
+    return _ctx.current() is not None
+
+
+def _in_compute_run() -> bool:
+    """Is the thread asking able to use the cluster-job tools? True inside a
+    Science run, and inside a Lab run that has a compute node configured (the
+    Lab borrows this subset through the thread-local compute context)."""
+    return _compute_ctx() is not None
+
+
+#: Which threads each tool is offered to. The registry is process-wide, so
+#: without this a Science turn advertises its whole toolset to every other agent
+#: in the process — a normal chat turn beside a Science session was offered
+#: spawn_specialist and present_output, which could only answer "Science context
+#: unavailable". Execution is unchanged; this is about what the model is shown.
+_VISIBILITY = {name: (_in_compute_run if name in ("submit_cluster_job",
+                                                 "check_cluster_job",
+                                                 "cluster_shell",
+                                                 "write_cluster_file",
+                                                 "fetch_cluster_file")
+                      else _in_science_run)
+               for name in SCIENCE_TOOL_NAMES}
+
+
 def _acquire(names) -> None:
     with _REG_LOCK:
         for d in SCIENCE_TOOL_DEFINITIONS:
             name = d["function"]["name"]
             if name in names:
                 _REG_USERS[name] = _REG_USERS.get(name, 0) + 1
-                _tools.register_dynamic_tool(d, _RUNNERS[name])
+                _tools.register_dynamic_tool(d, _RUNNERS[name],
+                                             visible=_VISIBILITY.get(name))
 
 
 def _release(names) -> None:

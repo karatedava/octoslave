@@ -1,7 +1,7 @@
 """
 Tool foundry — runtime capability expansion (build + use, sandboxed).
 
-When a specialist hits a capability it lacks, it calls one of three meta-tools
+When a specialist hits a capability it lacks, it calls one of two meta-tools
 (registered into the live tool registry while a lab runs):
 
   request_tool(name, purpose, signature)  — a tool-engineer LLM writes a new
@@ -9,8 +9,12 @@ When a specialist hits a capability it lacks, it calls one of three meta-tools
         registered into the live registry, callable immediately by any agent.
   request_agent(name, role, expertise, goal, tools)  — add a specialist to the
         team (capped at 10); it joins the next meeting/round.
-  request_mcp(server_id, values)  — connect a known MCP server from the registry
-        at runtime; its tools appear in the registry on reconnect.
+
+Connecting external software (MCP connectors) is not a foundry meta-tool: the
+shared ``find_connector`` / ``connect_connector`` tools (octoslave.connectors)
+do it in every mode, and are granted to Lab agents alongside the meta-tools.
+When one connects on a Lab/Science agent's thread, ``connector_connected``
+grants the new tools to that agent so they are offered on its next step.
 
 A built tool runs in-process via ``tools.execute_tool`` (so the existing
 permission flow still applies to anything it does through bash/file tools); its
@@ -137,7 +141,12 @@ def _emit(event: dict):
             pass
 
 
-META_TOOL_NAMES = ("request_tool", "request_agent", "request_mcp")
+META_TOOL_NAMES = ("request_tool", "request_agent")
+# Built-in tools handed to every working Lab agent with the meta-tools.
+_CONNECTOR_TOOLS = ("find_connector", "connect_connector")
+# Retired: ``request_mcp`` became connect_connector. Saved sessions may still
+# list it; it is dropped on grant so no agent is told about a dead tool.
+_RETIRED_TOOLS = ("request_mcp",)
 
 _VALID_NAME = re.compile(r"^[a-z][a-z0-9_]{2,40}$")
 
@@ -349,9 +358,7 @@ def _meta_request_agent(args: dict, working_dir: str) -> tuple[str, bool]:
         model=session.model,
     )
     # Grant the meta-tools to the new agent too (so it can also expand).
-    for mt in META_TOOL_NAMES:
-        if mt not in spec.tools:
-            spec.tools.append(mt)
+    grant_meta_tools(spec)
     session.team.append(spec)
     if agent is not None and isinstance(counts, dict):
         counts[agent.id] = counts.get(agent.id, 0) + 1
@@ -360,38 +367,6 @@ def _meta_request_agent(args: dict, working_dir: str) -> tuple[str, bool]:
     display.print_info(f"  👥 Foundry added agent: {spec.name}")
     return (f"Agent '{spec.name}' ({spec.role}) added to the team; they will join "
             "the next meeting/round."), True
-
-
-def _meta_request_mcp(args: dict, working_dir: str) -> tuple[str, bool]:
-    server_id = str(args.get("server_id", "")).strip()
-    values = args.get("values") or {}
-    if not server_id:
-        return "Provide a server_id from the MCP registry.", False
-    try:
-        from .. import mcp_registry
-        from ..config import add_mcp_server
-    except Exception as e:
-        return f"MCP unavailable: {e}", False
-    entry = mcp_registry.get_entry(server_id)
-    if entry is None:
-        ids = ", ".join(e["id"] for e in mcp_registry.list_entries()[:30])
-        return f"Unknown MCP server '{server_id}'. Known ids include: {ids}", False
-    # Required inputs without a default and not supplied → ask the human instead.
-    missing = [r["key"] for r in mcp_registry.required_inputs(entry, working_dir)
-               if not r["default"] and not values.get(r["key"])]
-    if missing:
-        return (f"Server '{server_id}' needs inputs {missing} (e.g. API keys). "
-                "Ask the human to provide them, then retry."), False
-    try:
-        cfg = mcp_registry.build_config(entry, dict(values), working_dir)
-        add_mcp_server(cfg)
-        _tools.init_mcp(force=True)
-    except Exception as e:
-        return f"Failed to connect MCP server '{server_id}': {e}", False
-    _emit({"type": "mcp_connected", "server_id": server_id})
-    display.print_info(f"  🔌 Foundry connected MCP server: {server_id}")
-    return (f"MCP server '{server_id}' connected. Its tools are now available "
-            "(named mcp__{server}__<tool>)."), True
 
 
 # ---------------------------------------------------------------------------
@@ -447,28 +422,11 @@ _META_DEFS = {
             },
         },
     },
-    "request_mcp": {
-        "type": "function",
-        "function": {
-            "name": "request_mcp",
-            "description": ("Connect a known MCP server from the registry at runtime "
-                            "to gain its tools."),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "server_id": {"type": "string", "description": "Registry id of the MCP server."},
-                    "values": {"type": "object", "description": "Optional input values (API keys, paths)."},
-                },
-                "required": ["server_id"],
-            },
-        },
-    },
 }
 
 _META_FUNCS = {
     "request_tool": _meta_request_tool,
     "request_agent": _meta_request_agent,
-    "request_mcp": _meta_request_mcp,
 }
 
 
@@ -486,7 +444,22 @@ def enable(session, client, model, emit=None) -> None:
 
 
 def grant_meta_tools(spec: AgentSpec) -> None:
-    """Give an agent the meta-tools so it can request capabilities at runtime."""
-    for mt in META_TOOL_NAMES:
+    """Give an agent the meta-tools (and the connector tools) so it can request
+    capabilities at runtime."""
+    spec.tools[:] = [t for t in spec.tools if t not in _RETIRED_TOOLS]
+    for mt in (*META_TOOL_NAMES, *_CONNECTOR_TOOLS):
         if mt not in spec.tools:
             spec.tools.append(mt)
+
+
+def connector_connected(server_name: str, tool_names) -> None:
+    """An MCP connector was just connected on THIS thread. Grant its tools to
+    the agent running here — Lab agents and Science specialists work from an
+    allowlist, so without this they were told the tools existed and then had
+    every call refused — and tell the Lab UI. No-op outside an agent run."""
+    agent = _ctx("current_agent")
+    if agent is not None and agent.tools:
+        for t in tool_names or []:
+            if t not in agent.tools:
+                agent.tools.append(t)
+    _emit({"type": "mcp_connected", "server_id": server_name})

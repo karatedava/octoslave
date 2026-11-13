@@ -42,9 +42,10 @@ export function Workspace(p: Props) {
   ];
   return (
     <section className="sx-ws">
-      <div className="sx-tabs">
+      <div className="sx-tabs" role="tablist" aria-label="Workspace">
         {tabs.map((t) => (
-          <button key={t.id} className={"sx-tab" + (p.tab === t.id ? " on" : "")} onClick={() => p.setTab(t.id)}>
+          <button key={t.id} role="tab" aria-selected={p.tab === t.id}
+            className={"sx-tab" + (p.tab === t.id ? " on" : "")} onClick={() => p.setTab(t.id)}>
             {t.label}
             {t.live && <span className="sx-livedot" />}
             {t.badge !== undefined && <span className="sx-badge">{t.badge}</span>}
@@ -248,12 +249,23 @@ function Team({ st, onFocus }: { st: SciState; onFocus: (id: string) => void }) 
                 <div className="sx-spec-name">{sp.name}</div>
                 <div className="sx-spec-role">{sp.role}</div>
               </div>
-              <span className={"sx-pill " + sp.status}>{working ? <><span className="sx-spin sm" /> working</> : sp.status}</span>
+              <span className={"sx-pill " + sp.status}
+                    title={sp.status === "incomplete"
+                      ? "This specialist did not finish — it can be resumed." : undefined}>
+                {working ? <><span className="sx-spin sm" /> working</> : sp.status}</span>
             </div>
             {working && current && <div className="sx-member-now">{current.summary}</div>}
             {sp.goal && <div className="sx-member-goal">{sp.goal}</div>}
+            {/* Clamped visually, not truncated: a specialist's findings were
+                cut at 600 chars AND clipped by CSS, so the end of a report
+                simply did not exist anywhere on this panel. The full text (plus
+                its working notes and transcript) is on its card in the feed,
+                which is what clicking here opens. */}
             {!working && sp.summary && (
-              <div className="sx-member-sum"><Markdown text={sp.summary.length > 600 ? sp.summary.slice(0, 600) + "…" : sp.summary} /></div>
+              <>
+                <div className="sx-member-sum"><Markdown text={sp.summary} /></div>
+                <div className="sx-member-more">Open its card for the full report, working notes and transcript →</div>
+              </>
             )}
             <div className="sx-member-foot">
               {sp.runs.length > 0 && <span>{sp.runs.length} run{sp.runs.length === 1 ? "" : "s"}</span>}
@@ -271,15 +283,33 @@ function Jobs({ st, onAutoContinue }: { st: SciState; onAutoContinue: (on: boole
   // Keep the "checked Nm ago" line and the staleness cut-off ticking over even
   // when nothing is running — that is exactly when a reading goes stale.
   const now = useNow(true, 30000);
+  // The toggle decides whether the orchestrator restarts itself overnight, so it
+  // must be settable BEFORE a job exists — it used to sit after this early
+  // return and so was unreachable on a fresh session, exactly when you would set it.
+  const auto = (
+    <label className="sx-auto" title="Between turns, open jobs are re-checked every few minutes. When one ends, the orchestrator looks at the result and carries on with the agreed plan — or stops and asks you if the next step is a decision.">
+      <input type="checkbox" checked={st.autoContinue} onChange={(e) => onAutoContinue(e.target.checked)} />
+      Continue automatically when a job ends
+      <span className="sx-auto-budget">
+        {st.autoContinue
+          ? st.autoWakes >= st.maxWakes
+            ? `· budget spent (${st.autoWakes}/${st.maxWakes}) — waiting for you`
+            : `· ${st.autoWakes}/${st.maxWakes} automatic continuations used`
+          : "· off"}
+      </span>
+    </label>
+  );
   if (!st.jobOrder.length) {
-    return <div className="sx-empty"><div className="sx-empty-ic">⎔</div>No jobs yet. This tracks heavy computations — work submitted to a cluster, or long runs on a compute node or here. Ordinary commands the agents run are not jobs and stay out of this list.</div>;
+    return (
+      <div className="sx-jobs">
+        {auto}
+        <div className="sx-empty"><div className="sx-empty-ic">⎔</div>No jobs yet. This tracks heavy computations — work submitted to a cluster, or long runs on a compute node or here. Ordinary commands the agents run are not jobs and stay out of this list.</div>
+      </div>
+    );
   }
   return (
     <div className="sx-jobs">
-      <label className="sx-auto" title="Between turns, open jobs are re-checked every few minutes. When one ends, the orchestrator looks at the result and carries on with the agreed plan — or stops and asks you if the next step is a decision. At most 8 times in a row without a message from you.">
-        <input type="checkbox" checked={st.autoContinue} onChange={(e) => onAutoContinue(e.target.checked)} />
-        Continue automatically when a job ends
-      </label>
+      {auto}
       {st.jobOrder.slice().reverse().map((id) => st.jobs[id]).filter(Boolean).map((j) => {
         const live = ["submitted", "running"].includes(j.status);
         const checked = j.last_checked ? new Date(j.last_checked).getTime() : 0;
@@ -298,6 +328,9 @@ function Jobs({ st, onAutoContinue }: { st: SciState; onAutoContinue: (on: boole
             </div>
             <div className="sx-job-meta">
               {j.remote_label || "local"} · {j.scheduler}{j.handle ? ` · #${j.handle}` : ""}
+              {/* How long it has been going. For a run measured in hours, this is
+                  the number you actually want, and it was never shown. */}
+              {j.submitted_at && <> · submitted {fmtAgo(j.submitted_at)}</>}
               {live && (
                 <span className={"sx-job-checked" + (stale ? " stale" : "")}>
                   {" · "}
@@ -305,6 +338,15 @@ function Jobs({ st, onAutoContinue }: { st: SciState; onAutoContinue: (on: boole
                 </span>
               )}
             </div>
+            {/* What was actually submitted. Judging whether a job is worth
+                waiting on means seeing the command, not just its name. */}
+            {j.command && (
+              <details className="sx-job-cmd">
+                <summary>Command</summary>
+                <pre>{j.command}</pre>
+                {j.cwd && <div className="sx-job-cwd">in <code>{j.cwd}</code></div>}
+              </details>
+            )}
             {stale && (
               <div className="sx-job-warn">
                 Last confirmed {j.last_checked ? fmtAgo(j.last_checked) : "never"} — it may

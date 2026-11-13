@@ -7,7 +7,8 @@ import { fmtWhen, shortDir } from "./util";
 export type Remote = { id: string; name?: string; host?: string };
 
 export function Start({ connected, workingDir, setWorkingDir, models, orchModel, setOrchModel,
-  pool, setPool, remotes, remoteId, setRemoteId, sessions, onStart, onOpen }: {
+  pool, setPool, remotes, remoteId, setRemoteId, sessions, onStart, onOpen,
+  gone, dismissGone }: {
   connected: boolean;
   workingDir: string;
   setWorkingDir: (d: string) => void;
@@ -22,6 +23,8 @@ export function Start({ connected, workingDir, setWorkingDir, models, orchModel,
   sessions: SessionMeta[];
   onStart: (goal: string) => void;
   onOpen: (dir: string) => void;
+  gone?: string;
+  dismissGone?: () => void;
 }) {
   const [goal, setGoal] = useState("");
   const [advanced, setAdvanced] = useState(false);
@@ -39,6 +42,18 @@ export function Start({ connected, workingDir, setWorkingDir, models, orchModel,
     <div className="sx-start">
       <div className="sx-start-card">
         <div className="sx-start-mark">⌬</div>
+        {gone && (
+          <div className="sx-gone" role="status">
+            <b>That session could not be opened.</b>
+            <div><code>{gone}</code> has no Science session in it any more.</div>
+            <div className="sx-muted">
+              The work itself is in that folder, not in the app — if the folder was
+              moved, renamed, or is on a drive that is not mounted or has not finished
+              syncing, put it back or enter its new path below and the session resumes.
+            </div>
+            <button className="sx-btn sm" type="button" onClick={dismissGone}>Dismiss</button>
+          </div>
+        )}
         <h1>New research session</h1>
         <p className="sx-muted">
           You talk with an orchestrator; it plans, delegates to specialists, runs the

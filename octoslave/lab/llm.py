@@ -13,6 +13,7 @@ import time
 
 from openai import OpenAI
 
+from .. import netwatch, ratelimit
 from ..agent import _is_ollama_client, _ollama_extra_body, _is_retryable_error
 
 # Transient upstream hiccups (502/503/504, connection drops, timeouts) are common
@@ -62,7 +63,8 @@ def complete_text(client: OpenAI, model: str, system: str, user: str,
     extra = {"extra_body": _ollama_extra_body()} if _is_ollama_client(client) else {}
     # Leave room for reasoning tokens so the answer isn't starved (see note above).
     max_tokens = max(max_tokens, _REASONING_HEADROOM)
-    for attempt in range(_MAX_RETRIES + 1):
+    attempt = 0
+    while True:
         try:
             resp = client.chat.completions.create(
                 model=model,
@@ -74,12 +76,28 @@ def complete_text(client: OpenAI, model: str, system: str, user: str,
             )
             return strip_tool_markup((resp.choices[0].message.content or "").strip())
         except Exception as exc:  # noqa: BLE001
+            # A connection the machine's sleep killed, or an outage waited out
+            # (server unreachable at all), is not this call failing: go again
+            # without spending a retry. Failing here would read as "Critic
+            # unavailable" and let unreviewed work through.
+            if netwatch.is_sleep_error(exc):
+                continue
+            # A rate limit is the key's, shared with every agent: wait for a
+            # slot and go again rather than come back empty-handed.
+            if ratelimit.is_rate_limit(exc):
+                if ratelimit.wait_after(exc, client):
+                    continue
+                return ""
+            if not _is_retryable_error(exc):
+                return ""
+            if netwatch.wait_out_outage(client):
+                continue
             # Retry transient gateway/connection/timeout hiccups; give up otherwise.
-            if _is_retryable_error(exc) and attempt < _MAX_RETRIES:
-                time.sleep(_RETRY_BACKOFF * (attempt + 1))
+            if attempt < _MAX_RETRIES:
+                attempt += 1
+                time.sleep(_RETRY_BACKOFF * attempt)
                 continue
             return ""
-    return ""
 
 
 _JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)

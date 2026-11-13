@@ -1,4 +1,5 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode,
+  type WheelEvent as ReactWheelEvent } from "react";
 import { Markdown } from "./Markdown";
 import { FileView } from "./Viewers";
 import type { Artifact, Digest, Item, SciState, Specialist, Step, Todo } from "./store";
@@ -26,50 +27,156 @@ type FeedProps = {
   onRefinePlan: (todos: Todo[]) => void;
   onExample: (text: string) => void;
   focusSpec: string | null;
+  workingDir: string;
+  sentTick: number;            // bumped each time the researcher sends something
 };
 
-export function Feed({ st, onOpenArt, onRefine, onHide, onRefinePlan, onExample, focusSpec }: FeedProps) {
+// Within this many px of the end counts as being at the latest; further away
+// than OFFER_AT, the way back to it is offered.
+const AT_END = 24;
+const OFFER_AT = 60;
+
+export function Feed({ st, onOpenArt, onRefine, onHide, onRefinePlan, onExample, focusSpec, workingDir, sentTick }: FeedProps) {
   const scroller = useRef<HTMLDivElement>(null);
   const inner = useRef<HTMLDivElement>(null);
-  const stick = useRef(true);
-  const [away, setAway] = useState(false);
 
-  // Stick to the bottom only while the user is there — reading back through
-  // the conversation must not be yanked away by every token. Any scroll UP
-  // lets go at once (a slow trackpad scroll used to stay within the "near the
-  // bottom" zone and get pulled back); following resumes only at the bottom.
+  // Following the work: the view stays at the latest while the researcher is
+  // there, and lets go the moment THEY go back to read — reading must not be
+  // yanked away by every token. Only the reader lets go. The view also moves
+  // up by itself whenever something around the conversation gets smaller (the
+  // plan folding away, the status line ending with the turn, the message box
+  // shrinking after a send): the browser pulls the scroll position up to the
+  // new end. That used to be taken for the reader leaving, and the work then
+  // ran on out of sight until the reader scrolled down after it.
+  const stick = useRef(true);
   const lastTop = useRef(0);
+  const upAt = useRef(0);                      // when the reader last asked to go up (wheel, keys)
+  const goingTo = useRef(0);                   // until when the view glides to a card the reader picked
+  const dragging = useRef(false);              // holding the scrollbar
+  const touchY = useRef<number | null>(null);  // a finger on the conversation
+  const nextId = useRef(st.nextId);
+  const newFrom = useRef(Infinity);            // first item the reader has not seen yet
+  const [away, setAway] = useState(false);
+  const awayNow = useRef(false);
+
+  const measure = () => {
+    const el = scroller.current;
+    if (!el) return;
+    const a = !stick.current && el.scrollHeight - el.scrollTop - el.clientHeight > OFFER_AT;
+    if (a !== awayNow.current) { awayNow.current = a; setAway(a); }
+  };
+  const letGo = () => {
+    if (stick.current) { stick.current = false; newFrom.current = nextId.current; }
+  };
+  const follow = () => { stick.current = true; newFrom.current = Infinity; };
+  const toBottom = () => {
+    const el = scroller.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  };
   const onScroll = () => {
     const el = scroller.current;
     if (!el) return;
-    const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
-    if (el.scrollTop < lastTop.current - 1) stick.current = false;
-    else if (gap < 24) stick.current = true;
-    lastTop.current = el.scrollTop;
-    setAway(gap >= 24);
+    const top = el.scrollTop;
+    const gap = el.scrollHeight - top - el.clientHeight;
+    const up = top < lastTop.current - 1;
+    lastTop.current = top;
+    const now = Date.now();
+    const asked = dragging.current || touchY.current !== null || now - upAt.current < 600 || now < goingTo.current;
+    // Going up and landing short of the end is the reader (or find-in-page, or
+    // a link); going up and landing exactly AT the end is the page getting
+    // shorter beneath the view — keep following then. (A smooth scroll starts
+    // with a step that small too, hence the explicit signals in ``asked``.)
+    if (up && (asked || gap > 2)) letGo();
+    else if (gap < AT_END) follow();
+    measure();
   };
-  const toBottom = (smooth = false) => {
-    const el = scroller.current;
-    if (el) el.scrollTo({ top: el.scrollHeight, behavior: smooth ? "smooth" : "auto" });
+  // Going up inside a box of its own (a long log, a wide table) scrolls that
+  // box, not the conversation — that is not the reader leaving the latest.
+  const innerTakesIt = (t: EventTarget | null) => {
+    for (let n = t as HTMLElement | null; n && n !== scroller.current; n = n.parentElement) {
+      if (n.scrollTop > 0 && n.scrollHeight > n.clientHeight
+          && /^(auto|scroll)$/.test(getComputedStyle(n).overflowY)) return true;
+    }
+    return false;
   };
-  useLayoutEffect(() => { if (stick.current) toBottom(); });
+  const onWheel = (e: ReactWheelEvent) => {
+    if (e.ctrlKey || e.deltaY >= 0 || innerTakesIt(e.target)) return;   // ctrl+wheel is a pinch-zoom
+    upAt.current = Date.now();
+    // Let go now, not at the scroll event: a token arriving in between would
+    // otherwise put the view back at the end and swallow a slow trackpad scroll.
+    if ((scroller.current?.scrollTop || 0) > 0) letGo();
+  };
+  // Straight to the latest, and follow it from there.
+  const jump = () => {
+    goingTo.current = 0;
+    follow(); toBottom(); measure();
+  };
+
+  // After every render: stay at the latest while following, and check again
+  // whether to offer the way back — content grows without any scrolling.
+  useLayoutEffect(() => {
+    nextId.current = st.nextId;
+    if (stick.current && !dragging.current) toBottom();
+    measure();
+  });
+  // Sending something: show it go out and follow what comes back, wherever the
+  // reader had scrolled to.
+  useLayoutEffect(() => {
+    if (sentTick) jump();
+  }, [sentTick]);
   useEffect(() => {
-    // Images and tables grow after they load; keep following if we were.
-    const el = inner.current;
-    if (!el || typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver(() => { if (stick.current) toBottom(); });
+    // Content grows after it loads (images, tables), and the view itself
+    // changes size when the plan, the status line or the message box do.
+    const el = scroller.current, content = inner.current;
+    if (!el || !content || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => {
+      if (stick.current && !dragging.current) toBottom();
+      measure();
+    });
+    ro.observe(content);
     ro.observe(el);
-    return () => ro.disconnect();
+    // The reader going up by keyboard (focus in the conversation, not in a field).
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && t !== document.body && !el.contains(t)) return;
+      if (t && t.closest("input, textarea, select, [contenteditable]")) return;
+      if (e.key === "PageUp" || e.key === "ArrowUp" || e.key === "Home" || (e.key === " " && e.shiftKey))
+        upAt.current = Date.now();
+    };
+    const release = () => { dragging.current = false; };
+    document.addEventListener("keydown", onKey, true);
+    window.addEventListener("pointerup", release);
+    window.addEventListener("pointercancel", release);
+    window.addEventListener("blur", release);
+    return () => {
+      ro.disconnect();
+      document.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("pointerup", release);
+      window.removeEventListener("pointercancel", release);
+      window.removeEventListener("blur", release);
+    };
   }, []);
   useEffect(() => {
     if (!focusSpec) return;
     const el = document.getElementById("sxspec-" + focusSpec);
     if (el) {
+      // The reader asked to look at this card: do not pull them off it, nor
+      // take the glide's first small step for the page getting shorter.
+      letGo();
+      goingTo.current = Date.now() + 1500;
       el.scrollIntoView({ behavior: "smooth", block: "center" });
       el.classList.add("sx-flash");
       setTimeout(() => el.classList.remove("sx-flash"), 1400);
     }
   }, [focusSpec]);
+
+  // What arrived since the reader left the latest; an answer still being
+  // written counts too (its end has not been seen).
+  let fresh = 0;
+  if (away) {
+    for (let i = st.items.length - 1; i >= 0 && st.items[i].id >= newFrom.current; i--) fresh++;
+    if (st.live && st.live.text) fresh++;
+  }
 
   const now = useNow(st.running);
   const lastStepsId = [...st.items].reverse().find((i) => i.k === "steps")?.id;
@@ -86,32 +193,51 @@ export function Feed({ st, onOpenArt, onRefine, onHide, onRefinePlan, onExample,
   }), []);
 
   return (
-    <div className="sx-feed" ref={scroller} onScroll={onScroll}>
-      <div className="sx-feed-inner" ref={inner}>
-        {st.items.length === 0 && !st.live && <Welcome onExample={onExample} />}
-        {st.items.map((it) => {
-          const live = st.running && it.id === lastStepsId;
-          const sp = it.k === "spec" ? st.specialists[it.specId] : undefined;
-          const art = it.k === "art" ? st.artifacts[it.artId]
-            : it.k === "user" && it.artifactId ? st.artifacts[it.artifactId] : undefined;
-          // The clock only matters to what is still running.
-          const ticks = live || (sp && sp.status === "working");
-          return (
-            <FeedItem key={it.id} it={it} sp={sp} art={art} now={ticks ? now : 0}
-              liveSteps={live} {...stable} />
-          );
-        })}
-        {st.live && st.live.text && (
-          <div className="sx-msg assistant streaming">
-            <Who who={st.live.who} icon={st.live.icon} />
-            <Markdown text={st.live.text} />
-            <span className="sx-caret" />
-          </div>
-        )}
+    <div className="sx-feedwrap">
+      {/* The conversation updates on its own as agents work, so a screen reader
+          needs to be told. "polite" waits for a pause rather than interrupting
+          every streamed token. */}
+      <div className="sx-feed" ref={scroller} onScroll={onScroll} onWheel={onWheel}
+        onPointerDown={(e) => { if (e.target === scroller.current) dragging.current = true; }}
+        onTouchStart={(e) => { touchY.current = e.touches[0]?.clientY ?? null; }}
+        onTouchMove={(e) => {
+          const y = e.touches[0]?.clientY;
+          if (touchY.current !== null && y !== undefined && y - touchY.current > 4 && !innerTakesIt(e.target)) letGo();
+        }}
+        onTouchEnd={() => { touchY.current = null; }} onTouchCancel={() => { touchY.current = null; }}
+        role="log" aria-live="polite" aria-relevant="additions" aria-label="Research conversation">
+        <div className="sx-feed-inner" ref={inner}>
+          {st.items.length === 0 && !st.live && <Welcome onExample={onExample} />}
+          {st.items.map((it) => {
+            const live = st.running && it.id === lastStepsId;
+            const sp = it.k === "spec" ? st.specialists[it.specId] : undefined;
+            const art = it.k === "art" ? st.artifacts[it.artId]
+              : it.k === "user" && it.artifactId ? st.artifacts[it.artifactId] : undefined;
+            // The clock only matters to what is still running.
+            const ticks = live || (sp && sp.status === "working");
+            return (
+              <FeedItem key={it.id} it={it} sp={sp} art={art} now={ticks ? now : 0}
+                liveSteps={live} workingDir={workingDir} {...stable} />
+            );
+          })}
+          {st.live && st.live.text && (
+            <div className="sx-msg assistant streaming">
+              <Who who={st.live.who} icon={st.live.icon} />
+              <Markdown text={st.live.text} />
+              <span className="sx-caret" />
+            </div>
+          )}
+        </div>
       </div>
+      {/* The way back to the work. It floats over the conversation rather than
+          sitting in it, so showing or hiding it never moves the content. */}
       {away && (
-        <button className="sx-jump" onClick={() => { stick.current = true; setAway(false); toBottom(true); }}>
-          ↓ Latest
+        <button className={"sx-jump" + (st.running ? " live" : "")} onClick={jump}
+          title="Scroll to the latest and keep following it">
+          {st.running && <span className="sx-pulse sm" aria-hidden />}
+          <span className="sx-jump-t">{st.running ? "Jump to current work" : "Jump to latest"}</span>
+          {fresh > 0 && <span className="sx-jump-n">{fresh} new</span>}
+          <span className="sx-jump-arrow" aria-hidden>↓</span>
         </button>
       )}
     </div>
@@ -149,10 +275,10 @@ function Who({ who, icon }: { who?: string; icon?: string }) {
   );
 }
 
-const FeedItem = memo(function FeedItem({ it, sp, art, now, onOpenArt, onRefine, onHide, onRefinePlan, liveSteps }: {
+const FeedItem = memo(function FeedItem({ it, sp, art, now, onOpenArt, onRefine, onHide, onRefinePlan, liveSteps, workingDir }: {
   it: Item; sp?: Specialist; art?: Artifact; now: number; onOpenArt: (id: string) => void;
   onRefine: (id: string) => void; onHide: (id: string) => void; onRefinePlan: (todos: Todo[]) => void;
-  liveSteps: boolean;
+  liveSteps: boolean; workingDir: string;
 }) {
   switch (it.k) {
     case "compacted":
@@ -172,7 +298,7 @@ const FeedItem = memo(function FeedItem({ it, sp, art, now, onOpenArt, onRefine,
     case "steps":
       return <StepsGroup steps={it.steps} live={liveSteps} now={now} />;
     case "spec":
-      return sp ? <SpecCard sp={sp} runIdx={it.run} now={now || Date.now()} /> : null;
+      return sp ? <SpecCard sp={sp} runIdx={it.run} now={now || Date.now()} workingDir={workingDir} /> : null;
     case "art":
       return art ? <ArtCard a={art} onOpen={() => onOpenArt(art.id)} onRefine={() => onRefine(art.id)}
         onHide={() => onHide(art.id)} /> : null;
@@ -344,7 +470,8 @@ function stepDetail(s: Step) {
 
 // ---------------------------------------------------------------------------
 
-function SpecCard({ sp, runIdx, now }: { sp: Specialist; runIdx: number; now: number }) {
+function SpecCard({ sp, runIdx, now, workingDir }:
+                  { sp: Specialist; runIdx: number; now: number; workingDir: string }) {
   const run = sp.runs[runIdx];
   const working = run?.status === "working";
   const [open, setOpen] = useState(false);
@@ -360,8 +487,10 @@ function SpecCard({ sp, runIdx, now }: { sp: Specialist; runIdx: number; now: nu
           <div className="sx-spec-name">{sp.name}{run.resumed && <span className="sx-tag">resumed</span>}</div>
           <div className="sx-spec-role">{sp.role}{sp.model ? ` · ${sp.model}` : ""}</div>
         </div>
-        <span className={"sx-pill " + run.status}>
-          {working ? <><span className="sx-spin sm" /> working</> : run.status === "failed" ? "failed" : "done"}
+        <span className={"sx-pill " + run.status}
+              title={run.status === "incomplete"
+                ? "This specialist did not finish — it can be resumed." : undefined}>
+          {working ? <><span className="sx-spin sm" /> working</> : run.status}
         </span>
         <span className="sx-spec-dur">{fmtDur(dur)}</span>
       </div>
@@ -383,6 +512,28 @@ function SpecCard({ sp, runIdx, now }: { sp: Specialist; runIdx: number; now: nu
           <Markdown text={run.summary} />
         </details>
       ) : null}
+      {/* What it said as it worked. Watching it live and then losing it the
+          moment it finishes is how the reasoning behind a result disappears —
+          the summary is the conclusion, this is how it got there. */}
+      {!working && run.said.length > 0 && (
+        <details className="sx-spec-sum">
+          <summary>Working notes · {run.said.length} message{run.said.length === 1 ? "" : "s"}</summary>
+          {run.said.map((t, i) => <Markdown key={i} text={t} />)}
+        </details>
+      )}
+      {/* Files it offered the orchestrator. Ones that were not presented exist
+          only on disk, so name them here rather than losing them. */}
+      {!working && (run.proposed?.length || 0) > 0 && (
+        <details className="sx-spec-sum">
+          <summary>Proposed {run.proposed!.length} output{run.proposed!.length === 1 ? "" : "s"} · the orchestrator decides which are shown</summary>
+          <ul className="sx-spec-prop">
+            {run.proposed!.map((p, i) => (
+              <li key={i}><code>{p.rel}</code>{p.interim ? <span className="sx-tag">interim</span> : null}
+                {p.caption ? <span className="sx-spec-propcap"> — {p.caption}</span> : null}</li>
+            ))}
+          </ul>
+        </details>
+      )}
       {run.steps.length > 0 && (
         <>
           <button className="sx-spec-toggle" onClick={() => setOpen((o) => !o)}>
@@ -392,7 +543,65 @@ function SpecCard({ sp, runIdx, now }: { sp: Specialist; runIdx: number; now: nu
           {open && <div className="sx-steps-list">{run.steps.map((s, i) => <StepRow key={i} s={s} now={now} />)}</div>}
         </>
       )}
+      {!working && workingDir && <Transcript specId={sp.id} workingDir={workingDir} />}
     </div>
+  );
+}
+
+/** The specialist's own transcript, fetched on demand.
+ *
+ *  Its report is a claim; this is the work behind it. It is written to disk on
+ *  every run and was unreachable from the page, so a relayed summary had to be
+ *  taken on trust. Loaded only when asked for — a transcript can be large. */
+function Transcript({ specId, workingDir }: { specId: string; workingDir: string }) {
+  const [state, setState] = useState<"idle" | "loading" | "error" | "ready">("idle");
+  const [data, setData] = useState<any>(null);
+  const [err, setErr] = useState("");
+
+  const load = async () => {
+    if (state === "loading") return;
+    if (state === "ready") { setState("idle"); return; }
+    setState("loading");
+    try {
+      const r = await fetch(`/api/science/transcript?working_dir=${encodeURIComponent(workingDir)}`
+        + `&id=${encodeURIComponent(specId)}`);
+      const j = await r.json();
+      if (!j.ok) { setErr(j.error || "could not read the transcript"); setState("error"); return; }
+      setData(j); setState("ready");
+    } catch (e: any) {
+      setErr(String(e?.message || e)); setState("error");
+    }
+  };
+
+  return (
+    <>
+      <button className="sx-spec-toggle" onClick={load} aria-expanded={state === "ready"}>
+        <Chev open={state === "ready"} /> {state === "loading" ? "Loading transcript…" : "Transcript"}
+      </button>
+      {state === "error" && <div className="sx-spec-now muted">⚠ {err}</div>}
+      {state === "ready" && data && (
+        <div className="sx-tr">
+          {data.truncated && (
+            <div className="sx-tr-note">Showing the last {data.steps.length} of {data.total} entries.</div>
+          )}
+          {data.steps.map((x: any, i: number) => (
+            <div key={i} className={"sx-tr-row " + x.kind}>
+              <span className="sx-tr-kind">
+                {x.kind === "call" ? toolIcon(x.name) : x.kind === "result" ? "↳"
+                  : x.kind === "said" ? "💬" : x.kind === "note" ? (x.from === "researcher" ? "👤" : "ℹ️") : "🎯"}
+              </span>
+              <div className="sx-tr-body">
+                {x.kind === "call" && <><b>{x.name}</b><pre>{x.args}</pre></>}
+                {x.kind === "result" && <pre>{x.text}</pre>}
+                {x.kind === "said" && <Markdown text={x.text} />}
+                {x.kind === "task" && <><b>brief</b><pre>{x.text}</pre></>}
+                {x.kind === "note" && <><b>{x.from === "researcher" ? "message from the researcher" : "note from the runtime"}</b><pre>{x.text}</pre></>}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
   );
 }
 

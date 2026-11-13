@@ -1374,7 +1374,9 @@ def remote_awareness_note(active: dict | None = None, cfg: dict | None = None,
             lines.append(
                 "Workflow for a HEAVY step: write_cluster_file(path=…, content=…) to "
                 "put scripts and code ON the node → submit_cluster_job(remote_id=…, "
-                "command=…) to run it there → check_cluster_job to poll it → when it "
+                "command=…) to run it there → check_cluster_job to read its status, "
+                "or check_cluster_job(job_id=…, wait=true) to see it through in a "
+                "single step when the job is the only thing left to do → when it "
                 "finishes, fetch_cluster_file the LIGHTWEIGHT result (a plot, a "
                 "UMAP/embedding projection, a small summary table) back to the local "
                 "session, then present_output it so the user sees it. Big files, "
@@ -1480,6 +1482,10 @@ def _normalize_mcp_server(s: dict) -> dict:
     `command` means stdio transport."""
     name = (s.get("name") or "").strip()
     out: dict = {"name": name, "enabled": bool(s.get("enabled", True))}
+    # Where a connector came from (a catalog id or an MCP Registry name), so an
+    # agent asking for the same server again finds this entry, not a duplicate.
+    if isinstance(s.get("source"), str) and s["source"].strip():
+        out["source"] = s["source"].strip()
     if s.get("url"):
         out["url"] = (s.get("url") or "").strip()
         headers = s.get("headers") or {}

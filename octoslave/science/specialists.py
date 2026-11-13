@@ -66,6 +66,17 @@ class Run:
         when = f"{self.elapsed:.0f}s" if mins < 1 else f"{mins:.0f} min"
         if self.status == "working":
             doing = f" — {self.activity}" if self.activity else ""
+            # Queued for a model slot? Say so, or a quiet specialist reads as stuck.
+            w = None
+            if self.ident is not None:
+                from .. import ratelimit
+                w = ratelimit.waiting(self.ident)
+            if w and w[0] >= 5:
+                doing += (" — waiting for the model server to accept requests again "
+                          "(it is refusing this key's requests for now)"
+                          if w[1] == "full" else
+                          " — waiting its turn for a model slot (the key allows only "
+                          "so many requests at once)")
             return (f"- **{self.name}** ({self.role}) — working for {when}, "
                     f"{self.steps} tool call{'s' if self.steps != 1 else ''}"
                     f"{doing}\n  Goal: {_short(self.goal, 200)}")
@@ -139,6 +150,17 @@ class Pool:
             r.proposed = [p for p in r.proposed if p.get("rel") != item.get("rel")] + [item]
             return True
 
+    def proposals_of(self, sid: str) -> list:
+        """What specialist ``sid`` offered for the researcher to see.
+
+        The orchestrator decides which of these reach the workspace, so the ones
+        it passes over leave no trace anywhere. The card shows them, so a figure
+        a specialist made is never silently dropped.
+        """
+        with self._lock:
+            r = self._runs.get(sid)
+            return [dict(p) for p in (r.proposed if r else [])]
+
     def finish(self, sid: str, status: str, summary: str, ok: bool = True) -> None:
         with self._lock:
             for p in [p for p, o in self._claims.items() if o == sid]:
@@ -187,6 +209,11 @@ class Pool:
     def wait(self, timeout: float) -> bool:
         """Block until a specialist reports back (True) or ``timeout`` (False)."""
         return self._news.wait(timeout)
+
+    def has_news(self) -> bool:
+        """A specialist has reported back and the orchestrator has not collected
+        it yet — without collecting it (the next safe point does that)."""
+        return self._news.is_set()
 
     def cancel(self) -> None:
         """Ask every specialist still working to stop (its own stop signal —

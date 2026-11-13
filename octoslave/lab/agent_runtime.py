@@ -13,6 +13,7 @@ only ever sees the tools the Director granted it.
 
 from __future__ import annotations
 
+import functools
 import json
 import time
 
@@ -20,6 +21,8 @@ from openai import OpenAI, BadRequestError
 
 from .. import display
 from .. import interrupt
+from .. import netwatch
+from .. import ratelimit
 from .. import steer
 from ..agent import (
     _RT,
@@ -74,23 +77,36 @@ _MAX_FAILOVERS = 6
 _SWEEP_BACKOFF_SECS = (60, 180, 300)
 
 
-def tools_for_agent(spec: AgentSpec) -> list[dict]:
-    """Resolve the agent's tool allowlist against the live registry.
+def effective_tool_names(spec: AgentSpec) -> set[str]:
+    """The agent's allowlist PLUS the tools the runtime grants it on top.
 
-    Unknown names are silently dropped. An empty allowlist means "no tools"
-    (discussion-only agent). MCP tools are matched by their full name too.
+    One source of truth for "what does this agent have", so the tool list in its
+    system prompt cannot disagree with the tools it is actually offered — an
+    agent that is never told about a tool mostly does not use it, which defeated
+    both auto-grants below.
     """
     allowed = set(spec.tools or [])
     if not allowed:
-        return []
+        return allowed
+    # `mcp__<server>` grants a connected MCP connector whole (every tool it has),
+    # so the Director / orchestrator need not spell out each tool name.
+    if any(t.startswith("mcp__") for t in allowed):
+        try:
+            from ..mcp_client import manager as _mcp
+            allowed = set(_mcp.expand_server_grants(sorted(allowed)))
+        except Exception:
+            pass
     # If an agent can run shell commands, give it the background-process trio too,
     # so it can offload a long/expensive job instead of blocking the whole lab on a
     # synchronous bash call with an inflated timeout (the Director often omits these).
+    # Likewise the connector tools: an agent with a shell can already launch any
+    # package itself, and these are the vetted, user-approved way to add software.
     if "bash" in allowed:
-        allowed.update({"run_background", "check_process", "stop_process"})
-    # When a compute node is configured for this lab run, give code-capable agents
+        allowed.update({"run_background", "check_process", "stop_process",
+                        "find_connector", "connect_connector"})
+    # When a compute node is configured for this run, give code-capable agents
     # the cluster-job tools so they can offload HEAVY steps to the node and fetch
-    # lightweight results back (the lab itself stays local). Mirrors the bash →
+    # lightweight results back (the session itself stays local). Mirrors the bash →
     # run_background auto-grant. The tools are registered only while a node is active.
     try:
         from ..science.tools import active_compute_node, CLUSTER_TOOL_NAMES
@@ -98,32 +114,67 @@ def tools_for_agent(spec: AgentSpec) -> list[dict]:
             allowed.update(CLUSTER_TOOL_NAMES)
     except Exception:
         pass
+    return allowed
+
+
+def tools_for_agent(spec: AgentSpec) -> list[dict]:
+    """Resolve the agent's tool allowlist against the live registry.
+
+    Unknown names are silently dropped. An empty allowlist means "no tools"
+    (discussion-only agent). MCP tools are matched by their full name too.
+    """
+    allowed = effective_tool_names(spec)
+    if not allowed:
+        return []
     defs = [t for t in all_tool_definitions() if t["function"]["name"] in allowed]
     return defs
 
 
 def _stream_turn(client: OpenAI, model: str, messages: list[dict],
-                 tools: list[dict]) -> dict:
+                 tools: list[dict], who: str = "") -> dict:
     """One streaming completion turn restricted to ``tools``, with transient
-    upstream-error retries (504/502/503, connection/timeouts)."""
-    last_exc: Exception | None = None
-    for attempt in range(_MAX_TURN_RETRIES + 1):
+    upstream-error retries (504/502/503, connection/timeouts).
+
+    Neither a closed lid nor a dropped network spends a retry: a connection
+    the machine's sleep killed is retried at once, and an outage (the server
+    cannot be reached at all) is waited out until it is back — otherwise a few
+    minutes offline used up every retry and model switch, and the agent
+    stopped with its work unfinished."""
+    attempt = 0
+    while True:
         try:
             return _stream_completion(client, model, messages,
                                       force_tool=False, tools=tools)
         except BadRequestError:
             raise
         except Exception as e:  # noqa: BLE001 — classify below
-            if not _is_retryable_error(e) or attempt >= _MAX_TURN_RETRIES:
+            # The stream may already have started; close it in the UI so a
+            # retry does not leave a dead "thinking…" draft behind.
+            display.stream_end(False, aborted=True)
+            if netwatch.is_sleep_error(e):
+                display.print_info(f"  ↻ [{who}] The connection did not survive the "
+                                   f"computer sleeping — retrying.")
+                continue
+            if ratelimit.is_rate_limit(e):
+                # The key's request limit, shared by every agent — not this
+                # model failing. Wait for a slot (the gate holds the retry) and
+                # go again, uncounted; switching models cannot help.
+                if ratelimit.wait_after(e, client, who=who):
+                    continue
                 raise
-            last_exc = e
+            if not _is_retryable_error(e):
+                raise
+            if netwatch.wait_out_outage(client, who=who):
+                continue
+            if attempt >= _MAX_TURN_RETRIES:
+                raise
+            attempt += 1
             display.print_info(
                 f"  ↻ Upstream {type(e).__name__}; retry "
-                f"{attempt + 1}/{_MAX_TURN_RETRIES} in {_RETRY_BACKOFF_SECS}s…"
+                f"{attempt}/{_MAX_TURN_RETRIES} in {_RETRY_BACKOFF_SECS}s…"
             )
             if interrupt.wait(_RETRY_BACKOFF_SECS):
                 raise interrupt.StopRequested
-    raise last_exc  # pragma: no cover
 
 
 def _pick_alternate_model(failed: str, pool: list[str] | None,
@@ -172,6 +223,18 @@ def _resumable(history: list[dict]) -> list[dict]:
     return msgs
 
 
+def _background_requests(fn):
+    """Run ``fn`` with its model requests queued BEHIND foreground ones: when the
+    key's request slots are scarce, the orchestrator answering the researcher
+    goes first and specialists take the next free slot."""
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        with ratelimit.background():
+            return fn(*args, **kwargs)
+    return run
+
+
+@_background_requests
 def run_agent_task(
     spec: AgentSpec,
     task: str,
@@ -231,9 +294,20 @@ def run_agent_task(
         user_blocks.append("\n\n## Shared context\n" + context.strip())
     messages: list[dict]
     if history:
-        # Resume: keep the prior transcript (system prompt included) and append the
-        # next instruction. A resumed agent must not redo what it already did.
+        # Resume: keep the prior transcript and append the next instruction. A
+        # resumed agent must not redo what it already did.
         messages = _resumable(history) + [{"role": "user", "content": "\n".join(user_blocks)}]
+        # ...but describe the agent as it is NOW. The stored system prompt is the
+        # one it started with, so tools granted since (on continue, or a compute
+        # node attached later) and the node's own working rules were never
+        # mentioned — and an agent not told about a tool rarely uses it.
+        if messages and messages[0].get("role") == "system":
+            try:
+                fresh = build_agent_system_prompt(spec, working_dir, setting)
+                if fresh.strip():
+                    messages[0] = {"role": "system", "content": fresh}
+            except Exception:  # noqa: BLE001 — a stale prompt beats a lost run
+                pass
     else:
         messages = [
             {"role": "system", "content": build_agent_system_prompt(spec, working_dir, setting)},
@@ -381,7 +455,7 @@ def run_agent_task(
         # tool calls. Normalise before every request so it never reaches the wire.
         messages, _ = repair_messages(messages)
         try:
-            response = _stream_turn(client, model, messages, tools)
+            response = _stream_turn(client, model, messages, tools, who=spec.name)
             # Progress. Forgive the past: every model becomes a candidate again,
             # and the failover budget resets — these bound consecutive failures,
             # not the lifetime of the run.
@@ -474,15 +548,31 @@ def run_agent_task(
             # finished work, so it must be flagged as partial.
             stopped_reason = f"the model endpoint kept failing ({type(e).__name__})"
             break
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as stop:
             display.stream_end(False)
             _restore_budget()
+            # A Stop that lands mid-stream (the usual case — most of a run is
+            # spent waiting on the model) must carry the transcript too, or the
+            # caller has nothing to save and the resumed agent starts over.
+            if isinstance(stop, interrupt.StopRequested) and not hasattr(stop, "transcript"):
+                stop.transcript = messages      # type: ignore[attr-defined]
             raise
         except Exception as e:  # noqa: BLE001 — connection died for good
             # _stream_turn already retried transient failures with backoff. If we
             # land here the model is effectively unreachable: continue the same
             # transcript on another model rather than losing the whole run.
             display.stream_end(False)
+            if ratelimit.is_rate_limit(e):
+                # _stream_turn waited as long as it is worth waiting (the key's
+                # quota is gone, or the server refused everything for hours).
+                # Every model shares the key, so no switch: stop with the work
+                # so far kept, resumable.
+                display.print_error(
+                    f"[{spec.name}] Stopping with the work done so far — the model "
+                    f"server keeps refusing this key's requests (rate limit). Resume "
+                    f"this specialist once it accepts requests again.")
+                stopped_reason = "the model server kept refusing requests (rate limit)"
+                break
             reason = ("Connection kept dropping" if _is_retryable_error(e)
                       else type(e).__name__)
             if _failover(reason):
@@ -526,6 +616,12 @@ def run_agent_task(
             break
 
         display.print_separator()
+        # What this agent was OFFERED this turn. The registry is shared, so a
+        # name the model emits can be a real, runnable tool it was never given —
+        # spawn_specialist is registered (and visible) on a Science specialist's
+        # own thread — and executing it unchecked meant "a specialist cannot
+        # dispatch specialists" held only for well-behaved models.
+        offered_names = {t["function"]["name"] for t in tools}
         for tc in tool_calls:
             name = tc["function"]["name"]
             try:
@@ -539,6 +635,18 @@ def run_agent_task(
 
             display.print_tool_call(name, args)
             _ev("tool_call", tool=name)
+            if name not in offered_names:
+                # A tool built a moment ago (request_tool) is granted back to
+                # spec.tools — look once more before refusing.
+                offered_names = {t["function"]["name"] for t in tools_for_agent(spec)}
+            if name not in offered_names:
+                msg = (f"'{name}' is not one of your tools, so it was not run. "
+                       f"Use only the tools you were given; if this needs "
+                       f"something you do not have, say so in your report.")
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": msg})
+                display.print_tool_result(name, msg, False)
+                _ev("tool_result", tool=name, ok=False)
+                continue
             try:
                 result, success = execute_tool(name, args, working_dir, permission_mode)
             except interrupt.StopRequested as stop:
@@ -693,8 +801,9 @@ Today's date: {date}.
 
 _EXPANSION = (" If you need a capability none of your tools provide, you can expand "
               "at runtime: `request_tool` has a new tool built and registered (then "
-              "call it), `request_agent` adds a teammate, `request_mcp` connects a "
-              "known data/service server. Use these sparingly, only when genuinely "
+              "call it), `request_agent` adds a teammate, and `find_connector` / "
+              "`connect_connector` add external software (an application, a service, "
+              "a specialised model) as tools. Use these sparingly, only when genuinely "
               "blocked.")
 
 _ADVISOR_HEADER = """\
@@ -725,9 +834,26 @@ def build_agent_system_prompt(spec: AgentSpec, working_dir: str,
     # them (Lab members do; Science specialists do not).
     from .foundry import META_TOOL_NAMES
     has_meta = any(t in spec.tools for t in META_TOOL_NAMES)
+    # List what the agent will ACTUALLY be offered, resolved against the live
+    # registry — not just what it was asked for. The runtime adds the
+    # background-process trio and (with a compute node) the cluster tools, and
+    # an agent whose prompt never mentions them does not reach for them, so that
+    # work came back to whoever dispatched it. Resolving against the registry
+    # also drops what this agent's own model cannot have (view_image on a model
+    # without vision), which the allowlist alone would still have promised.
+    # Requested tools keep their order; granted extras follow.
+    try:
+        offered = {d["function"]["name"] for d in tools_for_agent(spec)}
+    except Exception:  # noqa: BLE001
+        offered = set()
+    if not offered:                      # registry unavailable — say what we asked for
+        offered = effective_tool_names(spec)
+    listed = [t for t in spec.tools if t in offered and t not in META_TOOL_NAMES]
+    listed += sorted(t for t in offered
+                     if t not in listed and t not in META_TOOL_NAMES)
     prompt = _AGENT_HEADER.format(
         working_dir=working_dir, layout=ctx["layout"], lead=ctx["lead"],
-        tool_list=", ".join(t for t in spec.tools if t not in META_TOOL_NAMES),
+        tool_list=", ".join(listed),
         expansion=_EXPANSION if has_meta else "",
         **fields,
     )
@@ -743,7 +869,19 @@ def build_agent_system_prompt(spec: AgentSpec, working_dir: str,
             if node is not None:
                 note = remote_awareness_note(active=node, job_submission=True)
                 if note:
-                    prompt = prompt + "\n\n" + note
+                    # Every agent on the team shares ONE workspace on the node,
+                    # so two of them writing the obvious `run.py` or `job.sh`
+                    # silently overwrite each other mid-computation. Give each a
+                    # corner of its own to work in.
+                    slug = "".join(c if (c.isalnum() or c in "-_") else "-"
+                                   for c in (spec.name or "agent").lower()).strip("-")
+                    prompt = prompt + "\n\n" + note + (
+                        f"\n\nYou share this node's session workspace with the "
+                        f"other agents working on this problem. Put your own "
+                        f"scripts, logs and intermediates under "
+                        f"`{slug or 'agent'}-{spec.id[:6]}/` inside it so you "
+                        f"cannot overwrite theirs, and say where your results "
+                        f"are when you report back.")
         except Exception:
             pass
     return prompt

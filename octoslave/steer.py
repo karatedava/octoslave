@@ -94,6 +94,16 @@ class Inbox:
                 it["_relayed"].add(who)
             return fresh
 
+    def has_unseen(self, who: str) -> bool:
+        """Whether a message has arrived that ``who`` has not been shown yet —
+        WITHOUT marking it shown (the agent's next step is what shows it).
+
+        `pending()` is the orchestrator's question ("is there anything I have not
+        taken?") and stays true until the ORCHESTRATOR takes the message — so a
+        worker that asked it kept seeing news it had already been shown."""
+        with self._lock:
+            return any(who not in it["_relayed"] for it in self._recent + self._items)
+
     def mark_seen(self, who: str) -> None:
         """A worker starting now does not need messages the orchestrator has
         already acted on — its instructions were written with them in mind."""

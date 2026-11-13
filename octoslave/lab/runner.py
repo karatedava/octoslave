@@ -49,6 +49,14 @@ class _LabComputeSession:
         self.remote_id = remote_id or ""
         self.jobs: list = []
         self.science_dir = Path(lab_session.working_dir) / "lab"
+        self._lab = lab_session
+
+    @property
+    def stopped(self) -> bool:
+        """The researcher pressed Stop on this Lab run. A Lab thread is never
+        registered with `interrupt`, so a blocking tool (check_cluster_job with
+        wait) has to look here, or Stop would not reach it until it returned."""
+        return getattr(self._lab, "status", "") == "stopped"
 
     def add_job(self, job):
         self.jobs.append(job)
@@ -508,7 +516,16 @@ def run_lab(
     session.ensure_dirs()
     session.touch()
 
-    # Activate the runtime tool/agent/MCP foundry for this run (single-threaded
+    # Connect the user's configured MCP servers (idempotent). Chat and Science
+    # do this on entry; without it a Lab run only saw them if some other run in
+    # the process had connected them first.
+    try:
+        from ..tools import init_mcp
+        init_mcp(working_dir=session.working_dir)
+    except Exception:  # noqa: BLE001 — MCP is strictly additive
+        pass
+
+    # Activate the runtime tool/agent foundry for this run (single-threaded
     # loop → module-level context is safe). No-op if disabled.
     if enable_foundry:
         try:

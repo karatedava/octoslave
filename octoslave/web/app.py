@@ -887,6 +887,125 @@ _EDITABLE_EXT = {".md", ".txt", ".csv", ".tsv", ".json", ".html", ".htm",
 # connection, so a reload, a second tab, or switching sessions never loses a run.
 
 
+#: Steps returned for one specialist transcript, and the size of each result
+#: body. A transcript can be megabytes; the panel wants what it did and found,
+#: not every byte a tool returned.
+_TRANSCRIPT_STEPS = 400
+_TRANSCRIPT_BODY = 4000
+
+
+@app.get("/api/science/transcript")
+async def science_transcript(working_dir: str, id: str):
+    """One specialist's full working transcript, for the drill-down panel.
+
+    The orchestrator relays a specialist's summary, and the researcher has to
+    take it on trust: the reasoning and the tool calls that produced a result are
+    written to ``science/specialists/<id>.json`` and were, until now, unreachable
+    from the page. This serves them, shaped for reading rather than for resuming.
+    """
+    root = Path(working_dir).expanduser().resolve()
+    if await asyncio.to_thread(_science_root_of, root) != root:
+        return {"ok": False, "error": "not a Science session directory"}
+
+    def _read() -> dict:
+        from ..science.session import ScienceSession
+        sess = ScienceSession.load(str(root))
+        if sess is None:
+            return {"ok": False, "error": "no session here"}
+        # Resolve the reference to a specialist THIS session owns and read by its
+        # id, never by the string the browser sent: that string used to be joined
+        # straight onto a filename, so "../../.." reached another project's
+        # transcripts.
+        rec = sess.get_specialist(id)
+        if rec is None:
+            return {"ok": False, "error": "no such specialist in this session"}
+        raw = sess.load_transcript(rec.id)
+        if not raw:
+            return {"ok": False, "error": "no transcript recorded for this specialist",
+                    "specialist": _spec_brief(rec)}
+        if not isinstance(raw, list):
+            return {"ok": False, "error": "this specialist's transcript is unreadable",
+                    "specialist": _spec_brief(rec)}
+        steps: list[dict] = []
+        seen_brief = False
+        for m in raw:
+            if not isinstance(m, dict):
+                continue           # a truncated or hand-edited file, not a step
+            role = m.get("role")
+            if role == "system":
+                continue           # its brief, already shown on the card
+            if role == "assistant":
+                for tc in (m.get("tool_calls") or []):
+                    fn = (tc.get("function") or {})
+                    steps.append({"kind": "call", "name": fn.get("name") or "tool",
+                                  "args": _clip(fn.get("arguments"), _TRANSCRIPT_BODY)})
+                text = m.get("content")
+                if isinstance(text, str) and text.strip():
+                    steps.append({"kind": "said", "text": _clip(text, _TRANSCRIPT_BODY)})
+            elif role == "tool":
+                steps.append({"kind": "result", "name": m.get("name") or "",
+                              "text": _clip(_content_text(m.get("content")), _TRANSCRIPT_BODY)})
+            elif role == "user":
+                # Only the FIRST user message is the specialist's brief. Later ones
+                # are the researcher's messages relayed to it, the runtime's own
+                # nudges (step budget, "summarise before you finish"), or images
+                # it asked to look at — labelling them all "brief" misread what
+                # the specialist was told and when.
+                text = _content_text(m.get("content"))
+                if not seen_brief:
+                    seen_brief = True
+                    steps.append({"kind": "task", "text": _clip(text, _TRANSCRIPT_BODY)})
+                elif text.startswith("[FYI"):
+                    steps.append({"kind": "note", "from": "researcher",
+                                  "text": _clip(text, _TRANSCRIPT_BODY)})
+                else:
+                    steps.append({"kind": "note", "from": "system",
+                                  "text": _clip(text, _TRANSCRIPT_BODY)})
+        total = len(steps)
+        return {"ok": True, "specialist": _spec_brief(rec), "total": total,
+                "truncated": total > _TRANSCRIPT_STEPS,
+                "steps": steps[-_TRANSCRIPT_STEPS:]}
+
+    try:
+        return await asyncio.to_thread(_read)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+def _spec_brief(rec) -> dict:
+    if rec is None:
+        return {}
+    return {"id": rec.id, "name": rec.name, "role": rec.role, "goal": rec.goal,
+            "status": rec.status, "summary": rec.summary, "tools": list(rec.tools or [])}
+
+
+def _content_text(content) -> str:
+    """A message's content as readable text. Multimodal content is a list of
+    parts; showing it with str() printed a Python repr with the base64 image
+    data inline."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for part in content:
+            if isinstance(part, dict):
+                if part.get("type") == "text":
+                    out.append(str(part.get("text") or ""))
+                elif part.get("type") in ("image_url", "image", "input_image"):
+                    out.append("[image]")
+            elif isinstance(part, str):
+                out.append(part)
+        return "\n".join(x for x in out if x)
+    return "" if content is None else str(content)
+
+
+def _clip(text, limit: int) -> str:
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit] + f"\n… [{len(text) - limit} more characters]"
+
+
 @app.get("/api/science/sessions")
 async def science_sessions():
     """List past/current Science sessions (most recent first) for the history UI."""
@@ -1090,6 +1209,8 @@ class _ScienceWatcher:
                         f"could not be started to look at them: {exc}"})
             return
         sess.auto_wakes = int(getattr(sess, "auto_wakes", 0) or 0) + 1
+        ch.publish({"type": "science_settings", "auto_continue": sess.auto_continue,
+                    "auto_wakes": sess.auto_wakes, "max_wakes": self.MAX_WAKES})
         lines = "\n".join(f"- '{j.name}' (id `{j.id}`) on {j.remote_label}: **{j.status}**"
                           for j in ended)
         names = ", ".join(f"“{j.name}”" for j in ended)
@@ -1178,9 +1299,9 @@ async def ws_endpoint(websocket: WebSocket):
                     msg = json.loads(raw)
                     mt = msg.get("type")
                     if mt == "permission_response":
-                        resolve_permission(bool(msg.get("allow", False)))
+                        resolve_permission(bool(msg.get("allow", False)), str(msg.get("id", "")))
                     elif mt == "user_response":
-                        resolve_user_response(str(msg.get("answer", "")))
+                        resolve_user_response(str(msg.get("answer", "")), str(msg.get("id", "")))
                     # ---- a message typed while the chat agent works ----
                     elif mt == "chat_steer":
                         event_q.put_nowait(chat_steer(msg))
@@ -1367,19 +1488,50 @@ async def ws_endpoint(websocket: WebSocket):
             ch.publish({"type": "science_artifact_removed", "id": art.id, "rel": art.rel})
 
     async def sci_settings(msg: dict) -> None:
-        """Per-session switches set from the page (e.g. auto-continue)."""
+        """Per-session settings set from the page: auto-continue, and which
+        models and compute node this session runs on.
+
+        The model/pool/node pickers stay reachable mid-session, but their values
+        used to travel only with the next message — so the header could show a
+        new model while the job watcher, which continues the session on its own
+        from ``sess.model``, still used the old one. Recording them here means
+        the session's state matches what the page displays.
+        """
         from ..science.channel import get_channel
         working_dir = msg.get("working_dir") or state["working_dir"]
         ch = get_channel(sci_key(working_dir))
         sess = ch.session
         if sess is None:
             return
+        dirty = False
         if "auto_continue" in msg:
             sess.auto_continue = bool(msg.get("auto_continue"))
             if sess.auto_continue:
                 sess.auto_wakes = 0
+            dirty = True
+        if msg.get("model"):
+            sess.model = str(msg["model"])
+            state["model"] = sess.model
+            dirty = True
+        if "specialist_models" in msg:
+            pool = [m for m in (msg.get("specialist_models") or [])
+                    if isinstance(m, str) and m.strip()]
+            sess.specialist_models = pool
+            state["specialist_models"] = pool
+            dirty = True
+        if "remote_id" in msg:
+            rid = msg.get("remote_id") or None
+            sess.remote_id = rid
+            state["remote_id"] = rid
+            dirty = True
+        if dirty:
             await asyncio.to_thread(sess.save)
-        ch.publish({"type": "science_settings", "auto_continue": sess.auto_continue})
+        ch.publish({"type": "science_settings", "auto_continue": sess.auto_continue,
+                    "auto_wakes": int(getattr(sess, "auto_wakes", 0) or 0),
+                    "max_wakes": _ScienceWatcher.MAX_WAKES,
+                    "model": sess.model,
+                    "specialist_models": list(sess.specialist_models or []),
+                    "remote_id": sess.remote_id})
 
     def sci_settle_specialists(sess, ch) -> None:
         """Specialists a crash or restart left marked "working" (nothing runs
@@ -1579,6 +1731,15 @@ async def ws_endpoint(websocket: WebSocket):
             pass
         ch.publish({"type": "science_user", "text": text, "cid": cid,
                     "artifact_id": refine_id})
+        # Every open view should see what this message changed: the job
+        # watcher's budget is reset (the panel otherwise kept "budget spent —
+        # waiting for you" until a reload), and the models/node the message
+        # carried are now the session's.
+        ch.publish({"type": "science_settings", "auto_continue": sess.auto_continue,
+                    "auto_wakes": 0, "max_wakes": _ScienceWatcher.MAX_WAKES,
+                    "model": sess.model,
+                    "specialist_models": list(sess.specialist_models or []),
+                    "remote_id": sess.remote_id})
 
         _run_science_turn_thread(ch, key, sess, user_message, client=client,
                                  model=model, remote=remote, refine_id=refine_id,
@@ -2516,9 +2677,9 @@ async def ws_endpoint(websocket: WebSocket):
             # connection is idle in the receive loop (a Science view never
             # blocks it, unlike the chat stream).
             elif mtype == "user_response":
-                resolve_user_response(str(msg.get("answer", "")))
+                resolve_user_response(str(msg.get("answer", "")), str(msg.get("id", "")))
             elif mtype == "permission_response":
-                resolve_permission(bool(msg.get("allow", False)))
+                resolve_permission(bool(msg.get("allow", False)), str(msg.get("id", "")))
 
     except WebSocketDisconnect:
         pass

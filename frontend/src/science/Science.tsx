@@ -24,12 +24,20 @@ function lsSet(k: string, v: string | null) {
   try { v === null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch { /* ignore */ }
 }
 
+/** Same models in the same order. */
+function samePool(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((m, i) => m === b[i]);
+}
+
 export default function Science() {
   const sock = useMemo(() => new LabSocket(), []);
   const [st, dispatch] = useReducer(reducer, initialState);
   const [connected, setConnected] = useState(false);
   const [started, setStarted] = useState(false);
   const [loading, setLoading] = useState(false);
+  // A remembered session whose directory was not found, so the start screen can
+  // explain why the researcher was put back here.
+  const [gone, setGone] = useState("");
   const [workingDir, setWorkingDir] = useState("");
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [models, setModels] = useState<string[]>([]);
@@ -45,6 +53,9 @@ export default function Science() {
   const [wsTab, setWsTab] = useState<WsTab>("preview");
   const [follow, setFollow] = useState(true);
   const [focusSpec, setFocusSpec] = useState<string | null>(null);
+  // Bumped whenever the researcher sends something: the conversation then shows
+  // it and follows what comes back, wherever they had scrolled to.
+  const [sentTick, setSentTick] = useState(0);
   const [fileTick, setFileTick] = useState(0);
   const [showSettings, setShowSettings] = useState(false);
 
@@ -92,6 +103,35 @@ export default function Science() {
   const runningRef = useRef(false);
 
   useEffect(() => { cfg.current = { workingDir, orchModel, pool, remoteId }; }, [workingDir, orchModel, pool, remoteId]);
+  // Save the models and compute node onto the session as soon as they are
+  // changed, not just when the next message happens to carry them: the job
+  // watcher continues a session on its own from the session's own record, so a
+  // change made and then left alone would be shown in the header and ignored
+  // by the thing that acts on it.
+  //
+  // Only ever send a CHANGE the researcher made. Opening a session renders
+  // before its state arrives, so an unconditional send pushed whatever was on
+  // screen — nothing on a fresh load, the previous session's node and model
+  // pool when switching sessions — onto the session that was just opened, and
+  // the server persisted that. It corrected itself a round-trip later, but
+  // anything reading the session meanwhile (the between-turns job watcher,
+  // a message sent straight after opening) saw the wrong node.
+  const serverCfg = useRef<{ model: string; pool: string[]; remoteId: string } | null>(null);
+  useEffect(() => {
+    if (!started || !workingDir) return;
+    const s = serverCfg.current;
+    if (!s) return;                       // the session's own values aren't in yet
+    // Send only what changed. Sending all three re-sent whatever this tab still
+    // showed for the others, so changing the model in one tab put back the node
+    // another tab had just changed.
+    const msg: any = { type: "science_settings", working_dir: workingDir };
+    if (orchModel && orchModel !== s.model) msg.model = orchModel;
+    if (!samePool(pool, s.pool)) msg.specialist_models = pool;
+    if (remoteId !== s.remoteId) msg.remote_id = remoteId || null;
+    serverCfg.current = { model: orchModel, pool, remoteId };
+    if (Object.keys(msg).length > 2) sock.send(msg);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [started, workingDir, orchModel, pool, remoteId]);
   useEffect(() => { runningRef.current = st.running; }, [st.running]);
   useEffect(() => { lsSet("sx.left", leftOpen ? "1" : "0"); }, [leftOpen]);
   useEffect(() => { lsSet("sx.right", rightOpen ? "1" : "0"); }, [rightOpen]);
@@ -141,8 +181,30 @@ export default function Science() {
         if (m.seq <= lastSeq.current) return;                      // already in the replayed log
         lastSeq.current = m.seq;
       }
+      if (m.type === "science_settings") {
+        // The session's settings changed — in another tab, or in this one. Show
+        // what the session now holds and record it as the session's, so the
+        // settings effect does not push this tab's older values back over it.
+        const cur = cfg.current;
+        const next = {
+          model: typeof m.model === "string" && m.model ? m.model : cur.orchModel,
+          pool: Array.isArray(m.specialist_models) ? m.specialist_models : cur.pool,
+          remoteId: "remote_id" in m ? (m.remote_id || "") : cur.remoteId,
+        };
+        serverCfg.current = next;
+        if (next.model !== cur.orchModel) setOrchModel(next.model);
+        if (!samePool(next.pool, cur.pool)) setPool(next.pool);
+        if (next.remoteId !== cur.remoteId) setRemoteId(next.remoteId);
+      }
       if (m.type === "science_done") refreshSessions();
       if (m.type === "science_done" || m.type === "science_artifact") setFileTick((t) => t + 1);
+      // An error while opening a session has to stop the wait, or the page sits
+      // on "Opening session…" for ever with the explanation hidden behind it —
+      // which is exactly what an unreadable state.json produced: a dead end.
+      if (m.type === "error") {
+        setLoading(false);
+        resuming.current = false;
+      }
       dispatch({ type: "event", ev: m });
     });
     sock.connect();
@@ -153,6 +215,7 @@ export default function Science() {
 
   function onState(m: any) {
     setLoading(false);
+    if (m.exists) setGone("");
     if (!m.exists) {
       sid.current = m.sid || "";
       lastSeq.current = 0;
@@ -160,10 +223,21 @@ export default function Science() {
       if (pendingFirst.current) {
         const first = pendingFirst.current;
         pendingFirst.current = "";
+        // A session started right here: its first message carries the models
+        // and node on screen, so those ARE the session's from now on. Left
+        // unset, nothing changed in the settings afterwards was saved until a
+        // reload — while the job watcher kept acting on the old values.
+        serverCfg.current = { model: cfg.current.orchModel, pool: cfg.current.pool,
+                              remoteId: cfg.current.remoteId };
         send(first, null);
       } else if (resuming.current) {
-        setStarted(false);          // the remembered session is gone
+        // The remembered session isn't there. Say so: landing back on the start
+        // screen with no explanation reads as the app losing the work, and the
+        // usual cause (a moved folder, an unmounted or not-yet-synced drive) is
+        // something only the researcher can put right.
+        setStarted(false);
         lsSet("science.lastDir", null);
+        setGone(m.working_dir || m.sid || "");
       }
       resuming.current = false;
       return;
@@ -183,6 +257,12 @@ export default function Science() {
       if (Array.isArray(snap.specialist_models)) { setPool(snap.specialist_models); cfg.current.pool = snap.specialist_models; }
       setRemoteId(snap.remote_id || ""); cfg.current.remoteId = snap.remote_id || "";
     }
+    // What the SESSION holds, so the settings effect above can tell a change the
+    // researcher made from the screen simply catching up with the session. For a
+    // session being started now, the researcher's choices are authoritative and
+    // the first message carries them.
+    serverCfg.current = { model: cfg.current.orchModel, pool: cfg.current.pool,
+                          remoteId: cfg.current.remoteId };
     dispatch({ type: "hydrate", snapshot: snap, events: evs, running: !!m.running });
     const arts: string[] = (snap.artifacts || []).map((a: any) => a.id);
     if (!reopened) setDoc(arts.length ? { type: "art", id: arts[arts.length - 1] } : null);
@@ -208,6 +288,8 @@ export default function Science() {
     dispatch({ type: "reset" });
     sid.current = "";
     lastSeq.current = 0;
+    // Whatever is on screen belongs to the session being left, not this one.
+    serverCfg.current = null;
     setWorkingDir(dir);
     cfg.current = { ...cfg.current, workingDir: dir };
     setStarted(true);
@@ -252,13 +334,15 @@ export default function Science() {
       ? { type: "science_comment", artifact_id: refineCtx.id, text: t, ...base }
       : { type: "science_message", message: t, ...base });
     setRefine(null);
+    setSentTick((n) => n + 1);
   }
 
   function answer(text: string) {
     const t = text.trim();
     if (!t || !st.ask) return;
-    sock.send({ type: "user_response", answer: t });
+    sock.send({ type: "user_response", answer: t, id: st.ask.id || "" });
     dispatch({ type: "answered", text: t });
+    setSentTick((n) => n + 1);
   }
 
   function stop() {
@@ -363,23 +447,36 @@ export default function Science() {
         {started && (
           <div className="sx-top-session" title={workingDir}>
             <span className="sx-top-task">{task || shortDir(workingDir)}</span>
-            <span className={"sx-state " + (st.running ? "run" : "idle")}>
-              {st.running ? <><span className="sx-pulse sm" />{working ? `${working} specialist${working > 1 ? "s" : ""} working` : "working"}</> : "idle"}
-            </span>
+            {st.running && st.net ? (
+              st.net.state === "limited" ? (
+                <span className="sx-state wait" title={`The model server (${st.net.host}) is refusing new requests from this key for now (its limit on requests at once is used up). The work carries on by itself once it accepts them again; Stop ends it.`}>
+                  <span className="sx-pulse sm" />waiting for a free model slot…
+                </span>
+              ) : (
+                <span className="sx-state wait" title={`The model server (${st.net.host}) cannot be reached — the network is down or the computer just woke up. The work carries on by itself once it is back; Stop ends it.`}>
+                  <span className="sx-pulse sm" />waiting for the network…
+                </span>
+              )
+            ) : (
+              <span className={"sx-state " + (st.running ? "run" : "idle")}>
+                {st.running ? <><span className="sx-pulse sm" />{working ? `${working} specialist${working > 1 ? "s" : ""} working` : "working"}</> : "idle"}
+              </span>
+            )}
           </div>
         )}
         <span className="sx-spacer" />
         {started && (
           <div className="sx-settings-wrap">
             <button className={"sx-chip model" + (showSettings ? " on" : "")} onClick={() => setShowSettings((v) => !v)}
+              aria-expanded={showSettings} aria-haspopup="dialog"
               title="Models & compute for this session">
               {orchModel || "model"}{pool.length ? ` +${pool.length}` : ""}{nodeName ? ` · ${nodeName}` : ""}
             </button>
             {showSettings && (
               <>
                 <div className="sx-scrim" onClick={() => setShowSettings(false)} />
-                <div className="sx-pop">
-                  <div className="sx-pop-h">Session settings <span className="sx-muted">— apply from the next message</span></div>
+                <div className="sx-pop" role="dialog" aria-label="Session settings">
+                  <div className="sx-pop-h">Session settings <span className="sx-muted">— saved to this session</span></div>
                   <ModelPicker models={models} orchLabel="Orchestrator model" orchModel={orchModel}
                     setOrchModel={setOrchModel} pool={pool} setPool={setPool} />
                   {remotes.length > 0 && (
@@ -422,7 +519,8 @@ export default function Science() {
           <Start connected={connected} workingDir={workingDir} setWorkingDir={setWorkingDir}
             models={models} orchModel={orchModel} setOrchModel={setOrchModel} pool={pool} setPool={setPool}
             remotes={remotes} remoteId={remoteId} setRemoteId={setRemoteId} sessions={sessions}
-            onStart={(goal) => openSession(workingDir, goal)} onOpen={(d) => openSession(d)} />
+            onStart={(goal) => openSession(workingDir, goal)} onOpen={(d) => openSession(d)}
+            gone={gone} dismissGone={() => setGone("")} />
         ) : (
           <>
             <main className="sx-center">
@@ -431,7 +529,7 @@ export default function Science() {
                 <div className="sx-feed"><div className="sx-loading big">Opening session…</div></div>
               ) : (
                 <Feed st={st} onOpenArt={openArt} onRefine={startRefine} onHide={hideArt} focusSpec={focusSpec}
-                  onRefinePlan={refinePlan}
+                  onRefinePlan={refinePlan} workingDir={workingDir} sentTick={sentTick}
                   onExample={(t) => { setInput(t); inputRef.current?.focus(); }} />
               )}
               <Composer st={st} value={input} setValue={setInput} inputRef={inputRef}
@@ -458,6 +556,9 @@ export default function Science() {
 
       <footer className="sx-status">
         <span className={"sx-conn " + (connected ? "on" : "off")}>{connected ? "● connected" : "● reconnecting…"}</span>
+        {connected && st.net && (st.net.state === "limited"
+          ? <span className="sx-conn off" title="The model server refuses this key's requests for now (rate limit). The run waits and continues by itself.">● {st.net.host || "the model server"} is refusing new requests (rate limit) — waiting</span>
+          : <span className="sx-conn off" title="The run is waiting for the model server and continues by itself when it is reachable again.">● no connection to {st.net.host || "the model server"} — waiting</span>)}
         {started && <span className="sx-status-path" title={workingDir}>{workingDir} 📁</span>}
         {started && <span>{nodeName ? `🖥 ${nodeName}` : "💻 local compute"}</span>}
         <span className="sx-spacer" />

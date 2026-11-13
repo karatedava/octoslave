@@ -35,9 +35,13 @@ export function Sidebar({ sessions, current, onOpen, onNew, onForget, workingDir
           <div className="sx-sessions">
             {sessions.length === 0 && <div className="sx-side-empty">No sessions yet.</div>}
             {sessions.map((s) => (
-              <div key={s.working_dir}
+              <div key={s.working_dir} role="button" tabIndex={0}
+                aria-current={s.working_dir === current ? "true" : undefined}
                 className={"sx-session" + (s.working_dir === current ? " on" : "")}
-                onClick={() => onOpen(s.working_dir)} title={s.working_dir}>
+                onClick={() => onOpen(s.working_dir)} title={s.working_dir}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpen(s.working_dir); }
+                }}>
                 <span className={"sx-sdot" + (s.running ? " run" : "")} />
                 <div className="sx-session-main">
                   <div className="sx-session-title">{s.title || shortDir(s.working_dir)}</div>
@@ -108,8 +112,16 @@ function Dir({ workingDir, rel, depth, refreshKey, onOpenFile, activeFile }: {
       {entries.map((e) => (
         <div key={e.rel}>
           <div className={"sx-node" + (e.dir ? " dir" : "") + (activeFile === e.path ? " on" : "")}
+            role="button" tabIndex={0}
+            aria-expanded={e.dir ? !!open[e.rel] : undefined}
             style={{ paddingLeft: 10 + depth * 12 }}
             onClick={() => (e.dir ? setOpen((o) => ({ ...o, [e.rel]: !o[e.rel] })) : onOpenFile(e.path, e.rel))}
+            onKeyDown={(ev) => {
+              if (ev.key !== "Enter" && ev.key !== " ") return;
+              ev.preventDefault();
+              if (e.dir) setOpen((o) => ({ ...o, [e.rel]: !o[e.rel] }));
+              else onOpenFile(e.path, e.rel);
+            }}
             title={e.dir ? e.rel : `${e.rel} · ${fmtSize(e.size)}`}>
             <span className="sx-node-ic">{e.dir ? <Chev open={!!open[e.rel]} /> : fileIcon(e.name)}</span>
             <span className="sx-node-name">{e.name}</span>

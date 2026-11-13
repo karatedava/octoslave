@@ -39,16 +39,23 @@ export type Artifact = {
   at: number;
 };
 
+// A file a specialist offered to show the researcher. The orchestrator decides
+// which are actually presented; the rest would otherwise leave no trace.
+export type Proposal = {
+  rel: string; caption: string; path?: string; interim?: boolean;
+};
+
 export type SpecRun = {
   steps: Step[];
   live: string;          // text being streamed right now
   said: string[];        // finished messages of this run
-  status: "working" | "done" | "failed";
+  status: "working" | "done" | "incomplete" | "failed";
   summary?: string;
   started: number;
   ended?: number;
   resumed?: boolean;
   thinking: number;
+  proposed?: Proposal[];
 };
 
 export type Specialist = {
@@ -63,6 +70,11 @@ export type Job = {
   // When the node was last asked about this job. Without it a "running" badge
   // cannot be told apart from one set at submit time and never re-checked.
   last_checked?: string;
+  // What was actually submitted, and when. For a run measured in hours these
+  // are what make a status readable: elapsed time, and the command to judge.
+  submitted_at?: string;
+  command?: string;
+  cwd?: string;
 };
 
 // What the earlier, compacted part of a long session amounted to (the server
@@ -104,6 +116,12 @@ export type SciState = {
   lastArt: { id: string; isNew: boolean; n: number } | null;  // for auto-follow in the workspace
   turnStarted: number;
   autoContinue: boolean;       // the orchestrator may pick up jobs ending between turns
+  autoWakes: number;           // automatic continuations spent so far
+  maxWakes: number;            // ceiling on them before it waits for the user
+  // A run is waiting on the model server: it cannot be reached ("offline":
+  // network down, laptop just woke) or it refuses the key's requests for now
+  // ("limited": a rate limit). Live only: never restored from the timeline.
+  net: { host: string; since: number; state: "offline" | "limited" } | null;
 };
 
 export const initialState: SciState = {
@@ -111,6 +129,9 @@ export const initialState: SciState = {
   jobs: {}, jobOrder: [], prov: [], todos: [], running: false, live: null, thinking: 0,
   activity: null, ask: null, lastAssistant: "", lastArt: null, turnStarted: 0,
   autoContinue: true,
+  autoWakes: 0,
+  maxWakes: 8,
+  net: null,
 };
 
 export type Action =
@@ -122,6 +143,36 @@ export type Action =
   | { type: "answered"; text: string };
 
 const CARDED_TOOLS = new Set(["spawn_specialist", "continue_specialist", "present_output"]);
+
+// What a carded tool's FAILURE is called in the feed. Its success is shown by
+// the card it creates, so only the failure needs wording of its own.
+const FAILED_CARDED: Record<string, string> = {
+  spawn_specialist: "could not dispatch a specialist",
+  continue_specialist: "could not resume a specialist",
+  present_output: "could not present an output",
+};
+
+// A specialist that was stopped, cut off by the end of a turn, or left behind by
+// a restart reports back like any other — the backend marks it done so it can be
+// resumed. Reading that as "finished" is how an unfinished piece of work gets
+// built on, so the wording it reports with is what decides the badge.
+// Matched against the SENTINEL the backend writes ("⚠ INCOMPLETE — …", or a
+// stop event's own summary), not against ordinary words. Free-floating
+// "interrupted" / "incomplete" / "resumable" are normal research vocabulary —
+// "PDB entry 4XYZ is incomplete (missing loop 120-128)" or "the helix is
+// interrupted by a proline" badged finished work as unfinished, which invites
+// the researcher to re-dispatch work that was already done.
+// The live "done" events for a cut-off run all end in "(resumable)" — "stopped
+// by the user (resumable)", "did not finish (resumable)" (the turn ended while
+// it ran), "interrupted (resumable)" (settled after a restart) — while the
+// saved record says "⚠ INCOMPLETE — …"; matching only the latter showed such a
+// run as done live and incomplete after a reload. The parenthesised form never
+// occurs in prose, unlike the bare word ("results are resumable from cache").
+const INCOMPLETE = /⚠\s*INCOMPLETE\b|^\s*INCOMPLETE\b|\(resumable\)\s*$/;
+
+function incomplete(summary: any): boolean {
+  return INCOMPLETE.test(String(summary || ""));
+}
 
 function speakerOf(ev: any): Speaker {
   return ev && ev.agent_name
@@ -153,10 +204,22 @@ export function reducer(s: SciState, a: Action): SciState {
       st.prov = snap.provenance || [];
       for (const ev of a.events) st = onEvent(st, ev, true);
       st = { ...st, specialists: { ...st.specialists }, artifacts: { ...st.artifacts } };
-      // Snapshot status wins over whatever the replay reconstructed.
+      // Snapshot status wins over whatever the replay reconstructed. The
+      // snapshot only ever says working/done/failed, so re-derive "incomplete"
+      // from the summary it carries and apply it to the run too — otherwise a
+      // reload showed the Team panel saying "done" and that same specialist's
+      // feed card saying "incomplete", over a summary reading "⚠ INCOMPLETE".
       for (const sp of snap.specialists || []) {
         const cur = st.specialists[sp.id];
-        if (cur) st.specialists[sp.id] = { ...cur, status: sp.status, summary: sp.summary || cur.summary };
+        if (!cur) continue;
+        const summary = sp.summary || cur.summary;
+        const status = (sp.status === "done" && incomplete(summary))
+          ? "incomplete" : sp.status;
+        const runs = cur.runs.length && status === "incomplete"
+          ? cur.runs.map((r, i) =>
+              i === cur.runs.length - 1 ? { ...r, status: "incomplete" as const } : r)
+          : cur.runs;
+        st.specialists[sp.id] = { ...cur, status, summary, runs };
       }
       for (const art of snap.artifacts || []) {
         const cur = st.artifacts[art.id];
@@ -173,6 +236,7 @@ export function reducer(s: SciState, a: Action): SciState {
           last_checked: j.last_checked || cur.last_checked, output: j.output ?? cur.output } };
       }
       if (typeof snap.auto_continue === "boolean") st.autoContinue = snap.auto_continue;
+      if (typeof snap.auto_wakes === "number") st.autoWakes = snap.auto_wakes;
       st.prov = snap.provenance || st.prov;
       st.running = a.running;
       if (!a.running) {
@@ -293,7 +357,10 @@ function onEvent(s: SciState, ev: any, replay: boolean): SciState {
       return replay ? st : note(st, `Removed “${ev.rel}” from the outputs — the file itself is kept.`, "info");
     }
     case "science_settings":
-      return typeof ev.auto_continue === "boolean" ? { ...s, autoContinue: ev.auto_continue } : s;
+      return { ...s,
+        autoContinue: typeof ev.auto_continue === "boolean" ? ev.auto_continue : s.autoContinue,
+        autoWakes: typeof ev.auto_wakes === "number" ? ev.auto_wakes : s.autoWakes,
+        maxWakes: typeof ev.max_wakes === "number" ? ev.max_wakes : s.maxWakes };
     case "science_user": {
       // Our own optimistic message coming back: attach the server's ids.
       if (ev.cid) {
@@ -366,8 +433,14 @@ function onEvent(s: SciState, ev: any, replay: boolean): SciState {
     case "science_done": {
       let st = s.live ? commitLive(s) : s;
       st = settleAll(st);
-      return { ...st, running: false, ask: null, live: null };
+      return { ...st, running: false, ask: null, live: null, net: null };
     }
+    case "net":
+      if (replay) return s;
+      return ev.state === "offline" || ev.state === "limited"
+        ? { ...s, net: { host: ev.host || "", state: ev.state,
+                         since: s.net && s.net.state === ev.state ? s.net.since : now } }
+        : (s.net ? { ...s, net: null } : s);
     case "tool_call": {
       const step: Step = { name: ev.name, summary: ev.summary || ev.name, args: ev.args_preview, at: now };
       // ``activity`` is the ORCHESTRATOR's current step. Specialists run in
@@ -401,6 +474,26 @@ function onEvent(s: SciState, ev: any, replay: boolean): SciState {
       };
       if (sp.agentId) return updateRun(s, sp.agentId, (r) => ({ ...r, steps: close(r.steps) }));
       const st = { ...s, activity: replay ? s.activity : null };
+      // A carded tool got no step row, because its card (the specialist, the
+      // output) is the record of it. When the call FAILS there is no card — a
+      // refused spawn would otherwise vanish completely, and the researcher
+      // would see the orchestrator quietly doing the work itself instead of
+      // delegating, with nothing anywhere saying why. Give the failure a row.
+      if (ev.ok === false && CARDED_TOOLS.has(ev.name)) {
+        const row = { name: ev.name, summary: FAILED_CARDED[ev.name] || ev.name,
+                      ok: false, preview: ev.preview, at: now, end: now };
+        // Append to the step group already open, rather than starting a second
+        // one: a later tool_result only scans the LAST group, so anything still
+        // open in an earlier one could never be closed, and the researcher saw
+        // one run's steps split across two blocks.
+        const tail = st.items[st.items.length - 1];
+        if (tail && tail.k === "steps") {
+          const items = st.items.slice();
+          items[items.length - 1] = { ...tail, steps: [...tail.steps, row] };
+          return { ...st, items };
+        }
+        return push(st, { k: "steps", steps: [row] });
+      }
       for (let i = st.items.length - 1; i >= 0; i--) {
         const it = st.items[i];
         if (it.k === "steps") {
@@ -443,9 +536,14 @@ function onEvent(s: SciState, ev: any, replay: boolean): SciState {
         return push(st, { k: "spec", specId: ev.id, run: spc.runs.length - 1 });
       }
       if (ev.event === "done") {
-        const status = ev.status === "failed" ? "failed" : "done";
+        const status = ev.status === "failed" ? "failed"
+          : incomplete(ev.summary) ? "incomplete" : "done";
+        const proposed: Proposal[] = (ev.proposed || []).map((p: any) =>
+          ({ rel: p.rel || p.path || "", caption: p.caption || "", path: p.path,
+             interim: !!p.interim }));
         let st = updateRun(s, ev.id, (r) => ({ ...r, status, summary: ev.summary || "", ended: now,
-                                               live: "", steps: settleSteps(r.steps) }));
+                                               live: "", steps: settleSteps(r.steps),
+                                               proposed }));
         return updateSpec(st, ev.id, (x) => ({ ...x, status, summary: ev.summary || x.summary }));
       }
       return s;
@@ -454,7 +552,9 @@ function onEvent(s: SciState, ev: any, replay: boolean): SciState {
       const prev = s.jobs[ev.id];
       const job: Job = { id: ev.id, name: ev.name, status: ev.status, remote_label: ev.remote,
         scheduler: ev.scheduler, handle: ev.handle, output: ev.output, at: prev?.at || now,
-        last_checked: ev.last_checked || prev?.last_checked };
+        last_checked: ev.last_checked || prev?.last_checked,
+        submitted_at: ev.submitted_at || prev?.submitted_at,
+        command: ev.command || prev?.command, cwd: ev.cwd || prev?.cwd };
       let st: SciState = { ...s, jobs: { ...s.jobs, [ev.id]: job },
         jobOrder: prev ? s.jobOrder : [...s.jobOrder, ev.id] };
       if (!prev || prev.status !== ev.status) {

@@ -830,11 +830,13 @@ def _council_loop(
             display.print_interrupted(iteration)
             logger.log_session_end(iteration, reason="interrupted")
             return note_stopped(messages)
-        if signal in ("fatal", "fatal_conn"):
-            # fatal_conn = retries exhausted / endpoint rejecting this model.
+        if signal in ("fatal", "fatal_conn", "fatal_rate"):
+            # fatal_conn = retries exhausted / endpoint rejecting this model;
+            # fatal_rate = the server refused this key's requests for hours.
             # Either way `response` is None, so stop cleanly instead of
             # dereferencing it below.
-            end_reason = "connection_lost" if signal == "fatal_conn" else "error"
+            end_reason = {"fatal_conn": "connection_lost",
+                          "fatal_rate": "rate_limited"}.get(signal, "error")
             break
 
         content = response["content"]

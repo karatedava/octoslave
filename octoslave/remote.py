@@ -21,6 +21,8 @@ import subprocess
 import tempfile
 import threading
 
+from . import netwatch
+
 
 class RemoteError(RuntimeError):
     """A remote ssh/scp operation failed."""
@@ -92,6 +94,10 @@ class RemoteSession:
         self._control_dir = tempfile.mkdtemp(prefix="ots_ssh_", dir=base)
         # %C hashes host/port/user → one socket per distinct connection.
         self._control_path = os.path.join(self._control_dir, "cm-%C")
+        # Sleep clock at the last time the master was known fresh (see
+        # _fresh_after_sleep), and a lock so concurrent callers retire it once.
+        self._mark = netwatch.slept_seconds()
+        self._lock = threading.Lock()
 
     # -- construction / caching -------------------------------------------
 
@@ -120,6 +126,13 @@ class RemoteSession:
             "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ConnectTimeout=15",
+            # Without these, a master whose network died (the Wi-Fi dropped,
+            # the laptop slept) looks alive for many minutes: every command
+            # multiplexed onto it hangs until its own timeout, and the next one
+            # hangs again. With them the master notices in ~45 s and exits, so
+            # the next command simply reconnects.
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=3",
         ]
 
     def _ssh_opts(self) -> list[str]:
@@ -143,13 +156,52 @@ class RemoteSession:
 
     def _ssh(self, remote_cmd: str, timeout: int | None = 60,
              capture_bytes: bool = False) -> subprocess.CompletedProcess:
+        self._fresh_after_sleep()
         cmd = ["ssh", *self._ssh_opts(), self.cfg.target, remote_cmd]
-        return subprocess.run(
-            cmd,
-            capture_output=True,
-            text=not capture_bytes,
-            timeout=timeout,
-        )
+        try:
+            return subprocess.run(
+                cmd,
+                capture_output=True,
+                text=not capture_bytes,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            # It may have hung on a dead master; the next command must not.
+            self.retire_master()
+            raise
+
+    # -- the shared master connection --------------------------------------
+
+    def _fresh_after_sleep(self) -> None:
+        """Before every ssh/scp: if the machine slept since the master was last
+        known fresh, retire it. Its TCP connection almost certainly died during
+        the sleep, yet it keeps accepting commands — which then hang until their
+        timeouts, one after another, until the master finally notices."""
+        if not netwatch.slept_since(self._mark):
+            return
+        with self._lock:
+            if not netwatch.slept_since(self._mark):
+                return              # another thread just did it
+            self._mark = netwatch.slept_seconds()
+            self.retire_master()
+
+    def retire_master(self) -> None:
+        """Make the next command open a new master connection.
+
+        ``-O stop`` tells the master to accept no more commands (it removes its
+        socket) while the ones already running on it finish. If it does not
+        answer, its socket is removed here so nothing new joins it."""
+        try:
+            subprocess.run(["ssh", *self._ssh_opts(), "-O", "stop", self.cfg.target],
+                           capture_output=True, timeout=8)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            for name in os.listdir(self._control_dir):
+                if name.startswith("cm-"):
+                    _silent_unlink(os.path.join(self._control_dir, name))
+        except OSError:
+            pass
 
     # -- connectivity ------------------------------------------------------
 
@@ -264,11 +316,13 @@ class RemoteSession:
         else:
             fd, local = tempfile.mkstemp(prefix="ots_pull_", suffix=suffix)
             os.close(fd)
+        self._fresh_after_sleep()
         cmd = ["scp", *self._scp_opts(), f"{self.cfg.target}:{remote_path}", local]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         except subprocess.TimeoutExpired:
             _silent_unlink(local)
+            self.retire_master()
             raise RemoteError(f"scp of {remote_path} timed out")
         if r.returncode != 0:
             _silent_unlink(local)
@@ -278,10 +332,12 @@ class RemoteSession:
     def push(self, local_path: str, remote_path: str) -> None:
         """Copy a local file to the remote host (creating parent dirs)."""
         self.mkdirs(posixpath.dirname(remote_path) or ".")
+        self._fresh_after_sleep()
         cmd = ["scp", *self._scp_opts(), local_path, f"{self.cfg.target}:{remote_path}"]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         except subprocess.TimeoutExpired:
+            self.retire_master()
             raise RemoteError(f"scp to {remote_path} timed out")
         if r.returncode != 0:
             raise RemoteError((r.stderr or "scp failed").strip())

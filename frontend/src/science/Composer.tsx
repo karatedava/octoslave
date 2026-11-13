@@ -23,12 +23,18 @@ export function Composer(p: Props) {
   const { st, value, setValue, inputRef } = p;
   const ask = st.ask;
 
-  // Grow with the text, up to a cap.
+  // Grow with the text, up to a cap. Measuring needs the box collapsed for a
+  // moment; hold the space around it meanwhile, so the conversation above never
+  // sees the page change size on a keystroke — not even for that moment (while
+  // it is taller, its scroll position reads as pulled up to fit).
   useLayoutEffect(() => {
     const el = inputRef.current;
     if (!el) return;
+    const box = el.parentElement;
+    if (box) box.style.minHeight = box.offsetHeight + "px";
     el.style.height = "0px";
     el.style.height = Math.min(el.scrollHeight, 220) + "px";
+    if (box) box.style.minHeight = "";
   }, [value, inputRef]);
 
   const submit = () => {

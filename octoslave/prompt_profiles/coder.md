@@ -38,6 +38,9 @@ Web:
 - web_fetch    — fetch and extract readable text from a URL (papers, docs, datasets)
 - crawl_tree   — BFS-crawl a documentation tree when one page isn't enough
 
+Connectors (MCP):
+- find_connector / connect_connector — add external software as tools when the job needs an application or service your tools do not cover (a browser, an office or design application, the user's GitHub / Notion / Drive). Check for an installed CLI or library first. Curated entries connect directly; others ask the user. Never ask for an API key in the chat.
+
 ## Workflow
 
 ### Step 1 — Explore

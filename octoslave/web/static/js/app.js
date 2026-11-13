@@ -91,6 +91,7 @@ function handleServerMessage(msg) {
     case 'chat_loaded': onChatLoaded(msg); break;
     case 'permission_request':  onPermissionRequest(msg); break;
     case 'user_question':       onUserQuestion(msg); break;
+    case 'user_question_closed': onUserQuestionClosed(msg); break;
     case 'todos':               onTodos(msg); break;
     case 'parallel_result':     onParallelResult(msg); break;
     case 'ok':
@@ -987,10 +988,14 @@ function onChatLoaded(msg) {
 // Permission request UI
 // ──────────────────────────────────────────────────────────────
 
+// Each permission card carries the id of the request it shows, and its buttons
+// answer THAT request. A single "current id" made an old card — one whose
+// request had already timed out — answer the newest request instead.
 function onPermissionRequest(msg) {
   const container = document.getElementById('chat-messages');
   const wrap = document.createElement('div');
   wrap.className = 'msg msg-permission';
+  wrap.dataset.rid = msg.id || '';
 
   const modeLabel = msg.mode === 'supervised' ? 'Supervised' : 'Controlled';
   wrap.innerHTML = `
@@ -1016,7 +1021,8 @@ function onPermissionRequest(msg) {
 }
 
 window.resolvePermission = function(btn, allow) {
-  sendMsg({ type: 'permission_response', allow });
+  const card = btn.closest('.msg-permission');
+  sendMsg({ type: 'permission_response', allow, id: (card && card.dataset.rid) || '' });
   const actions = btn.closest('.perm-actions');
   if (actions) {
     actions.innerHTML = allow
@@ -1068,6 +1074,9 @@ function onUserQuestion(msg) {
   if (!container) return;
   const wrap = document.createElement('div');
   wrap.className = 'msg msg-question';
+  // The answer names THIS card's question, so a reply typed into an older card
+  // can never resolve a newer question (or one asked by a Science session).
+  wrap.dataset.qid = msg.id || '';
   const opts = (msg.options || []).map(o =>
     `<button class="uq-opt" onclick="window.resolveUserQuestion(this, ${JSON.stringify(esc(o)).replace(/"/g, '&quot;')})">${esc(o)}</button>`
   ).join('');
@@ -1095,16 +1104,32 @@ function _finishQuestion(node, answer) {
       <div class="uq-answered">${esc(answer)}</div>`;
   }
 }
+function _questionId(node) {
+  const card = node.closest('.msg-question');
+  return (card && card.dataset.qid) || '';
+}
 window.resolveUserQuestion = function(btn, answer) {
-  sendMsg({ type: 'user_response', answer });
+  sendMsg({ type: 'user_response', answer, id: _questionId(btn) });
   _finishQuestion(btn, answer);
 };
 window.resolveUserQuestionInput = function(input) {
   const answer = (input.value || '').trim();
   if (!answer) return;
-  sendMsg({ type: 'user_response', answer });
+  sendMsg({ type: 'user_response', answer, id: _questionId(input) });
   _finishQuestion(input, answer);
 };
+// The server says a question is over (answered, or it stopped waiting). Close
+// its card, or it sits there accepting an answer nothing will ever read.
+function onUserQuestionClosed(msg) {
+  if (!msg.id) return;
+  document.querySelectorAll('.msg-question').forEach((wrap) => {
+    if (wrap.dataset.qid !== msg.id) return;
+    const card = wrap.querySelector('.uq-card');
+    if (!card || !card.querySelector('.uq-input-row')) return;   // already answered here
+    card.innerHTML = `<div class="uq-header"><span class="uq-icon">·</span><span>${
+      msg.answered ? 'Answered' : 'No longer waiting for an answer'}</span></div>`;
+  });
+}
 
 // ──────────────────────────────────────────────────────────────
 // Initialization

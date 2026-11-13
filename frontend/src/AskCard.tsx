@@ -12,10 +12,14 @@ import { useEffect, useRef, useState } from "react";
 // the countdown reflects when the agent will actually give up rather than a
 // number the UI invented.
 // ``who`` names the agent asking when it is not the orchestrator itself.
-export type Ask = { question: string; options: string[]; expires: number; who?: string };
+// ``id`` identifies this exact question. The pending question is one slot
+// shared by every feature, so the answer must say which question it answers or
+// a reply from another tab could resolve someone else's.
+export type Ask = { id?: string; question: string; options: string[]; expires: number; who?: string };
 
 export function askFromEvent(m: any): Ask {
   return {
+    id: m.id || "",
     question: m.question || "",
     options: Array.isArray(m.options) ? m.options : [],
     expires: Date.now() + (Number(m.timeout) || 600) * 1000,

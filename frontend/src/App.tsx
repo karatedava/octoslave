@@ -371,7 +371,9 @@ export default function App() {
   function answerQuestion(text: string) {
     const t = text.trim();
     if (!t || !ask) return;
-    sock.send({ type: "user_response", answer: t });
+    // Echo the question's id, so this answer resolves THIS question and cannot
+    // land on another agent's pending one (a Science specialist's, say).
+    sock.send({ type: "user_response", answer: t, id: ask.id || "" });
     setAsk(null);
     // Filed under "injection" — it is user input into a live run, and that is the
     // filter people look under for it. ("user" is not one of the filter kinds.)

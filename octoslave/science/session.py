@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -184,17 +185,32 @@ class ScienceSession:
     def transcripts_dir(self) -> Path:
         return self.science_dir / "specialists"
 
+    def _transcript_path(self, sid: str) -> Optional[Path]:
+        """``specialists/<sid>.json``, or None if ``sid`` is not a plain id.
+
+        A specialist id is a bare token. Anything else — a path separator, a
+        ``..``, an absolute path — is refused rather than joined, so an id that
+        reached this from an HTTP query cannot name a file outside the session.
+        """
+        sid = (sid or "").strip()
+        if not sid or len(sid) > 64 or not re.fullmatch(r"[A-Za-z0-9_-]+", sid):
+            return None
+        return self.transcripts_dir / f"{sid}.json"
+
     def save_transcript(self, sid: str, messages: list[dict]) -> None:
         try:
+            p = self._transcript_path(sid)
+            if p is None:
+                return
             self.transcripts_dir.mkdir(parents=True, exist_ok=True)
-            (self.transcripts_dir / f"{sid}.json").write_text(json.dumps(messages))
+            p.write_text(json.dumps(messages))
         except Exception:
             pass
 
     def load_transcript(self, sid: str) -> list[dict]:
         try:
-            p = self.transcripts_dir / f"{sid}.json"
-            return json.loads(p.read_text()) if p.exists() else []
+            p = self._transcript_path(sid)
+            return json.loads(p.read_text()) if (p is not None and p.exists()) else []
         except Exception:
             return []
 
@@ -492,6 +508,10 @@ class ScienceSession:
             "provenance": self.provenance,
             "remote_id": self.remote_id,
             "auto_continue": self.auto_continue,
+            # How much of the automatic-continuation budget this session has
+            # spent. Without it the page can only say "it has stopped doing
+            # that" after the fact, never how close it is to the limit.
+            "auto_wakes": int(getattr(self, "auto_wakes", 0) or 0),
         }
 
 

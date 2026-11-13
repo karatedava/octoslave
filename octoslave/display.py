@@ -2,6 +2,7 @@
 
 import json
 import sys
+import uuid as _uuid
 import time as _time
 from rich.console import Console
 from rich.markdown import Markdown
@@ -22,6 +23,12 @@ _tl = _threading.local()  # thread-local storage for per-session callbacks
 _perm_lock = _threading.Lock()
 _perm_event: "_threading.Event | None" = None
 _perm_result: bool = False
+# The pending permission request is a single slot, like the pending question.
+# A second asker used to overwrite it, leaving the first waiting on an Event
+# nobody would ever set — a silent five-minute stall ending in a denial. So an
+# asker holds a floor, and the answer names the request it is answering.
+_perm_floor = _threading.Lock()
+_perm_id: str = ""
 
 
 def set_event_callback(cb) -> None:
@@ -53,10 +60,18 @@ def _silent() -> bool:
     return bool(getattr(_tl, "silent_cli", False))
 
 
-def resolve_permission(allow: bool) -> None:
-    """Called from the web handler to unblock a pending permission request."""
+def resolve_permission(allow: bool, rid: str = "") -> None:
+    """Called from the web handler to unblock a pending permission request.
+
+    ``rid`` says WHICH request is being answered; a mismatched or stale one is
+    ignored, so an answer from one tab cannot approve another agent's pending
+    action. An empty id resolves the current request, for a client that does not
+    send one.
+    """
     global _perm_result, _perm_event
     with _perm_lock:
+        if rid and _perm_id and rid != _perm_id:
+            return
         _perm_result = allow
         if _perm_event is not None:
             _perm_event.set()
@@ -677,6 +692,15 @@ def print_info(msg: str):
     console.print(f"[info]{msg}[/info]")
 
 
+def net_status(state: str, host: str = "") -> None:
+    """Tell the web UI whether this run is waiting on the model server — it
+    cannot be reached ("offline"), or it refuses the key's requests for now
+    ("limited", a rate limit) — or no longer is ("ok"), so it can show that
+    instead of looking stuck. The explanation itself goes out through
+    print_info."""
+    _emit({"type": "net", "state": state, "host": host})
+
+
 def print_error(msg: str):
     _emit({"type": "error", "text": _plain(msg)})
     if _silent():
@@ -772,16 +796,32 @@ _ask_answer: str = ""
 # So an asker holds the floor until its question is answered or closed.
 _ask_floor = _threading.Lock()
 
+# Identifies the question currently occupying the slot, so an answer can be
+# matched to it instead of resolving whatever is waiting (see
+# resolve_user_response).
+_ask_id: str = ""
+
 # How long a web-mode question stays open before the agent gives up and proceeds
 # on its own judgement. Sent to the browser with the question so the UI can show
 # a truthful countdown instead of hard-coding its own number.
 ASK_TIMEOUT_SECS = 600
 
 
-def resolve_user_response(answer: str) -> None:
-    """Called from the web handler to unblock a pending ask_user request."""
+def resolve_user_response(answer: str, qid: str = "") -> None:
+    """Called from the web handler to unblock a pending ask_user request.
+
+    ``qid`` identifies WHICH question is being answered. The pending question is
+    a single process-wide slot shared by every feature, so without it an answer
+    sent from one tab resolved whatever question happened to be waiting — a reply
+    typed in the chat could answer a Science specialist's question, and vice
+    versa. A stale or mismatched id is ignored rather than answering the wrong
+    agent. An empty id still resolves the current question, so a client that does
+    not send one keeps working.
+    """
     global _ask_answer, _ask_event
     with _ask_lock:
+        if qid and _ask_id and qid != _ask_id:
+            return
         _ask_answer = answer or ""
         if _ask_event is not None:
             _ask_event.set()
@@ -808,11 +848,14 @@ def ask_user_question(question: str, options: list[str] | None = None) -> tuple[
                 return "", False
         try:
             ev = _threading.Event()
+            global _ask_id
+            qid = _uuid.uuid4().hex[:12]
             with _ask_lock:
                 _ask_event = ev
                 _ask_answer = ""
-            _emit({"type": "user_question", "question": question, "options": options,
-                   "timeout": ASK_TIMEOUT_SECS})
+                _ask_id = qid
+            _emit({"type": "user_question", "id": qid, "question": question,
+                   "options": options, "timeout": ASK_TIMEOUT_SECS})
             got = False
             deadline = _time.monotonic() + ASK_TIMEOUT_SECS
             while True:
@@ -827,9 +870,10 @@ def ask_user_question(question: str, options: list[str] | None = None) -> tuple[
             with _ask_lock:
                 answer = _ask_answer
                 _ask_event = None
+                _ask_id = ""
             # Always tell the UI the question is over, or it leaves a prompt on
             # screen that no longer has anything listening for its answer.
-            _emit({"type": "user_question_closed", "answered": bool(got)})
+            _emit({"type": "user_question_closed", "id": qid, "answered": bool(got)})
         finally:
             _ask_floor.release()
         if not got:
@@ -1107,22 +1151,51 @@ def request_permission(tool_name: str, args: dict, working_dir: str, permission_
 
     # Web mode: emit a permission_request event and wait for the browser response
     if getattr(_tl, "emit", None) is not None:
-        global _perm_event, _perm_result
-        with _perm_lock:
-            _perm_event = _threading.Event()
-            _perm_result = False
-        _emit({
-            "type": "permission_request",
-            "tool": tool_name,
-            "desc": desc,
-            "icon": icon,
-            "working_dir": working_dir,
-            "mode": permission_mode,
-        })
-        _perm_event.wait(timeout=300)   # 5-minute timeout → default deny
-        with _perm_lock:
-            result = _perm_result
-            _perm_event = None
+        global _perm_event, _perm_result, _perm_id
+        from . import interrupt as _interrupt
+        # Wait for the floor rather than overwriting another asker's request,
+        # but never past a Stop.
+        while not _perm_floor.acquire(timeout=1.0):
+            if _interrupt.should_stop():
+                return False
+        try:
+            rid = _uuid.uuid4().hex[:12]
+            with _perm_lock:
+                _perm_event = _threading.Event()
+                _perm_result = False
+                _perm_id = rid
+                mine = _perm_event
+            _emit({
+                "type": "permission_request",
+                "id": rid,
+                "tool": tool_name,
+                "desc": desc,
+                "icon": icon,
+                "working_dir": working_dir,
+                "mode": permission_mode,
+            })
+            # Wait in slices so a Stop ends this at once instead of holding the
+            # floor for the rest of the five minutes: the next turn's first gated
+            # tool would queue behind a thread that has already been stopped.
+            waited = 0.0
+            while waited < 300.0:            # 5-minute timeout → default deny
+                if mine.wait(timeout=1.0):
+                    break
+                if _interrupt.should_stop():
+                    break
+                waited += 1.0
+            # Read the answer BEFORE giving up the floor. Released first, the
+            # next asker — already queued inside acquire() — wakes and resets
+            # _perm_result to its own default, so this call returned ITS answer:
+            # a tool the researcher had approved came back "denied", and the new
+            # asker was left on an event this thread then set to None, waiting
+            # the full timeout for a reply that had already arrived.
+            with _perm_lock:
+                result = _perm_result if _perm_id == rid else False
+                _perm_id = ""
+                _perm_event = None
+        finally:
+            _perm_floor.release()
         return result
 
     # Console mode: block on user input

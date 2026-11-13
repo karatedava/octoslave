@@ -25,6 +25,8 @@ Tools are namespaced ``mcp__<server>__<tool>`` so they never collide with the
 built-in tool names and the routing layer can recover the originating server.
 """
 
+import collections
+import hashlib
 import json
 import os
 import queue
@@ -66,6 +68,23 @@ def _log(msg: str) -> None:
 
 def namespaced_name(server: str, tool: str) -> str:
     return f"{_PREFIX}{_SEP}{server}{_SEP}{tool}"
+
+
+# What OpenAI-compatible endpoints accept as a function name. A name outside it
+# fails the WHOLE request (every tool, every turn), not just that one tool.
+_WIRE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_WIRE_NAME_MAX = 64
+
+
+def wire_tool_name(server: str, tool: str) -> str:
+    """The namespaced name, made safe to send: characters outside
+    ``[A-Za-z0-9_-]`` become ``_`` and an over-long name is shortened with a
+    stable hash suffix, so it is unique and the same on every reconnect."""
+    full = namespaced_name(server, re.sub(r"[^A-Za-z0-9_-]", "_", tool or ""))
+    if len(full) <= _WIRE_NAME_MAX:
+        return full
+    digest = hashlib.sha1(full.encode("utf-8")).hexdigest()[:8]
+    return full[:_WIRE_NAME_MAX - 9] + "_" + digest
 
 
 def is_mcp_name(name: str) -> bool:
@@ -227,6 +246,11 @@ class MCPServer:
         # stdio state
         self._proc: subprocess.Popen | None = None
         self._reader: threading.Thread | None = None
+        # The last lines the server wrote to stderr. A server that fails to start
+        # almost always says why there ("command not found", a missing key, a
+        # Python traceback); without it the only error is a bare timeout.
+        self._stderr_tail: collections.deque = collections.deque(maxlen=25)
+        self._stderr_reader: threading.Thread | None = None
         self._pending: dict[int, queue.Queue] = {}
         self._lock = threading.Lock()
         self._io_lock = threading.Lock()  # serialize stdin writes across threads
@@ -262,9 +286,22 @@ class MCPServer:
             return True
         except Exception as e:  # noqa: BLE001 — isolate per-server failures
             self.error = str(e)
+            said = self.stderr_text()
+            if said:
+                self.error += f" — the server reported: {said}"
             self.connected = False
             self._cleanup_process()
             return False
+
+    def stderr_text(self, max_chars: int = 600) -> str:
+        """The tail of what the server wrote to stderr, on one line."""
+        proc, rdr = self._proc, self._stderr_reader
+        # A server that died has usually just written its reason; give the
+        # drain thread a moment to read it before we look.
+        if proc is not None and rdr is not None and proc.poll() is not None:
+            rdr.join(timeout=1.0)
+        text = " | ".join(ln for ln in list(self._stderr_tail) if ln)
+        return text[-max_chars:]
 
     def call_tool(self, original_tool: str, arguments: dict, timeout: float = 300.0) -> tuple[str, bool]:
         """Invoke a tool by its *original* (un-namespaced) name.
@@ -357,7 +394,9 @@ class MCPServer:
             if orig in dead:
                 self.pruned[orig] = dead[orig]
                 continue
-            ns = namespaced_name(self.name, orig)
+            ns = wire_tool_name(self.name, orig)
+            if ns in index or not _WIRE_NAME_RE.match(ns):
+                continue  # collides after sanitising — keep the first
             schema = t.get("inputSchema") or {"type": "object", "properties": {}}
             # Some servers omit `type`; the OpenAI tool schema requires an object.
             if not isinstance(schema, dict) or "type" not in schema:
@@ -418,9 +457,14 @@ class MCPServer:
                 argv,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 env=env,
                 text=True,
+                # MCP's stdio transport is UTF-8 by spec. Left to the locale, a
+                # GUI launch can decode as ASCII, and one undecodable byte would
+                # kill the reader thread — every later call then just times out.
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,  # line-buffered
                 cwd=self.config.get("cwd") or None,
             )
@@ -433,6 +477,22 @@ class MCPServer:
 
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
+        # Drain stderr continuously (a full pipe would block the server) and
+        # keep the tail for diagnostics.
+        self._stderr_reader = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_reader.start()
+
+    def _drain_stderr(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            for line in proc.stderr:
+                line = line.strip()
+                if line:
+                    self._stderr_tail.append(line[:300])
+        except Exception:
+            pass
 
     def _read_loop(self) -> None:
         proc = self._proc
@@ -715,6 +775,67 @@ class MCPManager:
                 else:
                     _log(f"MCP: failed to connect '{server.raw_name}': {server.error}")
 
+    def add_server(self, cfg: dict, timeout: float = 120.0) -> MCPServer:
+        """Connect ONE server without touching the others (an agent adding a
+        connector mid-run must not restart the servers other agents are calling).
+
+        Returns the server — check ``.connected`` / ``.error``. A live server of
+        the same name is kept and returned as is; a dead one is replaced.
+        The handshake runs outside the lock: a first ``npx``/``uvx`` run can spend
+        a minute downloading, and every other agent still needs the tool list.
+        """
+        server = MCPServer(cfg)
+        with self._lock:
+            old = self.servers.get(server.name)
+            if old is not None and old.connected:
+                return old
+            roots = list(self._roots)
+        server.seed_roots(roots)
+        server.start(timeout=timeout)
+        with self._lock:
+            old = self.servers.get(server.name)
+            if old is not None and old is not server and old.connected:
+                server.stop()  # someone else connected it meanwhile — keep theirs
+                return old
+            if old is not None and old is not server:
+                old.stop()
+            self.servers[server.name] = server
+        if server.connected:
+            _log(f"MCP: connected '{server.raw_name}' ({len(server.tools)} tool(s)).")
+        return server
+
+    def find_server(self, name: str) -> MCPServer | None:
+        """A server by its configured name or its tool-name form."""
+        if not name:
+            return None
+        servers = list(self.servers.values())
+        for server in servers:
+            if name in (server.raw_name, server.name):
+                return server
+        key = sanitize_server_name(name).lower()
+        for server in servers:
+            if server.name.lower() == key:
+                return server
+        return None
+
+    def expand_server_grants(self, names) -> list[str]:
+        """Expand whole-server grants to that server's tools.
+
+        ``mcp__<server>`` (or ``mcp__<server>__*``) stands for every tool of a
+        connected server, so whoever hands a connector to another agent need not
+        spell out each tool. Anything else passes through unchanged, in order.
+        """
+        out: list[str] = []
+        for n in names or []:
+            n = str(n).strip()
+            m = re.fullmatch(rf"{_PREFIX}{_SEP}([A-Za-z0-9_-]+?)(?:{_SEP}\*)?", n)
+            server = self.find_server(m.group(1)) if m else None
+            if server is not None and server.connected:
+                out.extend(t for t in server._tool_index if t not in out)
+            elif n not in out:
+                out.append(n)
+        return out
+
     def set_roots(self, paths) -> None:
         """Point every connected server at ``paths`` (octoslave's active
         working dir). Cheap + idempotent — a no-op when nothing changed."""
@@ -730,16 +851,20 @@ class MCPManager:
             except Exception:
                 pass
 
+    # Readers iterate over a snapshot: an agent can connect a server on one
+    # thread while another builds its tool list, and iterating the live dict
+    # then raises "dictionary changed size during iteration".
+
     def tool_definitions(self) -> list[dict]:
         defs: list[dict] = []
-        for server in self.servers.values():
+        for server in list(self.servers.values()):
             if server.connected:
                 defs.extend(server.tools)
         return defs
 
     def tool_names(self) -> set[str]:
         names: set[str] = set()
-        for server in self.servers.values():
+        for server in list(self.servers.values()):
             if server.connected:
                 names.update(server._tool_index.keys())
         return names
@@ -748,7 +873,7 @@ class MCPManager:
         return name in self.tool_names()
 
     def call(self, namespaced: str, args: dict, timeout: float = 300.0) -> tuple[str, bool]:
-        for server in self.servers.values():
+        for server in list(self.servers.values()):
             orig = server.original_tool_for(namespaced)
             if orig is not None:
                 return server.call_tool(orig, args, timeout=timeout)
@@ -757,7 +882,7 @@ class MCPManager:
     def status(self) -> list[dict]:
         """Snapshot for the /mcp command and web UI."""
         out = []
-        for server in self.servers.values():
+        for server in list(self.servers.values()):
             out.append({
                 "name": server.raw_name,
                 "transport": server.transport,

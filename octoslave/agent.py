@@ -25,6 +25,8 @@ _STREAM_READ_TIMEOUT = httpx.Timeout(300.0, connect=30.0)
 from . import display
 from . import logger
 from . import interrupt
+from . import netwatch
+from . import ratelimit
 from . import steer
 from .tools import (
     TOOL_DEFINITIONS,
@@ -314,6 +316,13 @@ def _is_retryable_error(exc: Exception) -> bool:
     treated as a fatal error. e-INFRA / NIM endpoints throw these on long-TTFT
     calls when a model "thinks" for tens of seconds before the first token."""
     if isinstance(exc, (APIConnectionError, APITimeoutError)):
+        return True
+    # A failure WHILE streaming reaches us as the raw httpx error — the SDK only
+    # wraps the ones raised before the response starts. Any transport failure
+    # ("Broken pipe", "Operation timed out", a reset, a keepalive that found the
+    # connection dead) is the connection's, not the request's: retry it.
+    if isinstance(exc, (httpx.NetworkError, httpx.TimeoutException,
+                        httpx.RemoteProtocolError)):
         return True
     s = str(exc).lower()
     # Body markers that mean a transient upstream hiccup (worker dropped, gateway
@@ -734,7 +743,7 @@ def _probe_vision_once(client, model: str):
         # An explicit refusal is the clean answer; any other 400 (params,
         # context) says nothing about vision.
         return "refused" if _is_vision_unsupported_error(str(e)) else None
-    except Exception:
+    except (Exception, interrupt.StopRequested):
         return None
 
     try:
@@ -1595,6 +1604,8 @@ def probe_model(client: OpenAI, model: str, timeout: float = 12.0) -> bool:
             max_tokens=1, stream=False,
         )
         return True
+    except interrupt.StopRequested:
+        return False                  # the caller's stop check takes it from here
     except Exception as e:  # noqa: BLE001 — classify, don't propagate
         if _is_retryable_error(e) or _is_model_unavailable_error(str(e)):
             return False
@@ -2087,7 +2098,7 @@ def _llm_summary(client: OpenAI, model: str, turns_to_compact: list[dict], remov
     ]
     try:
         out = _simple_completion(client, model, prompt, max_tokens=800).strip()
-    except Exception:
+    except (Exception, interrupt.StopRequested):
         # Any failure (transport, or a user Stop surfacing as StopRequested) —
         # fall back to the mechanical summary. A pending stop is honoured by the
         # loop's between-turn interrupt check.
@@ -2297,11 +2308,20 @@ def make_client(api_key: str, base_url: str) -> OpenAI:
     # Ollama doesn't require a real API key; use a placeholder so the SDK
     # doesn't raise a missing-key error.
     # 1-hour timeout: large models on e-INFRA CZ can have long TTFT
-    return OpenAI(
+    client = OpenAI(
         api_key=api_key if api_key else "ollama",
         base_url=base_url,
         timeout=3600.0,
     )
+    # Survive a closed lid or a dropped network: a Stop lands within a second
+    # even mid-read, and a connection that died while the machine slept is
+    # detected in seconds instead of after the 5-minute silence limit.
+    netwatch.install(client)
+    # Share the key's request limit instead of tripping it: requests queue for a
+    # free slot (the orchestrator first), and a 429 is waited out rather than
+    # taken for a broken model.
+    ratelimit.install(client, api_key, base_url)
+    return client
 
 
 def _cap_result(result: str, tool_name: str) -> str:
@@ -2409,7 +2429,7 @@ _ORIENT_TOOLS = frozenset({"read_file", "list_dir", "glob", "grep", "bio_inspect
 # tool not listed here counts as a possible change.
 _READ_ONLY_TOOLS = _ORIENT_TOOLS | frozenset({
     "web_search", "web_fetch", "todo_write", "ask_user", "remember", "forget",
-    "check_process", "check_specialists", "literature_search",
+    "check_process", "check_specialists", "literature_search", "find_connector",
 })
 
 # Consecutive silent tool turns before the loop asks for a status line. In real
@@ -2694,14 +2714,17 @@ def _stream_completion(client: OpenAI, model: str, messages: list, force_tool: b
 
     if tools is None:
         tools = all_tool_definitions(profile=_rt("tool_profile", None))
+    # No tools (a discussion-only agent): leave the fields out. vLLM rejects an
+    # empty array outright ("`tools` must not be an empty array", a 400 on
+    # e-INFRA), which failed every turn of such an agent.
+    tool_args = {"tools": tools, "tool_choice": "required" if force_tool else "auto"} if tools else {}
 
     with client.chat.completions.create(
         model=model,
         messages=wire_messages(messages),
-        tools=tools,
-        tool_choice="required" if force_tool else "auto",
         stream=True,
         timeout=_STREAM_READ_TIMEOUT,
+        **tool_args,
         **extra,
     ) as stream:
         for chunk in stream:
@@ -3069,6 +3092,10 @@ def _robust_stream(
       ``"interrupt"`` — KeyboardInterrupt; caller should stop the loop.
       ``"fatal"``     — unrecoverable; the error has already been printed and the
                         caller should break.
+      ``"fatal_conn"`` — the model stopped responding; the caller may finish the
+                        work on another model.
+      ``"fatal_rate"`` — the server has refused this key's requests for hours
+                        (rate limit) or its quota is gone; no model can help.
 
     Retry counters persist across calls in ``state`` (keys: ``rate``/``timeout``/``conn``).
     Extracted from ``_agent_loop`` so both the single-model loop and the council loop
@@ -3196,17 +3223,39 @@ def _robust_stream(
         return None, "interrupt", messages
     except Exception as e:
         err_str = str(e)
-        if "429" in err_str or "rate" in err_str.lower() or "RateLimit" in type(e).__name__:
-            state["rate"] += 1
-            wait = min(60, 5 * (2 ** (state["rate"] - 1)))
-            if state["rate"] > 5:
-                display.print_error("Rate limit persists after 5 retries.")
-                return None, "fatal", messages
-            display.print_info(f"Rate limit — waiting {wait}s ({state['rate']}/5).")
-            if interrupt.wait(wait):      # wakes at once on Stop
-                raise interrupt.StopRequested
+        # A Stop during a backoff wait ends the turn the same clean way as a
+        # Stop mid-stream ("interrupt"): raising from here used to escape the
+        # loop and lose the turn's history.
+        if ratelimit.is_rate_limit(e):
+            # The key's limit, not the model's fault: wait for a free slot (the
+            # gate does the waiting) and go again, uncounted. Switching models
+            # cannot help — they all share the key. Only a server that refuses
+            # everything for hours ends the turn ("fatal_rate").
+            try:
+                if ratelimit.wait_after(e, client):
+                    return None, "retry", messages
+            except interrupt.StopRequested:
+                return None, "interrupt", messages
+            return None, "fatal_rate", messages
+        if netwatch.is_sleep_error(e):
+            # The machine slept and took the connection with it. Nothing is
+            # wrong with the model or the server: retry now, uncounted.
+            display.print_info("The connection did not survive the computer "
+                               "sleeping — sending the request again.")
             return None, "retry", messages
-        elif "timeout" in err_str.lower() or "timed out" in err_str.lower() or "Timeout" in type(e).__name__:
+        timed_out = ("timeout" in err_str.lower() or "timed out" in err_str.lower()
+                     or "Timeout" in type(e).__name__)
+        if timed_out or _is_retryable_error(e):
+            # The server cannot be reached at all (network down, laptop just
+            # woke): retrying on a timer, or on another model of the same
+            # server, cannot help. Wait for it to come back, then carry on.
+            try:
+                if netwatch.wait_out_outage(client):
+                    state["timeout"] = state["conn"] = 0
+                    return None, "retry", messages
+            except interrupt.StopRequested:
+                return None, "interrupt", messages
+        if timed_out:
             state["timeout"] += 1
             wait = min(30, 5 * (2 ** (state["timeout"] - 1)))
             if state["timeout"] > 3:
@@ -3214,7 +3263,7 @@ def _robust_stream(
                 return None, "fatal_conn", messages
             display.print_info(f"Request timeout — retrying in {wait}s ({state['timeout']}/3).")
             if interrupt.wait(wait):      # wakes at once on Stop
-                raise interrupt.StopRequested
+                return None, "interrupt", messages
             return None, "retry", messages
         elif _is_retryable_error(e):
             # Transient connection drop ("peer closed connection without sending
@@ -3231,7 +3280,7 @@ def _robust_stream(
                 f"Connection dropped — retrying in {wait}s ({state['conn']}/4)."
             )
             if interrupt.wait(wait):      # wakes at once on Stop
-                raise interrupt.StopRequested
+                return None, "interrupt", messages
             return None, "retry", messages
         elif "410" in err_str and ("end of life" in err_str.lower() or "Gone" in err_str):
             display.print_error(
@@ -3261,7 +3310,28 @@ def _robust_stream(
         return None, "fatal", messages
 
 
-def _agent_loop(
+# How the most recent _agent_loop on this thread ended ("completed",
+# "interrupted", "connection_lost", "error", "no_progress", …). run_agent and
+# continue_agent return only the history, so a caller that must tell an answer
+# from a turn cut short (Science reports the turn's reply) asks this instead of
+# guessing from the history — whose last assistant text may be a mid-task remark
+# or the PREVIOUS turn's answer.
+_LOOP_END = threading.local()
+
+
+def last_end_reason() -> str:
+    """How the last agent loop on this thread ended ("" if it raised)."""
+    return getattr(_LOOP_END, "reason", "")
+
+
+def _agent_loop(*args, **kwargs) -> tuple[list[dict], str]:
+    _LOOP_END.reason = ""
+    messages, reason = _agent_loop_run(*args, **kwargs)
+    _LOOP_END.reason = reason
+    return messages, reason
+
+
+def _agent_loop_run(
     messages: list[dict],
     model: str,
     working_dir: str,
@@ -3269,7 +3339,7 @@ def _agent_loop(
     permission_mode: str = "autonomous",
     preferred_model: str = "",
     force_first_tool: bool = False,
-) -> list[dict]:
+) -> tuple[list[dict], str]:
     """``preferred_model`` — the model this run is *meant* to use, when ``model``
     is only a substitute swapped in after a failure. The loop re-tests it
     periodically and moves back as soon as it is serving again, so an outage
@@ -3344,6 +3414,11 @@ def _agent_loop(
             break
         if _signal == "fatal":
             _end_reason = "error"
+            break
+        if _signal == "fatal_rate":
+            # The server refused every request for hours (or the key's quota
+            # is gone). Not the model's fault: no model switch, an honest end.
+            _end_reason = "rate_limited"
             break
 
         content = response["content"]

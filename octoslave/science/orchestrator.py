@@ -15,11 +15,12 @@ the turn going until the inbox is empty — so nothing sent mid-run is dropped.
 from __future__ import annotations
 
 import time as _time
+from pathlib import Path
 
 from .. import display
 from .. import steer
 from .. import tools as _tools
-from ..agent import continue_agent, run_agent
+from ..agent import continue_agent, last_end_reason, run_agent
 from . import workspace as _workspace
 from .context import RunContext, clear_context, set_context
 from .session import ScienceSession
@@ -112,16 +113,32 @@ def run_science_turn(
     _science_tools.register()
     display.set_event_callback(watched)
     # Outputs the user commented on during this turn — re-emitted at the end so
-    # their previews refresh even if the model edited the file in place.
-    refresh_ids: list[str] = [refresh_artifact_id] if refresh_artifact_id else []
+    # their previews refresh even if the model edited the file in place. Each is
+    # noted with the file's mtime AS COMMENTED, so the end-of-turn pass can tell
+    # a file that really changed from one the turn never touched: announcing an
+    # update that did not happen is how a researcher comes to distrust the card.
+    refresh_ids: dict[str, float] = {}
+
+    def _note_refresh(aid: str) -> None:
+        if not aid or aid in refresh_ids:
+            return
+        art = session.get_artifact(aid)
+        try:
+            refresh_ids[aid] = Path(art.path).stat().st_mtime if art else 0.0
+        except (OSError, TypeError, ValueError):
+            # A null/odd path in a hand-edited state.json raises TypeError from
+            # Path(), not OSError — and this runs inside the inbox callback,
+            # where an exception would take the turn down.
+            refresh_ids[aid] = 0.0
+
+    if refresh_artifact_id:
+        _note_refresh(refresh_artifact_id)
 
     def _on_deliver(items: list[dict], to: str, who: str) -> None:
         emit({"type": "science_steer", "ids": [it["id"] for it in items],
               "to": to, "to_name": who})
         for it in items:
-            aid = (it.get("meta") or {}).get("artifact_id")
-            if aid and aid not in refresh_ids:
-                refresh_ids.append(aid)
+            _note_refresh((it.get("meta") or {}).get("artifact_id"))
 
     # Jobs are only re-polled on a timer: each poll is a round trip to the node,
     # and nothing here is worth a connection per agent step.
@@ -252,11 +269,27 @@ def run_science_turn(
                 extra_system=pool_note, model_pool=fallbacks,
             )
         else:
+            # A resumed session carries the system prompt it was STARTED with —
+            # for a project that runs for weeks, that is a persona frozen at
+            # turn 1. Two things go stale in it:
+            #
+            #   * the orchestrator's own instructions, so every later improvement
+            #     to how it works (how it delegates, what it presents, how it
+            #     keeps the workspace) never reaches a session already running;
+            #   * this turn's facts — which models it may give specialists, which
+            #     compute node is selected — so it offers a model that is no
+            #     longer in the pool, or submits to a node the researcher changed.
+            #
+            # Everything in it is regenerated from the profile, the config and
+            # the session, so rebuilding it loses nothing.
+            _refresh_system_prompt(session, wd, pool_note=pool_note,
+                                   remote=remote, query=user_message)
             messages = continue_agent(
                 session.messages, user_message, model, wd, client,
                 permission_mode=permission_mode, remote=None,
-                model_pool=fallbacks,
+                model_pool=fallbacks, prompt_profile="science",
             )
+        ended = last_end_reason()
         session.messages = messages
         from .. import interrupt as _interrupt
         # Supervise the rest of the turn. Two things can still need the
@@ -343,10 +376,12 @@ def run_science_turn(
             messages = continue_agent(
                 messages, "\n\n---\n\n".join(parts), model, wd, client,
                 permission_mode=permission_mode, remote=None, model_pool=fallbacks,
+                prompt_profile="science",
                 # A report or the workspace check is the harness speaking; a late
                 # message alone is the researcher's own words.
                 user_typed=bool(late) and not reports and not note,
             )
+            ended = last_end_reason()
             quiet["on"] = False
             if note and _workspace.is_nothing_to_change(_last_assistant_text(messages,
                                                                               raw=True)):
@@ -364,14 +399,25 @@ def run_science_turn(
         # present_output — the model decides what's worth showing (not every
         # intermediate file). See prompt_profiles/science.md.
         # For a refinement, make sure the refined output's preview refreshes even
-        # if the model edited the file in place and didn't re-present it.
-        for aid in refresh_ids:
+        # if the model edited the file in place and didn't re-present it — but
+        # only when the file actually moved on. A comment the turn answered in
+        # words ("no, the first one was right") changes nothing on disk, and
+        # re-emitting then tells the researcher their output was updated when it
+        # was not.
+        for aid, was in refresh_ids.items():
             art = session.get_artifact(aid)
-            if art:
-                emit({"type": "science_artifact", "id": art.id, "rel": art.rel,
-                      "path": art.path, "caption": art.caption, "kind": art.kind,
-                      "provenance": art.provenance, "interim": art.interim,
-                      "refreshed": True})
+            if not art:
+                continue
+            try:
+                now_mtime = Path(art.path).stat().st_mtime
+            except (OSError, TypeError, ValueError):
+                continue
+            if now_mtime <= was:
+                continue
+            emit({"type": "science_artifact", "id": art.id, "rel": art.rel,
+                  "path": art.path, "caption": art.caption, "kind": art.kind,
+                  "provenance": art.provenance, "interim": art.interim,
+                  "refreshed": True})
         # A mid-tool stop unwinds the loop cleanly (history preserved and already
         # annotated), so the turn returns normally — check the flag rather than
         # relying on an exception, or a stop would be reported as a normal reply.
@@ -383,7 +429,16 @@ def run_science_turn(
                 "far is saved — send a message to carry on from here.")})
             return ""
         reply = _last_assistant_text(messages)
-        emit({"type": "science_reply", "text": reply})
+        if ended in _CUT_SHORT:
+            # The loop gave up mid-turn. Its last words are then a mid-task
+            # remark, or — when it said nothing this turn — the PREVIOUS turn's
+            # answer, which used to be shown again as if it were the new one.
+            reply = (f"⚠ This turn was cut short: {_CUT_SHORT[ended]} (details "
+                     f"above). Everything done so far is saved — send a message "
+                     f"(for example “continue”) to pick up where it stopped.")
+            emit({"type": "science_reply", "text": reply, "incomplete": True})
+        else:
+            emit({"type": "science_reply", "text": reply})
         session.save()
         try:
             from . import index as _index
@@ -429,6 +484,89 @@ def run_science_turn(
         clear_context()
         display.clear_event_callback()
         set_budget_cap(None)
+
+
+#: How an orchestrator loop that gave up is reported (see last_end_reason).
+_CUT_SHORT = {
+    "connection_lost": "the model server stopped responding, and no other model "
+                       "could take over",
+    "error": "the model endpoint returned an error that could not be worked around",
+    "rate_limited": "the model server kept refusing this key's requests (rate limit) "
+                    "for too long",
+}
+
+#: Most recent specialists named in the resumed orchestrator's team roster.
+_ROSTER_LIMIT = 12
+
+
+def _team_note(session: ScienceSession) -> str:
+    """The specialists this project already has, for a RESUMED turn.
+
+    The orchestrator only knows its team from its own conversation, and that is
+    summarised as the session grows — so on a long project it eventually cannot
+    name the agents it dispatched, and continue_specialist (which would hand work
+    back to the one that already knows the ground) becomes unreachable. Then its
+    only options are to spawn a fresh agent or do the job itself. The session
+    knows the team for certain, so state it.
+    """
+    people = [s for s in (getattr(session, "specialists", None) or [])
+              if (getattr(s, "role", "") or getattr(s, "name", ""))]
+    if not people:
+        return ""
+    lines = []
+    for s in people[-_ROSTER_LIMIT:]:
+        outcome = " ".join((s.summary or "").split())[:220]
+        lines.append(f"- `{s.id}` **{s.name}** ({s.role}) — {s.status}"
+                     + (f": {outcome}" if outcome else "")
+                     + f"\n  Remit: {' '.join((s.goal or '').split())[:200]}")
+    earlier = len(people) - len(lines)
+    head = ("## Your team on this project\n"
+            "Specialists already dispatched here. To take any of their work "
+            "further, continue_specialist(id=…) resumes that agent with its whole "
+            "transcript — what it tried, what worked, the dead ends — instead of a "
+            "fresh agent that would re-tread it. Dispatch a new specialist for work "
+            "none of them covers.\n")
+    if earlier > 0:
+        head += f"(the {earlier} earlier one(s) are omitted)\n"
+    return head + "\n".join(lines)
+
+
+def _refresh_system_prompt(session: ScienceSession, wd: str, *, pool_note: str,
+                           remote: dict | None, query: str) -> None:
+    """Rebuild the orchestrator's system message for this turn, in place.
+
+    Assembled exactly as ``run_agent`` assembles it for turn 1 (profile, then the
+    compute-node note, then the caller's extra context, then project memory), so
+    a session resumed next month runs the current orchestrator rather than the
+    one it was created with. Does nothing if the history has no system message to
+    replace, and never raises: a stale prompt is survivable, a lost turn is not.
+    """
+    msgs = session.messages
+    if not msgs or msgs[0].get("role") != "system":
+        return
+    try:
+        from ..agent import load_session_memory, load_system_prompt
+        from ..config import remote_awareness_note
+
+        prompt = load_system_prompt("science", wd)
+        note = remote_awareness_note(active=remote, job_submission=True)
+        if note:
+            prompt += "\n\n" + note
+        if pool_note.strip():
+            prompt += "\n\n" + pool_note.strip()
+        roster = _team_note(session)
+        if roster:
+            prompt += "\n\n" + roster
+        try:
+            memory = load_session_memory(wd, query=query, remote=None)
+        except Exception:  # noqa: BLE001 — memory is an optional extra
+            memory = ""
+        if memory:
+            prompt += f"\n\n{memory}"
+    except Exception:  # noqa: BLE001
+        return
+    if prompt.strip():
+        msgs[0] = {"role": "system", "content": prompt}
 
 
 def _last_assistant_text(messages: list[dict], raw: bool = False) -> str:

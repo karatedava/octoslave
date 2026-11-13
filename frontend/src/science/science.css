@@ -121,6 +121,10 @@ body.sx-dragging iframe { pointer-events: none; }
 .sx-pill.working, .sx-pill.running, .sx-pill.submitted { color: var(--accent); background: var(--accent-soft); }
 .sx-pill.done { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }
 .sx-pill.failed { color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); }
+/* Did not finish, but its work is kept and can be resumed — not a success and
+   not a failure, so it must read as neither. */
+.sx-pill.incomplete { color: var(--warn, #d08a3e);
+  background: color-mix(in srgb, var(--warn, #d08a3e) 14%, transparent); }
 .sx-pill.unknown { color: var(--muted); background: var(--chip); }
 /* A live status nobody has confirmed lately: shown as a question, not a fact,
    so it reads differently from a status the node has just backed up. */
@@ -176,6 +180,7 @@ body.sx-dragging iframe { pointer-events: none; }
 .sx-top-task { font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 38vw; }
 .sx-state { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--muted); white-space: nowrap; }
 .sx-state.run { color: var(--accent); }
+.sx-state.wait { color: var(--warn); }
 .sx-settings-wrap { position: relative; }
 .sx-scrim { position: fixed; inset: 0; z-index: 40; }
 .sx-pop {
@@ -277,14 +282,25 @@ body.sx-dragging iframe { pointer-events: none; }
 .sx-plan-list li.completed .sx-plan-mark { color: var(--ok); }
 
 /* ---------- feed ---------- */
+.sx-feedwrap { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
 .sx-feed { flex: 1; overflow-y: auto; min-height: 0; position: relative; }
 .sx-feed-inner { max-width: 860px; margin: 0 auto; padding: 26px 28px 18px; display: flex; flex-direction: column; gap: 14px; }
 .sx-feed-inner > * { flex-shrink: 0; }
+/* The way back to the current work: floats over the bottom of the conversation. */
 .sx-jump {
-  position: sticky; bottom: 12px; left: 50%; transform: translateX(-50%); display: block; margin: 0 auto;
-  background: var(--panel); border: 1px solid var(--border2); color: var(--text); border-radius: 999px;
-  padding: 5px 14px; font-size: 12px; cursor: pointer; box-shadow: var(--shadow);
+  position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); z-index: 6;
+  display: inline-flex; align-items: center; gap: 8px; max-width: calc(100% - 32px);
+  background: var(--panel2); border: 1px solid var(--border2); color: var(--text); border-radius: 999px;
+  padding: 6px 14px; font: inherit; font-size: 12.5px; font-weight: 500; line-height: 1.3;
+  cursor: pointer; box-shadow: var(--shadow); white-space: nowrap; animation: sx-jump-in .16s ease-out;
 }
+.sx-jump:hover { background: var(--hover); border-color: var(--accent); }
+.sx-jump:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.sx-jump.live { border-color: color-mix(in srgb, var(--accent) 55%, var(--border2)); }
+.sx-jump-t { overflow: hidden; text-overflow: ellipsis; }
+.sx-jump-n { font-size: 11px; color: var(--accent); background: var(--accent-soft); border-radius: 999px; padding: 1px 7px; }
+.sx-jump-arrow { color: var(--muted); }
+@keyframes sx-jump-in { from { opacity: 0; transform: translate(-50%, 6px); } to { opacity: 1; transform: translate(-50%, 0); } }
 .sx-flash { animation: sx-flash 1.4s ease; }
 @keyframes sx-flash { 0%, 40% { box-shadow: 0 0 0 3px var(--accent); } 100% { box-shadow: 0 0 0 0 transparent; } }
 
@@ -525,7 +541,12 @@ body.sx-dragging iframe { pointer-events: none; }
 .sx-member-head { display: flex; align-items: center; gap: 10px; }
 .sx-member-now { font-family: var(--mono); font-size: 11.5px; color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sx-member-goal { font-size: 12px; color: var(--muted); }
-.sx-member-sum { font-size: 12px; max-height: 9em; overflow: hidden; }
+/* Clamped, and visibly so: a hard cut with no fade read as the whole report.
+   The full text is on the specialist's card in the feed (click the member). */
+.sx-member-sum { font-size: 12px; max-height: 9em; overflow: hidden; position: relative;
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 2.2em), transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 2.2em), transparent 100%); }
+.sx-member-more { font-size: 11px; color: var(--accent); margin-top: 2px; }
 .sx-member-foot { display: flex; gap: 10px; font-size: 11px; color: var(--faint); font-family: var(--mono); }
 .sx-job { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
 .sx-job-head { display: flex; align-items: center; gap: 8px; }
@@ -628,3 +649,79 @@ body.sx-dragging iframe { pointer-events: none; }
 .sx .sx-compacted-a { opacity: .8; margin-top: 2px; white-space: pre-wrap; }
 .sx .sx-compacted-list { margin-top: 8px; opacity: .85; }
 .sx .sx-auto { display: flex; align-items: center; gap: 8px; padding: 8px 2px 12px; font-size: 13px; cursor: pointer; }
+
+/* --- specialist transcript drill-down & proposals ------------------------ */
+/* A specialist's report is a claim; the transcript is the work behind it.
+   Dense, monospaced, scrollable — made for scanning what it actually ran. */
+.sx-tr { max-height: 50vh; overflow: auto; margin: 6px 0 2px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--bg-sunk, var(--chip)); }
+.sx-tr-note { padding: 6px 10px; font-size: 11px; color: var(--muted);
+  border-bottom: 1px solid var(--line); }
+.sx-tr-row { display: flex; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--line); }
+.sx-tr-row:last-child { border-bottom: 0; }
+.sx-tr-row.result { background: color-mix(in srgb, var(--muted) 6%, transparent); }
+.sx-tr-row.said { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+.sx-tr-kind { flex: 0 0 auto; width: 18px; text-align: center; opacity: .8; }
+.sx-tr-body { min-width: 0; flex: 1; font-size: 12px; }
+.sx-tr-body pre { margin: 2px 0 0; white-space: pre-wrap; word-break: break-word;
+  font-family: var(--mono); font-size: 11.5px; color: var(--muted); max-height: 16em; overflow: auto; }
+.sx-spec-prop { margin: 4px 0 0; padding-left: 18px; font-size: 12px; }
+.sx-spec-prop li { margin: 2px 0; }
+.sx-spec-prop code { font-size: 11.5px; }
+.sx-spec-propcap { color: var(--muted); }
+
+/* --- session-gone notice & auto-continue budget -------------------------- */
+.sx-gone { text-align: left; border: 1px solid var(--warn, #d08a3e); border-radius: 10px;
+  background: color-mix(in srgb, var(--warn, #d08a3e) 10%, transparent);
+  padding: 10px 12px; margin: 0 0 14px; font-size: 12.5px; display: flex;
+  flex-direction: column; gap: 4px; }
+.sx-gone code { font-family: var(--mono); font-size: 11.5px; word-break: break-all; }
+.sx-gone .sx-btn.sm { align-self: flex-start; margin-top: 4px; }
+.sx-auto-budget { color: var(--faint); font-size: 11px; font-family: var(--mono); }
+
+/* --- inline maths & embedded figures ------------------------------------- */
+/* Not typeset LaTeX: sub/superscripts, Greek and operators, which is what
+   research prose uses inline. Slightly serif so a symbol reads as a symbol. */
+.md-math { font-family: ui-serif, Georgia, "Times New Roman", serif;
+  font-size: 1.04em; white-space: nowrap; }
+.md-math sub, .md-math sup { font-size: .72em; }
+.md-math.block { display: block; text-align: center; margin: 8px 0;
+  font-size: 1.12em; white-space: normal; }
+.md-img { max-width: 100%; height: auto; border-radius: 8px; margin: 6px 0;
+  border: 1px solid var(--line, var(--border)); display: block; }
+.md-img-missing { font-size: 12px; color: var(--muted); font-style: italic; }
+
+/* --- keyboard focus & reduced motion ------------------------------------- */
+/* Nothing in here defined a visible focus ring, and inputs set outline:none —
+   so navigating this page by keyboard gave no indication of where you were.
+   :focus-visible only shows for keyboard/AT users, so pointer users see no
+   change. One rule, scoped to the Science shell, covers every control. */
+.sx :where(button, a[href], input, select, textarea, summary, [tabindex]):focus-visible,
+.sx-start :where(button, a[href], input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+/* The composer and fields opt out of outline above; restore it for keyboard. */
+.sx-field:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* Several indicators pulse or blink indefinitely. For anyone who asked the OS
+   to reduce motion, hold the final frame instead of animating for ever. */
+@media (prefers-reduced-motion: reduce) {
+  .sx-livedot, .sx-spin, .sx-sdot.run, .sx-flash, .sx-steer-dot.queued,
+  .sx-steer-dot.sending, .sx-caret, [class*="sx-"] {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+  .sx-spin { border-top-color: var(--accent); }
+}
+
+/* --- job command detail -------------------------------------------------- */
+.sx-job-cmd { font-size: 11.5px; }
+.sx-job-cmd > summary { cursor: pointer; color: var(--muted); }
+.sx-job-cmd pre { margin: 4px 0 2px; padding: 6px 8px; background: var(--chip);
+  border-radius: 6px; white-space: pre-wrap; word-break: break-word;
+  font-family: var(--mono); font-size: 11px; max-height: 12em; overflow: auto; }
+.sx-job-cwd { color: var(--faint); font-size: 11px; }
+.sx-job-cwd code { font-family: var(--mono); word-break: break-all; }

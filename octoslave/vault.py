@@ -20,7 +20,7 @@ from pathlib import Path
 
 from openai import OpenAI, BadRequestError
 
-from . import display
+from . import display, interrupt, ratelimit
 from .agent import _cap_result, _compact_and_trim as _trim_messages, drain_image_attachments
 from .tools import TOOL_DEFINITIONS, execute_tool
 
@@ -228,16 +228,17 @@ def _run_vault_agent(
             return False
         except Exception as e:
             err_str = str(e)
-            if "429" in err_str or "rate" in err_str.lower() or "RateLimit" in type(e).__name__:
-                _rl += 1
-                wait = min(60, 5 * (2 ** (_rl - 1)))
-                display.print_info(f"  [{cfg['label']}] Rate limit — waiting {wait}s ({_rl}/5).")
-                if _rl > 5:
-                    display.print_error(f"[{cfg['label']}] Rate limit persists. Aborting batch.")
+            if ratelimit.is_rate_limit(e):
+                # The key's request limit, shared with everything else running:
+                # wait for a free slot (Stop-aware) instead of a fixed ladder.
+                try:
+                    if ratelimit.wait_after(e, client, who=cfg["label"]):
+                        iteration -= 1
+                        continue
+                except interrupt.StopRequested:
                     return False
-                time.sleep(wait)
-                iteration -= 1
-                continue
+                display.print_error(f"[{cfg['label']}] Rate limit persists. Aborting batch.")
+                return False
             elif "timeout" in err_str.lower() or "Timeout" in type(e).__name__:
                 _to += 1
                 wait = min(30, 5 * (2 ** (_to - 1)))

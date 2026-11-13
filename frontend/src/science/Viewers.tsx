@@ -103,13 +103,31 @@ function TableView({ url, size }: { url: string; size: Size }) {
   );
 }
 
+/** The directory a served file lives in, taken back out of its view URL.
+ *
+ *  A report's figures are written beside it and referenced relatively
+ *  (`![](figs/x.png)`), so the renderer needs the document's own directory to
+ *  resolve them against; the URL already carries the absolute path. */
+function dirOfViewUrl(url: string): string {
+  const m = /^\/api\/files\/view\/([^?#]+)/.exec(url || "");
+  if (!m) return "";
+  let abs: string;
+  try { abs = decodeURIComponent(m[1]); } catch { return ""; }
+  const cut = abs.lastIndexOf("/");
+  return cut > 0 ? abs.slice(0, cut) : "";
+}
+
 function TextView({ url, size, markdown }: { url: string; size: Size; markdown?: boolean }) {
   const { text, err } = useText(url);
   if (err) return <div className="sx-noprev">Couldn't load file ({err}).</div>;
   if (text === null) return <div className="sx-loading">Loading…</div>;
   const shown = size === "compact" ? text.split("\n").slice(0, 14).join("\n") : text;
   if (markdown) {
-    return <div className={"sx-doc " + size}><Markdown text={shown} /></div>;
+    return (
+      <div className={"sx-doc " + size}>
+        <Markdown text={shown} imgBase={dirOfViewUrl(url)} />
+      </div>
+    );
   }
   return <pre className={"sx-textview " + size}>{shown}</pre>;
 }

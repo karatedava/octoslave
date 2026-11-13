@@ -14,6 +14,7 @@ import glob as glob_module
 from pathlib import Path
 
 from .tools_bio import BIO_TOOL_DEFINITIONS, BIO_TOOL_NAMES, execute_bio_tool
+from .connectors import CONNECTOR_TOOL_DEFINITIONS, CONNECTOR_TOOL_NAMES
 from .tools_cryo import (
     CRYO_TOOL_DEFINITIONS,
     CRYO_TOOL_NAMES,
@@ -555,7 +556,7 @@ TOOL_DEFINITIONS = [
             },
         },
     },
-] + BIO_TOOL_DEFINITIONS
+] + BIO_TOOL_DEFINITIONS + CONNECTOR_TOOL_DEFINITIONS
 
 
 # ---------------------------------------------------------------------------
@@ -619,19 +620,43 @@ LOCAL_TOOL_ALLOWLIST = frozenset({
 _DYNAMIC_TOOLS: dict[str, "tuple[dict, callable]"] = {}
 
 
-def register_dynamic_tool(definition: dict, func) -> None:
+def register_dynamic_tool(definition: dict, func, visible=None) -> None:
     """Register (or replace) a runtime tool. ``definition`` is an OpenAI
-    function-tool schema; ``func(args, working_dir) -> (text, ok)``."""
+    function-tool schema; ``func(args, working_dir) -> (text, ok)``.
+
+    ``visible`` — an optional predicate, evaluated ON THE CALLING THREAD, saying
+    whether this tool should be offered to the agent running there. The registry
+    is process-wide, so without it a tool registered for one run is advertised to
+    every other agent in the process: a normal chat turn running beside a Science
+    session was offered its twelve research tools, and calling one could only
+    fail. Omit it for a tool that genuinely belongs to everything.
+    """
     name = definition["function"]["name"]
-    _DYNAMIC_TOOLS[name] = (definition, func)
+    _DYNAMIC_TOOLS[name] = (definition, func, visible)
 
 
 def unregister_dynamic_tool(name: str) -> None:
     _DYNAMIC_TOOLS.pop(name, None)
 
 
-def dynamic_tool_names() -> set[str]:
-    return set(_DYNAMIC_TOOLS)
+def _dyn_visible(entry) -> bool:
+    """Whether a registry entry is offered to the agent on this thread."""
+    vis = entry[2] if len(entry) > 2 else None
+    if vis is None:
+        return True
+    try:
+        return bool(vis())
+    except Exception:  # noqa: BLE001
+        # A predicate that cannot answer must not advertise the tool: offering
+        # one that will not work is worse than leaving it out.
+        return False
+
+
+def dynamic_tool_names(all_threads: bool = False) -> set[str]:
+    """Dynamic tools offered on THIS thread (or every registered one)."""
+    if all_threads:
+        return set(_DYNAMIC_TOOLS)
+    return {n for n, e in _DYNAMIC_TOOLS.items() if _dyn_visible(e)}
 
 
 def all_tool_definitions(profile: str | None = None) -> list[dict]:
@@ -654,7 +679,8 @@ def all_tool_definitions(profile: str | None = None) -> list[dict]:
     mgr = _mcp_manager()
     if mgr is not None:
         defs += mgr.tool_definitions()
-    defs += [d for (d, _f) in _DYNAMIC_TOOLS.values()]
+    # Only the dynamic tools this thread's run owns (see register_dynamic_tool).
+    defs += [e[0] for e in _DYNAMIC_TOOLS.values() if _dyn_visible(e)]
     return defs
 
 
@@ -669,7 +695,9 @@ def valid_tool_names() -> set[str]:
     mgr = _mcp_manager()
     if mgr is not None:
         names |= mgr.tool_names()
-    names |= set(_DYNAMIC_TOOLS)
+    # Same scoping as the advertised surface: a chat turn must not parse a
+    # Science tool name out of prose as if it were a call it could make.
+    names |= dynamic_tool_names()
     return names
 
 
@@ -1229,6 +1257,16 @@ def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str =
             # CryoSPARC tools talk to the user's instance over the network, so
             # they run locally (no remote staging) and reuse the cached client.
             return execute_cryo_tool(name, args, working_dir)
+        elif name in CONNECTOR_TOOL_NAMES:
+            # MCP connectors run on THIS machine, so they get the local working
+            # dir (a filesystem connector's root), not the remote remap.
+            from . import connectors
+            clean = {k: v for k, v in args.items()
+                     if k not in ("working_dir", "permission_mode")}
+            if name == "find_connector":
+                return connectors.find_connector(working_dir=orig_working_dir, **clean)
+            return connectors.connect_connector(working_dir=orig_working_dir,
+                                                permission_mode=permission_mode, **clean)
         elif _is_mcp:
             mgr = _mcp_manager()
             if mgr is None:
@@ -1245,7 +1283,7 @@ def execute_tool(name: str, args: dict, working_dir: str, permission_mode: str =
                     pass
             return mgr.call(name, args)
         elif name in _DYNAMIC_TOOLS:
-            _def, func = _DYNAMIC_TOOLS[name]
+            func = _DYNAMIC_TOOLS[name][1]
             return func(args, working_dir)
         else:
             return f"Unknown tool: {name}", False

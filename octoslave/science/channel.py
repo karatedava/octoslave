@@ -96,6 +96,10 @@ class ScienceChannel:
         # did not end last).
         self._partials: dict[str, dict] = {}
         self._last_text = ""                  # last assistant text persisted
+        # Whether a run is waiting for an unreachable model server right now
+        # (the latest "net" offline event, or None). Live state, never logged —
+        # but a viewer who connects mid-outage must be told too.
+        self._net: dict | None = None
         # The question an agent is waiting on right now, if any. Not part of the
         # timeline (an old question cannot be answered), but a viewer that
         # reloads while it is open must still see it, or the agent sits blocked.
@@ -144,6 +148,13 @@ class ScienceChannel:
     def _track(self, ev: dict) -> None:
         """Maintain the in-flight stream and write timeline records (lock held)."""
         t = ev.get("type")
+        if t == "net":
+            # "offline" (server unreachable) or "limited" (it refuses the key's
+            # requests for now) until an "ok".
+            self._net = ev if ev.get("state") in ("offline", "limited") else None
+            return
+        if t == "science_done":
+            self._net = None               # nobody is waiting once the turn is over
         if t == "user_question":
             self._question = ev
             return
@@ -233,6 +244,8 @@ class ScienceChannel:
                for p in self._partials.values() if p["text"]]
         if self._question is not None:
             out.append({k: v for k, v in self._question.items() if k != "seq"})
+        if self._net is not None:
+            out.append({k: v for k, v in self._net.items() if k != "seq"})
         return out
 
     def unsubscribe(self, loop, q) -> None:
