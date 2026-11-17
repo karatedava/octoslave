@@ -30,7 +30,7 @@ from typing import Optional
 
 from openai import OpenAI
 
-from . import display
+from . import display, keepawake
 from .agent import _simple_completion, run_agent
 
 PARALLEL_SUBDIR = ".parallel"
@@ -268,6 +268,7 @@ def _promote_winner(winner: CandidateResult, target: Path) -> int:
 _PROFILE_ROTATION = ["base", "coder", "analyst"]
 
 
+@keepawake.while_working
 def run_parallel_agents(
     task: str,
     model: str,

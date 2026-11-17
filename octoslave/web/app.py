@@ -663,7 +663,10 @@ def _healthy_model(model: str, cfg: dict) -> tuple[str, str]:
     """
     try:
         from ..config import list_models as _list_models, pick_fallback_model
-        available = [m for m in (_list_models(cfg) or []) if m]
+        # live_only: when the catalog call fails, list_models would otherwise
+        # hand back the static KNOWN_MODELS — and every newer model (absent from
+        # it) got "swapped" for a stale id the backend may not even serve.
+        available = [m for m in (_list_models(cfg, live_only=True) or []) if m]
     except Exception:
         return model, ""
     if not available or not model or model in available:
@@ -1172,9 +1175,15 @@ class _ScienceWatcher:
         return [ch for ch in all_channels() if ch.session is not None]
 
     def tick(self) -> None:
+        from .. import keepawake
         from ..science.tools import reconcile_jobs
         now = time.monotonic()
-        for ch in self._candidates():
+        candidates = self._candidates()
+        # Keep the machine awake (on mains power only) while some session waits
+        # for cluster jobs and will continue by itself when they end; asleep,
+        # this watcher can't notice them finishing.
+        keepawake.set_waiting(any(_jobs_awaited(ch.session) for ch in candidates))
+        for ch in candidates:
             sess = ch.session
             if ch.running or not _open_jobs(sess):
                 continue
@@ -1235,6 +1244,34 @@ class _ScienceWatcher:
 def _open_jobs(sess) -> bool:
     return any(getattr(j, "status", "") in ("submitted", "running")
                for j in (getattr(sess, "jobs", None) or []))
+
+
+# A job only keeps the machine awake while its status is fresh: last_checked
+# moves only on a SUCCESSFUL poll, so a remote that stays unreachable (or a job
+# record nobody can confirm) stops holding the machine up after this long.
+_AWAIT_FRESH_S = 2 * 3600
+
+
+def _jobs_awaited(sess) -> bool:
+    """Open jobs, confirmed alive recently, that the session will continue on
+    by itself when they end (auto-continue on, wake budget left)."""
+    from datetime import datetime
+    if not getattr(sess, "auto_continue", True):
+        return False
+    if int(getattr(sess, "auto_wakes", 0) or 0) >= _ScienceWatcher.MAX_WAKES:
+        return False
+    now = datetime.now()
+    for j in getattr(sess, "jobs", None) or []:
+        if getattr(j, "status", "") not in ("submitted", "running"):
+            continue
+        stamp = getattr(j, "last_checked", "") or getattr(j, "submitted_at", "")
+        try:
+            age = (now - datetime.fromisoformat(stamp)).total_seconds()
+        except Exception:  # noqa: BLE001, S112 — unparseable stamp: not confirmed
+            continue
+        if age <= _AWAIT_FRESH_S:
+            return True
+    return False
 
 
 _science_watcher = _ScienceWatcher()

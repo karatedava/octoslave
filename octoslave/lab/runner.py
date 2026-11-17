@@ -21,7 +21,7 @@ from pathlib import Path
 
 from openai import OpenAI
 
-from .. import display
+from .. import display, keepawake
 from ..config import DEFAULT_MODEL, load_config
 from . import director as _director
 from . import foundry as _foundry
@@ -473,6 +473,7 @@ def _run_round(session: LabSession, client: OpenAI, synthesis: str, emit) -> str
 
 # --- main entry --------------------------------------------------------------
 
+@keepawake.while_working
 def run_lab(
     task: str,
     working_dir: str,
@@ -647,6 +648,7 @@ def run_lab(
         _disable_compute_node(_compute_on)
 
 
+@keepawake.while_working
 def continue_lab(
     working_dir: str,
     client: OpenAI,

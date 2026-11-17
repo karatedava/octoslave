@@ -194,6 +194,7 @@ Research tabs directly.
 | ⚡ **GPU-aware** | Hardware probe at startup; CUDA enforced in generated code |
 | 🌐 **Web research** | DuckDuckGo search, full-page/PDF extraction, BFS website crawler |
 | 🧬 **Bio & chem** | Direct REST access to UniProt, PubChem, ChEMBL, RCSB PDB, AlphaFold, GEO, ENA + RDKit |
+| 🌙 **Screen-off runs** | The computer doesn't idle-sleep while agents work — leave it running with the screen dark |
 | 🏠 **Local mode** | Full functionality via Ollama — no API key, complete privacy |
 
 See [Modes in depth](#modes-in-depth) and the [docs](#documentation) for the rest.
@@ -579,6 +580,7 @@ Precedence: **environment variable** → `~/.octoslave/config.json` → built-in
 | `OCTOSLAVE_MODEL` / `OCTOSLAVE_BACKEND` | Default model / backend (`einfra` / `ollama` / `nim`) |
 | `OCTOSLAVE_PERMISSION_MODE` | `autonomous` / `controlled` / `supervised` |
 | `OCTOSLAVE_CONSTITUTION` | Constitution layer: `1`/`0` (default on; config key `constitution`) |
+| `OCTOSLAVE_KEEP_AWAKE` | Keep the computer from idle-sleeping while agents work: `1`/`0` (default on; config key `keep_awake`) |
 | `OCTOSLAVE_MAX_LIVE_IMAGES` | How many viewed images stay in context (default 3; older ones become a stub) |
 | `OCTOSLAVE_VISION_PROBE_TIMEOUT` | Seconds to wait for the one-off vision capability probe (default 75) |
 
@@ -593,6 +595,13 @@ modifying action), `supervised` (ask before file edits only). See
 every profile — the agent stays honest and calibrated, reads intent over literal
 wording, and is warmer to work with. On by default; disable with
 `OCTOSLAVE_CONSTITUTION=0` or `"constitution": false` in `~/.octoslave/config.json`.
+
+**Keep awake:** while an agent works (chat, council, Science, Lab, parallel), OctoSlave
+stops the computer from falling asleep on its own, so a run keeps going with the screen
+off. The screen still turns off as usual. While a Science session waits for cluster jobs
+it will continue by itself, the Mac stays awake only when plugged in. Closing the lid
+still sleeps the machine. Check it with `pmset -g assertions | grep OctoSlave`; disable
+with `OCTOSLAVE_KEEP_AWAKE=0` or `"keep_awake": false` in `~/.octoslave/config.json`.
 
 **Prompt profiles:** `base` (default), `coder`, `analyst`, and `cryouncle` (a
 CryoSPARC-connected cryo-EM companion for structural biologists). Switch with

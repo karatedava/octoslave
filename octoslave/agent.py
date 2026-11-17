@@ -23,6 +23,7 @@ from openai import (
 _STREAM_READ_TIMEOUT = httpx.Timeout(300.0, connect=30.0)
 
 from . import display
+from . import keepawake
 from . import logger
 from . import interrupt
 from . import netwatch
@@ -2546,15 +2547,54 @@ def _orientation_phase(
         # (never emitted a no-tool-calls "READY" turn to break out). Tell it
         # plainly so the plan is grounded in what it saw rather than silently
         # cut off mid-thought with no acknowledgement that time is up.
+        # Phase-neutral on purpose: what comes next (a plan request, or straight
+        # to work on the LOOK path) is said by the next message. "Write the plan,
+        # no more tools" here outlived the phase when no plan followed, and the
+        # model obeyed it during execution.
         messages.append({
             "role": "user",
             "content": (
-                "Orientation budget reached. Write the plan now using what "
-                "you have already seen — do not call any more tools."
+                "Orientation budget reached — stop exploring and work from "
+                "what you have already seen."
             ),
         })
 
     return messages
+
+
+def _handoff_to_work(messages: list[dict], planned: bool) -> list[dict]:
+    """Close the preparation phase with an explicit hand-off to execution.
+
+    Orientation and planning leave instructions in the transcript that are
+    wrong once real work starts ("read-only tools", "reply with just READY",
+    "do not call tools"). Without a clear switch — e.g. when the plan call
+    failed and nothing followed orientation — the model kept obeying them:
+    it answered READY and the run ended without doing the task."""
+    step = "the first step of your plan" if planned else "the first concrete step"
+    return list(messages) + [{"role": "user", "content": (
+        "[Note from the harness — not from the user] Preparation is over. You "
+        "now have your full tool set: you can write and edit files and run "
+        "commands. The orientation and planning instructions above (read-only "
+        "tools, replying READY, writing a plan without tools) no longer apply. "
+        f"Carry out the task now, starting with {step}."
+    )}]
+
+
+def _plan_completion(client: OpenAI, model: str, plan_messages: list,
+                     max_tokens: int) -> str:
+    """Ask for the plan; one retry after a short pause when nothing comes back.
+
+    ``_simple_completion`` returns "" on any transport error, and planning
+    usually runs right when a link is flaky (the main loop's own retry fired
+    on the very next call in the run this was written for). One retry recovers
+    a dropped connection; a persistent failure still returns ""."""
+    text = (_simple_completion(client, model, plan_messages, max_tokens=max_tokens) or "").strip()
+    if text:
+        return text
+    display.print_info("No plan came back (connection problem?) — retrying in 5s.")
+    if interrupt.wait(5):
+        raise interrupt.StopRequested
+    return (_simple_completion(client, model, plan_messages, max_tokens=max_tokens) or "").strip()
 
 
 def _assess_task_approach(task: str, system_prompt: str, client: OpenAI, model: str) -> str:
@@ -2635,9 +2675,10 @@ def _planning_step(
         "the plan only."
     )
     plan_messages = list(messages) + [{"role": "user", "content": plan_request}]
-    plan_text = _simple_completion(client, model, plan_messages, max_tokens=700)
+    plan_text = _plan_completion(client, model, plan_messages, max_tokens=700)
     if not plan_text:
-        return messages, ""
+        display.print_info("Couldn't get a plan from the model — continuing without one.")
+        return _handoff_to_work(messages, planned=False), ""
 
     display.print_plan(plan_text)
     # Inject into conversation so the main loop executes against the plan.
@@ -2645,7 +2686,7 @@ def _planning_step(
         {"role": "user", "content": plan_request},
         {"role": "assistant", "content": plan_text},
     ]
-    return messages, plan_text
+    return _handoff_to_work(messages, planned=True), plan_text
 
 
 # How many times the self-verify pass may send the model back to fix its own
@@ -2807,7 +2848,7 @@ def _switch_to_fallback_model(failed_model: str, client: OpenAI, prompt_profile:
     alt = random.choice(choices) if choices else None
     if not alt:
         try:
-            available = list_models(load_config())
+            available = list_models(load_config(), live_only=True)
         except Exception:
             available = []
         alt = pick_fallback_model(failed_model, available)
@@ -2829,6 +2870,7 @@ def _switch_to_fallback_model(failed_model: str, client: OpenAI, prompt_profile:
     return alt
 
 
+@keepawake.while_working
 def run_agent(
     task: str,
     model: str,
@@ -2935,6 +2977,7 @@ def run_agent(
         elif approach == "look":
             display.print_info("Focused task — a quick look first, no written plan.")
             messages = _orientation_phase(client, model, messages, working_dir, permission_mode)
+            messages = _handoff_to_work(messages, planned=False)
         else:  # "plan"
             messages, plan_text = _planning_step(task, system_prompt, client, model, messages, working_dir, permission_mode)
             if plan_text and plan_out is not None:
@@ -3011,6 +3054,7 @@ def run_agent(
     return messages
 
 
+@keepawake.while_working
 def continue_agent(
     messages: list[dict],
     follow_up: str,

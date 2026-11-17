@@ -18,6 +18,7 @@ import time as _time
 from pathlib import Path
 
 from .. import display
+from .. import keepawake
 from .. import steer
 from .. import tools as _tools
 from ..agent import continue_agent, last_end_reason, run_agent
@@ -47,6 +48,7 @@ _HISTORY_SAVE_INTERVAL = 60.0
 _JOB_POLL_INTERVAL = 120.0
 
 
+@keepawake.while_working
 def run_science_turn(
     session: ScienceSession,
     user_message: str,

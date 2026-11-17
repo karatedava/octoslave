@@ -194,7 +194,7 @@ def _pick_alternate_model(failed: str, pool: list[str] | None,
         return random.choice(untried_pool)
     try:
         from ..config import is_chat_model, list_models, load_config, pick_fallback_model
-        catalog = [m for m in (list_models(load_config()) or [])
+        catalog = [m for m in (list_models(load_config(), live_only=True) or [])
                    if m and m != failed and m not in tried and is_chat_model(m)]
     except Exception:  # noqa: BLE001 — catalog unreachable
         return None

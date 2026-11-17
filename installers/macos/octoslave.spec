@@ -64,7 +64,7 @@ hidden = [
     "octoslave.remote", "octoslave.vault", "octoslave.updater",
     "octoslave.web.app", "octoslave.wizard",
     "octoslave.mcp_client", "octoslave.mcp_registry", "octoslave.connectors",
-    "octoslave.netwatch", "octoslave.ratelimit",
+    "octoslave.netwatch", "octoslave.ratelimit", "octoslave.keepawake",
     # octoslave Lab (dynamic multi-agent) — imported lazily, so list explicitly
     "octoslave.lab", "octoslave.lab.runner", "octoslave.lab.state",
     "octoslave.lab.agent_runtime", "octoslave.lab.director",

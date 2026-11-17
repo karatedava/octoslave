@@ -514,6 +514,11 @@ def _run_specialist(ctx, rec, spec, task: str, working_dir: str, *,
                "resumed": bool(history), "background": True})
     context = _SPECIALIST_BRIEF + ("" if history else _prior_work(ctx.session, rec.id))
 
+    from .. import keepawake
+
+    # A background specialist can outlive the orchestrator's turn, so it keeps
+    # the machine awake on its own account until it reports back.
+    @keepawake.while_working
     def _work() -> None:
         from .. import steer
         # Follow the orchestrator's stop signal (one Stop from the user ends
@@ -701,7 +706,8 @@ def _resolve_specialist_model(ctx, requested) -> tuple[str, str]:
     # No pool configured — only the live catalog can vouch for the id.
     try:
         from ..config import is_chat_model, list_models, load_config
-        catalog = [m for m in (list_models(load_config()) or []) if is_chat_model(m)]
+        catalog = [m for m in (list_models(load_config(), live_only=True) or [])
+                   if is_chat_model(m)]
     except Exception:  # noqa: BLE001 — catalog unreachable; trust the request
         return requested, ""
     if not catalog or requested in catalog:

@@ -870,26 +870,32 @@ def reset_role_models(backend: str) -> None:
 # Config load / save
 # ---------------------------------------------------------------------------
 
-def list_models(cfg: dict | None = None) -> list[str]:
+def list_models(cfg: dict | None = None, live_only: bool = False) -> list[str]:
     """
     Return available model names for the active backend.
     - einfra: query /v1/models live; fall back to KNOWN_MODELS on failure
     - ollama: poll the local server; fall back to KNOWN_MODELS
     - nim:    query /v1/models live; fall back to NIM_KNOWN_MODELS on failure
     - custom: query the provider's /v1/models live; fall back to provider.models
+
+    ``live_only=True`` drops every fallback and returns ``[]`` when the catalog
+    can't be reached. Use it whenever the list decides whether a model is
+    served (veto a requested id, pick a substitute): the static lists are a
+    guess for populating pickers, and treating them as the catalog swaps
+    perfectly good models for ids the backend may no longer serve.
     """
     if cfg is None:
         cfg = {}
     backend = cfg.get("backend", "einfra")
     if backend == "ollama":
         pulled = ollama_list_models(cfg.get("ollama_url", OLLAMA_BASE_URL))
-        return pulled if pulled else list(KNOWN_MODELS)
+        return pulled if (pulled or live_only) else list(KNOWN_MODELS)
     if backend == "nim":
         live = nim_list_models(
             cfg.get("nim_url", NIM_BASE_URL),
             cfg.get("nim_api_key", ""),
         )
-        return live if live else list(NIM_KNOWN_MODELS)
+        return live if (live or live_only) else list(NIM_KNOWN_MODELS)
     if backend not in BUILTIN_BACKENDS:
         provider = get_custom_provider(cfg, backend)
         if provider:
@@ -897,7 +903,7 @@ def list_models(cfg: dict | None = None) -> list[str]:
                 provider.get("base_url", ""),
                 provider.get("api_key", "") or "x",  # some hosts (vLLM) accept anything
             )
-            if live:
+            if live or live_only:
                 return live
             saved = provider.get("models") or []
             if saved:
@@ -910,7 +916,7 @@ def list_models(cfg: dict | None = None) -> list[str]:
         cfg.get("base_url", BASE_URL),
         cfg.get("api_key", ""),
     )
-    return live if live else list(KNOWN_MODELS)
+    return live if (live or live_only) else list(KNOWN_MODELS)
 
 
 def _truthy(val) -> bool:
@@ -952,6 +958,11 @@ def load_config() -> dict:
         # stay honest/calibrated, and be pleasant to work with. Disable in
         # config.json ("constitution": false) or OCTOSLAVE_CONSTITUTION=0.
         "constitution": True,
+        # Keep the computer from idle-sleeping while an agent works (the screen
+        # may still turn off), and — on mains power only — while a Science
+        # session waits for cluster jobs it will continue by itself. See
+        # keepawake.py. Disable here ("keep_awake": false) or OCTOSLAVE_KEEP_AWAKE=0.
+        "keep_awake": True,
         # Optional per-model context windows (tokens), {model_id: tokens}. Overrides
         # the live catalog + family map for a model the gateway doesn't advertise
         # and the built-in map doesn't know (e.g. a new kimi/glm build). Empty = use

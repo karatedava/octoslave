@@ -44,6 +44,7 @@ import json
 from openai import OpenAI
 
 from . import display
+from . import keepawake
 from . import logger
 from . import interrupt
 from . import steer
@@ -53,6 +54,8 @@ from .agent import (
     _robust_stream,
     _simple_completion,
     _orientation_phase,
+    _handoff_to_work,
+    _plan_completion,
     _extract_text_tool_calls,
     _looks_like_tool_attempt,
     _cap_result,
@@ -141,7 +144,9 @@ def resolve_council_roles(
     # Live model list for the active backend; einfra/custom go through the
     # generic list_models, which already handles provider catalogs.
     try:
-        available = list_models(cfg)
+        # live_only: an unreachable catalog must read as "unknown" (→ the
+        # known-safe role defaults), not as the static fallback list.
+        available = list_models(cfg, live_only=True)
     except Exception:
         available = []
     return resolve_council_models(available, overrides)
@@ -306,7 +311,7 @@ def _other_grader_model(failed: str, client) -> str | None:
     try:
         from .agent import probe_model
         from .config import is_chat_model, list_models, load_config, pick_fallback_model
-        catalog = [m for m in (list_models(load_config()) or [])
+        catalog = [m for m in (list_models(load_config(), live_only=True) or [])
                    if is_chat_model(m) and m != failed]
     except Exception:  # noqa: BLE001 — catalog unreachable
         return None
@@ -637,13 +642,16 @@ def _thinker_plan(
             "a single numbered execution plan (3-8 steps)", drafts,
         ).strip()
         if not plan_text:  # debate produced nothing usable — fall back to the solo planner
-            plan_text = _simple_completion(client, roles["thinker"], plan_msgs, max_tokens=800).strip()
+            plan_text = _plan_completion(client, roles["thinker"], plan_msgs, max_tokens=800)
     else:
         display.print_info(f"{_TAG['thinker']} planning…")
-        plan_text = _simple_completion(client, roles["thinker"], plan_msgs, max_tokens=800).strip()
+        plan_text = _plan_completion(client, roles["thinker"], plan_msgs, max_tokens=800)
 
     if not plan_text:
-        return messages, ""
+        # Without this the Worker starts from orientation's last words ("reply
+        # READY" / budget note) and can end the run without doing the task.
+        display.print_info("Couldn't get a plan — the Worker continues without one.")
+        return _handoff_to_work(messages, planned=False), ""
 
     display.print_plan(plan_text)
     logger.log_plan(plan_text)
@@ -1324,6 +1332,7 @@ def print_roles(roles: dict[str, str], notes: dict[str, str] | None = None, ultr
     display.console.print()
 
 
+@keepawake.while_working
 def run_council_agent(
     task: str,
     working_dir: str,
@@ -1389,6 +1398,7 @@ def run_council_agent(
         configure_execution(None)
 
 
+@keepawake.while_working
 def continue_council_agent(
     messages: list[dict],
     follow_up: str,
